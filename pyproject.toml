@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ginger"
+version = "0.1.0"
+description = "Brain of the Freenove 4WD Smart Car"
+requires-python = ">=3.11"
+dependencies = [
+    "smbus2",
+]
+
+[project.scripts]
+ginger-center-servos = "ginger.tools.center_servos:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
