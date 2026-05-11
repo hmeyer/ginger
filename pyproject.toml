@@ -9,10 +9,19 @@ description = "Brain of the Freenove 4WD Smart Car"
 requires-python = ">=3.11"
 dependencies = [
     "smbus2",
+    "gpiozero",
+    "spidev",
+    "numpy",
+    # picamera2 is installed system-wide via apt; not on PyPI
 ]
 
 [project.scripts]
 ginger-center-servos = "ginger.tools.center_servos:main"
+ginger-scan = "ginger.tools.scan:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv.workspace]
+# picamera2 is only available via apt (system site-packages); run:
+#   uv venv --system-site-packages && uv sync
