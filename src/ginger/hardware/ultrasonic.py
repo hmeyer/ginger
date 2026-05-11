@@ -1,8 +1,7 @@
 """HC-SR04 ultrasonic distance sensor.
 
 Trigger: GPIO 27 (output), Echo: GPIO 22 (input). Max range: 3 m.
-Uses RPi.GPIO directly — avoids the lgpio "GPIO busy" issue that
-gpiozero's DistanceSensor can leave behind after unclean exits.
+Uses RPi.GPIO directly to avoid lgpio "GPIO busy" leaks from gpiozero.
 """
 
 import time
@@ -10,8 +9,8 @@ import RPi.GPIO as GPIO
 
 _TRIGGER = 27
 _ECHO = 22
-_ECHO_START_TIMEOUT_S = 0.01   # 10ms to wait for echo to go HIGH
-_ECHO_END_TIMEOUT_S   = 0.04   # 40ms max pulse (HC-SR04 outputs 38ms on no echo)
+_ECHO_START_TIMEOUT_S = 0.01   # 10ms to wait for echo to go HIGH after trigger
+_ECHO_END_TIMEOUT_S   = 0.05   # 50ms max pulse (HC-SR04 outputs ~38ms on no-echo)
 
 
 class Ultrasonic:
@@ -22,7 +21,13 @@ class Ultrasonic:
         GPIO.setup(_ECHO, GPIO.IN)
 
     def distance_cm(self) -> float | None:
-        """Return distance in cm, or None on timeout."""
+        """Return distance in cm, or None on timeout / out of range."""
+        # Wait for echo to be idle (LOW) before triggering
+        idle_deadline = time.monotonic() + 0.1
+        while GPIO.input(_ECHO) == GPIO.HIGH:
+            if time.monotonic() > idle_deadline:
+                return None
+
         # 10 µs trigger pulse
         GPIO.output(_TRIGGER, GPIO.HIGH)
         time.sleep(0.00001)

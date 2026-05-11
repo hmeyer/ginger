@@ -17,7 +17,7 @@ class PCA9685:
     def __init__(self, address: int = 0x40, bus: int = 1):
         self._bus = smbus2.SMBus(bus)
         self._address = address
-        self._write(_MODE1, 0x00)
+        self._write(_MODE1, 0x20)  # enable auto-increment (AI bit)
 
     def set_pwm_freq(self, freq: float) -> None:
         prescale = round(_OSC_FREQ / (_PWM_RESOLUTION * freq)) - 1

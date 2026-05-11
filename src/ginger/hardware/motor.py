@@ -4,10 +4,10 @@ from .pca9685 import PCA9685
 
 # PCA9685 channel pairs per wheel: (forward_channel, reverse_channel)
 _WHEEL_CHANNELS = {
-    "left_front":  (1, 0),
-    "left_rear":   (2, 3),
-    "right_front": (6, 7),
-    "right_rear":  (4, 5),
+    "left_front":  (6, 7),
+    "left_rear":   (4, 5),
+    "right_front": (0, 1),
+    "right_rear":  (3, 2),
 }
 
 _MAX_DUTY = 4095
