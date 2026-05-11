@@ -10,7 +10,8 @@ import RPi.GPIO as GPIO
 
 _TRIGGER = 27
 _ECHO = 22
-_TIMEOUT_S = 0.04  # 40ms → ~6.8m, well past max useful range
+_ECHO_START_TIMEOUT_S = 0.01   # 10ms to wait for echo to go HIGH
+_ECHO_END_TIMEOUT_S   = 0.04   # 40ms max pulse (HC-SR04 outputs 38ms on no echo)
 
 
 class Ultrasonic:
@@ -27,9 +28,8 @@ class Ultrasonic:
         time.sleep(0.00001)
         GPIO.output(_TRIGGER, GPIO.LOW)
 
-        deadline = time.monotonic() + _TIMEOUT_S
-
         # Wait for echo HIGH
+        deadline = time.monotonic() + _ECHO_START_TIMEOUT_S
         while GPIO.input(_ECHO) == GPIO.LOW:
             if time.monotonic() > deadline:
                 return None
@@ -37,6 +37,7 @@ class Ultrasonic:
         t_start = time.monotonic()
 
         # Wait for echo LOW
+        deadline = time.monotonic() + _ECHO_END_TIMEOUT_S
         while GPIO.input(_ECHO) == GPIO.HIGH:
             if time.monotonic() > deadline:
                 return None
