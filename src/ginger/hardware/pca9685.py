@@ -17,7 +17,7 @@ class PCA9685:
     def __init__(self, address: int = 0x40, bus: int = 1):
         self._bus = smbus2.SMBus(bus)
         self._address = address
-        self._write(_MODE1, 0x20)  # enable auto-increment (AI bit)
+        self._write(_MODE1, 0x00)
 
     def set_pwm_freq(self, freq: float) -> None:
         prescale = round(_OSC_FREQ / (_PWM_RESOLUTION * freq)) - 1
@@ -30,10 +30,10 @@ class PCA9685:
 
     def set_pwm(self, channel: int, on: int, off: int) -> None:
         base = _LED0_ON_L + 4 * channel
-        self._bus.write_i2c_block_data(
-            self._address, base,
-            [on & 0xFF, on >> 8, off & 0xFF, off >> 8],
-        )
+        self._write(base,     on  & 0xFF)
+        self._write(base + 1, on  >> 8)
+        self._write(base + 2, off & 0xFF)
+        self._write(base + 3, off >> 8)
 
     def set_duty(self, channel: int, duty: int) -> None:
         """duty in range [-4095, 4095]; 0 = brake (both high)."""
