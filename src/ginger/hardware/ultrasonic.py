@@ -1,31 +1,50 @@
-"""HC-SR04 ultrasonic distance sensor via gpiozero.
+"""HC-SR04 ultrasonic distance sensor.
 
-Trigger: GPIO 27, Echo: GPIO 22. Max range: 3 m.
+Trigger: GPIO 27 (output), Echo: GPIO 22 (input). Max range: 3 m.
+Uses RPi.GPIO directly — avoids the lgpio "GPIO busy" issue that
+gpiozero's DistanceSensor can leave behind after unclean exits.
 """
 
-import warnings
-from gpiozero import DistanceSensor
-from gpiozero.exc import DistanceSensorNoEcho, PWMSoftwareFallback
+import time
+import RPi.GPIO as GPIO
 
 _TRIGGER = 27
 _ECHO = 22
-_MAX_DISTANCE_M = 3.0
+_TIMEOUT_S = 0.04  # 40ms → ~6.8m, well past max useful range
 
 
 class Ultrasonic:
     def __init__(self):
-        warnings.filterwarnings("ignore", category=DistanceSensorNoEcho)
-        warnings.filterwarnings("ignore", category=PWMSoftwareFallback)
-        self._sensor = DistanceSensor(
-            echo=_ECHO, trigger=_TRIGGER, max_distance=_MAX_DISTANCE_M
-        )
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        GPIO.setup(_TRIGGER, GPIO.OUT, initial=GPIO.LOW)
+        GPIO.setup(_ECHO, GPIO.IN)
 
     def distance_cm(self) -> float | None:
-        """Return distance in cm, or None if out of range."""
-        try:
-            return round(self._sensor.distance * 100, 1)
-        except RuntimeWarning:
-            return None
+        """Return distance in cm, or None on timeout."""
+        # 10 µs trigger pulse
+        GPIO.output(_TRIGGER, GPIO.HIGH)
+        time.sleep(0.00001)
+        GPIO.output(_TRIGGER, GPIO.LOW)
+
+        deadline = time.monotonic() + _TIMEOUT_S
+
+        # Wait for echo HIGH
+        while GPIO.input(_ECHO) == GPIO.LOW:
+            if time.monotonic() > deadline:
+                return None
+
+        t_start = time.monotonic()
+
+        # Wait for echo LOW
+        while GPIO.input(_ECHO) == GPIO.HIGH:
+            if time.monotonic() > deadline:
+                return None
+
+        t_end = time.monotonic()
+
+        # Speed of sound: 34300 cm/s; divide by 2 for round trip
+        return round((t_end - t_start) * 34300 / 2, 1)
 
     def close(self) -> None:
-        self._sensor.close()
+        GPIO.cleanup([_TRIGGER, _ECHO])
