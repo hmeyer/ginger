@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use env_logger;
 use axum::{
     Router,
     extract::State,
@@ -20,6 +21,8 @@ use futures::Stream;
 use image::{DynamicImage, ImageFormat, RgbImage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+use log::{info, warn};
 
 use ginger_rs::{
     camera::Camera,
@@ -83,6 +86,11 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+    info!("Ginger starting");
+
     let (cmd_tx, cmd_rx) = mpsc::channel::<CarCmd>(32);
 
     let sensors = Arc::new(RwLock::new(SensorSnapshot {
@@ -149,21 +157,25 @@ fn hardware_thread(
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 CarCmd::ExploreStart => {
+                    info!("hw: exploration started");
                     explore_stop.store(false, Ordering::Relaxed);
                     explore_active = true;
                     is_driving = false;
                 }
                 CarCmd::Stop => {
+                    info!("hw: stop command — cancelling exploration");
                     explore_active = false;
                     explore_stop.store(true, Ordering::Relaxed);
-                    car.stop().ok();
+                    if let Err(e) = car.stop() { warn!("hw: stop error: {e}"); }
                     is_driving = false;
                 }
                 CarCmd::SetMotors { left, right } => {
-                    // Manual drive cancels exploration
+                    if explore_active { info!("hw: manual drive — cancelling exploration"); }
                     explore_active = false;
                     explore_stop.store(true, Ordering::Relaxed);
-                    car.motors().drive(left, right).ok();
+                    if let Err(e) = car.motors().drive(left, right) {
+                        warn!("hw: drive({left},{right}) error: {e}");
+                    }
                     last_drive = Instant::now();
                     is_driving = left != 0 || right != 0;
                 }
@@ -184,13 +196,14 @@ fn hardware_thread(
         // ── Exploration loop ───────────────────────────────────────────────────
         if explore_active {
             let status = explore::tick(&mut car, &map, &explore_stop);
+            info!("explore: tick → {status}");
             {
                 let mut snap = sensors.write().unwrap();
                 snap.explore_state = status.to_string();
-                // Refresh battery inside the tick interval
                 snap.battery_v = car.battery_v().unwrap_or(snap.battery_v);
             }
             if status == explore::Status::Complete || explore_stop.load(Ordering::Relaxed) {
+                info!("explore: stopped (status={status})");
                 explore_active = false;
                 explore_stop.store(false, Ordering::Relaxed);
             }

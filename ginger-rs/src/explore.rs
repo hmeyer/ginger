@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+use log::{info, warn};
 use serde::Serialize;
 
 use crate::{
@@ -25,7 +26,7 @@ use crate::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-pub const DRIVE_DUTY: i32 = 800;   // ~40% power — slow and safe
+pub const DRIVE_DUTY: i32 = 1500;  // ~37% power — reliable start, safe speed
 pub const STEP_MS:    u64 = 400;   // one forward step duration
 pub const STEP_CM:    f32 = 12.0;  // estimated cm per step (calibrate if needed)
 pub const TURN_MS:    u64 = 280;   // one turn pulse duration
@@ -69,6 +70,7 @@ impl std::fmt::Display for Status {
 /// Sweep pan servo across SCAN_ANGLES and collect ultrasonic readings.
 /// Returns to centre when done. Aborts early if `stop` is set.
 pub fn do_scan(car: &mut Car, stop: &AtomicBool) -> Vec<ScanRay> {
+    info!("scan: sweeping {} angles", SCAN_ANGLES.len());
     let mut rays = Vec::with_capacity(SCAN_ANGLES.len());
     for &pan in SCAN_ANGLES {
         if stop.load(Ordering::Relaxed) { break; }
@@ -77,7 +79,9 @@ pub fn do_scan(car: &mut Car, stop: &AtomicBool) -> Vec<ScanRay> {
         if stop.load(Ordering::Relaxed) { break; }
         let raw    = car.us().distance_cm().unwrap_or(MAX_RANGE_CM + 1.0);
         let capped = raw >= MAX_RANGE_CM;
-        rays.push(ScanRay { pan_deg: pan, dist_cm: raw.min(MAX_RANGE_CM), capped });
+        let dist   = raw.min(MAX_RANGE_CM);
+        info!("  pan={:.0}°  dist={:.1} cm{}", pan, dist, if capped { " (capped)" } else { "" });
+        rays.push(ScanRay { pan_deg: pan, dist_cm: dist, capped });
     }
     car.pan_tilt().set_pan(90.0).ok();
     rays
@@ -143,31 +147,45 @@ pub fn angle_diff(from: f32, to: f32) -> f32 {
 // ── Motion primitives ─────────────────────────────────────────────────────────
 
 fn step_forward(car: &mut Car, map: &Arc<RwLock<Map>>) {
-    car.motors().drive(DRIVE_DUTY, DRIVE_DUTY).ok();
+    info!("move: forward duty={} for {}ms", DRIVE_DUTY, STEP_MS);
+    if let Err(e) = car.motors().drive(DRIVE_DUTY, DRIVE_DUTY) {
+        warn!("move: drive() error: {e}");
+    }
     thread::sleep(Duration::from_millis(STEP_MS));
-    car.stop().ok();
+    if let Err(e) = car.stop() {
+        warn!("move: stop() error: {e}");
+    }
 
     let mut m = map.write().unwrap();
     let h_rad = m.robot_heading.to_radians();
     m.robot_gx +=  h_rad.sin() * STEP_CM / CELL_CM;
-    m.robot_gy += -h_rad.cos() * STEP_CM / CELL_CM; // y-down: north = -y
+    m.robot_gy += -h_rad.cos() * STEP_CM / CELL_CM;
     m.robot_gx = m.robot_gx.clamp(0.0, (W - 1) as f32);
     m.robot_gy = m.robot_gy.clamp(0.0, (H - 1) as f32);
+    info!("move: pose now ({:.1}, {:.1}) heading={:.1}°",
+          m.robot_gx, m.robot_gy, m.robot_heading);
 }
 
 fn turn_pulse(car: &mut Car, map: &Arc<RwLock<Map>>, clockwise: bool) {
+    let dir = if clockwise { "CW" } else { "CCW" };
+    info!("turn: {dir} duty={} for {}ms", DRIVE_DUTY, TURN_MS);
     let (l, r) = if clockwise {
         (DRIVE_DUTY, -DRIVE_DUTY)
     } else {
         (-DRIVE_DUTY, DRIVE_DUTY)
     };
-    car.motors().drive(l, r).ok();
+    if let Err(e) = car.motors().drive(l, r) {
+        warn!("turn: drive() error: {e}");
+    }
     thread::sleep(Duration::from_millis(TURN_MS));
-    car.stop().ok();
+    if let Err(e) = car.stop() {
+        warn!("turn: stop() error: {e}");
+    }
 
     let delta = if clockwise { TURN_DEG } else { -TURN_DEG };
     let mut m = map.write().unwrap();
     m.robot_heading = (m.robot_heading + delta).rem_euclid(360.0);
+    info!("turn: heading now {:.1}°", m.robot_heading);
 }
 
 // ── Main exploration tick ─────────────────────────────────────────────────────
@@ -178,8 +196,13 @@ pub fn tick(car: &mut Car, map: &Arc<RwLock<Map>>, stop: &AtomicBool) -> Status 
     if stop.load(Ordering::Relaxed) { return Status::Idle; }
 
     // Battery check
-    if let Ok(v) = car.battery_v() {
-        if v < LOW_BAT_V { return Status::Complete; }
+    match car.battery_v() {
+        Ok(v) if v < LOW_BAT_V => {
+            warn!("explore: low battery {v:.2} V — stopping");
+            return Status::Complete;
+        }
+        Ok(v) => info!("explore: battery {v:.2} V"),
+        Err(e) => warn!("explore: battery read error: {e}"),
     }
 
     // 1. Scan
@@ -191,32 +214,41 @@ pub fn tick(car: &mut Car, map: &Arc<RwLock<Map>>, stop: &AtomicBool) -> Status 
     let (fx, fy) = {
         let m = map.read().unwrap();
         match find_nearest_frontier(&m) {
-            None    => return Status::Complete,
+            None => {
+                info!("explore: no frontiers — exploration complete");
+                return Status::Complete;
+            }
             Some(f) => f,
         }
     };
 
     // 3. Compute heading error toward frontier
-    let diff = {
+    let (diff, current_heading, target_heading) = {
         let m      = map.read().unwrap();
         let target = heading_to_cell(&m, fx, fy);
-        angle_diff(m.robot_heading, target)
+        let diff   = angle_diff(m.robot_heading, target);
+        (diff, m.robot_heading, target)
     };
+    info!("explore: frontier at cell ({fx},{fy}), heading={current_heading:.1}°, target={target_heading:.1}°, diff={diff:.1}°");
 
     // 4. Turn to align if needed
     if diff.abs() > ALIGN_DEG {
         if stop.load(Ordering::Relaxed) { return Status::Idle; }
+        info!("explore: turning {} by ~{TURN_DEG}°", if diff > 0.0 { "CW" } else { "CCW" });
         turn_pulse(car, map, diff > 0.0);
         return Status::Turning;
     }
 
     // 5. Step forward if safe, otherwise turn away from obstacle
-    if is_forward_safe(&rays) {
+    let safe = is_forward_safe(&rays);
+    info!("explore: forward safe={safe}");
+    if safe {
         if stop.load(Ordering::Relaxed) { return Status::Idle; }
         step_forward(car, map);
         Status::Moving
     } else {
-        let clockwise = !obstacle_is_left(&rays); // turn away from obstacle
+        let clockwise = !obstacle_is_left(&rays);
+        warn!("explore: blocked — turning {} to escape", if clockwise { "CW" } else { "CCW" });
         for _ in 0..2 {
             if stop.load(Ordering::Relaxed) { return Status::Idle; }
             turn_pulse(car, map, clockwise);

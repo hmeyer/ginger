@@ -15,6 +15,7 @@ const OSC_FREQ: u32 = 25_000_000;
 const PWM_RES: u32 = 4096;
 
 pub const MAX_DUTY: u16 = (PWM_RES - 1) as u16; // 4095
+pub const FULL_OFF: u16 = PWM_RES as u16;        // 4096 — sets FULL-OFF bit in OFF_H register
 
 pub struct Pca9685 {
     i2c: I2c,
