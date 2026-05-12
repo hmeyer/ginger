@@ -383,8 +383,10 @@ sse.onmessage = e => {
   const es = d.explore_state || 'idle';
   exploreBadge.textContent = es;
   exploreBadge.className   = es;
-  if (es === 'complete' || (es === 'idle' && exploring)) {
+  if (es === 'idle' || es === 'complete') {
     setExploring(false);
+  } else {
+    setExploring(true);
   }
 
   // Update desktop sidebar IDs (also read by Playwright at 1280px)

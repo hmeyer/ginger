@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use log::{info, warn};
@@ -152,15 +152,23 @@ pub fn angle_diff(from: f32, to: f32) -> f32 {
 
 // ── Motion primitives ─────────────────────────────────────────────────────────
 
-fn step_forward(car: &mut Car, map: &Arc<RwLock<Map>>) {
+fn step_forward(car: &mut Car, map: &Arc<RwLock<Map>>, stop: &AtomicBool) {
     info!("move: forward duty={} for {}ms", DRIVE_DUTY, STEP_MS);
     if let Err(e) = car.motors().drive(DRIVE_DUTY, DRIVE_DUTY) {
         warn!("move: drive() error: {e}");
     }
-    thread::sleep(Duration::from_millis(STEP_MS));
+    let deadline = Instant::now() + Duration::from_millis(STEP_MS);
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            info!("move: stop flag — cutting step short");
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     if let Err(e) = car.stop() {
         warn!("move: stop() error: {e}");
     }
+    if stop.load(Ordering::Relaxed) { return; }
 
     let mut m = map.write().unwrap();
     let h_rad = m.robot_heading.to_radians();
@@ -172,7 +180,7 @@ fn step_forward(car: &mut Car, map: &Arc<RwLock<Map>>) {
           m.robot_gx, m.robot_gy, m.robot_heading);
 }
 
-fn turn_pulse(car: &mut Car, map: &Arc<RwLock<Map>>, clockwise: bool) {
+fn turn_pulse(car: &mut Car, map: &Arc<RwLock<Map>>, clockwise: bool, stop: &AtomicBool) {
     let dir = if clockwise { "CW" } else { "CCW" };
     info!("turn: {dir} duty={} for {}ms", DRIVE_DUTY, TURN_MS);
     let (l, r) = if clockwise {
@@ -183,10 +191,18 @@ fn turn_pulse(car: &mut Car, map: &Arc<RwLock<Map>>, clockwise: bool) {
     if let Err(e) = car.motors().drive(l, r) {
         warn!("turn: drive() error: {e}");
     }
-    thread::sleep(Duration::from_millis(TURN_MS));
+    let deadline = Instant::now() + Duration::from_millis(TURN_MS);
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            info!("turn: stop flag — cutting turn short");
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     if let Err(e) = car.stop() {
         warn!("turn: stop() error: {e}");
     }
+    if stop.load(Ordering::Relaxed) { return; }
 
     let delta = if clockwise { TURN_DEG } else { -TURN_DEG };
     let mut m = map.write().unwrap();
@@ -241,7 +257,7 @@ pub fn tick(car: &mut Car, map: &Arc<RwLock<Map>>, stop: &AtomicBool) -> Status 
     if diff.abs() > ALIGN_DEG {
         if stop.load(Ordering::Relaxed) { return Status::Idle; }
         info!("explore: turning {} by ~{TURN_DEG}°", if diff > 0.0 { "CW" } else { "CCW" });
-        turn_pulse(car, map, diff > 0.0);
+        turn_pulse(car, map, diff > 0.0, stop);
         return Status::Turning;
     }
 
@@ -250,14 +266,14 @@ pub fn tick(car: &mut Car, map: &Arc<RwLock<Map>>, stop: &AtomicBool) -> Status 
     info!("explore: forward safe={safe}");
     if safe {
         if stop.load(Ordering::Relaxed) { return Status::Idle; }
-        step_forward(car, map);
+        step_forward(car, map, stop);
         Status::Moving
     } else {
         let clockwise = !obstacle_is_left(&rays);
         warn!("explore: blocked — turning {} to escape", if clockwise { "CW" } else { "CCW" });
         for _ in 0..2 {
             if stop.load(Ordering::Relaxed) { return Status::Idle; }
-            turn_pulse(car, map, clockwise);
+            turn_pulse(car, map, clockwise, stop);
         }
         Status::Stuck
     }

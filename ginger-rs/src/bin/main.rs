@@ -207,6 +207,7 @@ fn hardware_thread(
 
         // ── Exploration loop ───────────────────────────────────────────────────
         if explore_active {
+            sensors.write().unwrap().explore_state = "scanning".into();
             let status = explore::tick(&mut car, &map, &explore_stop);
             info!("explore: tick → {status}");
             {
@@ -365,6 +366,8 @@ async fn explore_start(State(st): State<AppState>) -> StatusCode {
 
 async fn explore_stop_handler(State(st): State<AppState>) -> StatusCode {
     st.explore_stop.store(true, Ordering::Relaxed);
+    // Also queue Stop so motors are halted immediately after the current tick exits
+    st.cmd_tx.send(CarCmd::Stop).await.ok();
     StatusCode::OK
 }
 
