@@ -1,6 +1,6 @@
 # Ginger
 
-Rust driver library for the [Freenove 4WD Smart Car Kit (FNK0043)](https://docs.freenove.com/projects/fnk0043/en/latest/) running on a Raspberry Pi 4, PCB v2.0.
+Rust driver library and web control interface for the [Freenove 4WD Smart Car Kit (FNK0043)](https://docs.freenove.com/projects/fnk0043/en/latest/) running on a Raspberry Pi 4, PCB v2.0.
 
 ## Hardware
 
@@ -20,18 +20,22 @@ Rust driver library for the [Freenove 4WD Smart Car Kit (FNK0043)](https://docs.
 ```
 ginger-rs/
   src/
-    pca9685.rs   — I2C PWM driver (PCA9685)
-    motors.rs    — 4WD differential drive
-    servo.rs     — Pan/tilt with invert + trim
-    adc.rs       — ADS7830 battery/voltage/light ADC
-    led.rs       — WS2812B strip over SPI
-    buzzer.rs    — Active buzzer
+    pca9685.rs    — I2C PWM driver (PCA9685)
+    motors.rs     — 4WD differential drive
+    servo.rs      — Pan/tilt with invert + trim
+    adc.rs        — ADS7830 battery/voltage/light ADC
+    led.rs        — WS2812B strip over SPI
+    buzzer.rs     — Active buzzer
     ultrasonic.rs — HC-SR04 distance sensor
-    infrared.rs  — 3-sensor line tracker
-    camera.rs    — OV5647 via libcamera (streaming background thread)
-    car.rs       — Top-level Car struct with obstacle-avoidance safety
+    infrared.rs   — 3-sensor line tracker
+    camera.rs     — OV5647 via libcamera (streaming background thread)
+    car.rs        — Top-level Car struct with obstacle-avoidance safety
+  bin/
+    main.rs       — Web server (axum) with live sensor stream + controls
+    web/
+      index.html  — Embedded mobile-first control UI
   examples/
-    test_all.rs  — Interactive component-by-component hardware test
+    test_all.rs   — Interactive component-by-component hardware test
     drive_test.rs — Battery check + forward drive smoke test
     camera_test.rs — Capture one frame and save as PPM
 ```
@@ -50,6 +54,26 @@ Rust toolchain via [rustup](https://rustup.rs).
 cd ginger-rs
 cargo build
 ```
+
+## Web interface
+
+The `ginger` binary serves a mobile-first control UI on port 8080:
+
+```bash
+cargo run --bin ginger
+# Open http://<pi-ip>:8080  or  http://ginger.local:8080
+```
+
+Features:
+- **Live sensor feed** via SSE — battery voltage, light sensors (L/R), IR line tracker (3 dots), ultrasonic distance, all updating at 200 ms
+- **Camera stream** — JPEG frames polled at ~20 fps
+- **Drive controls** — D-pad (tap or hold), keyboard arrow keys, space to stop; server safety-stops motors after 500 ms of silence
+- **Pan / tilt sliders** — 0–180° range
+- **LED** — colour picker + off button
+- **Buzzer** — hold to beep
+- **Sensor toggles** — enable/disable light, IR, and ultrasonic per sensor
+
+The UI is mobile-first: on phones it stacks camera → scrollable sensor strip → footer controls. On screens ≥ 700 px it switches to a camera + sidebar layout.
 
 ## Running the hardware test
 
