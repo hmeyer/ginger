@@ -33,7 +33,8 @@ use ginger_rs::{
 
 // ── Embedded web UI ───────────────────────────────────────────────────────────
 
-const HTML: &str = include_str!("web/index.html");
+const HTML_TEMPLATE: &str = include_str!("web/index.html");
+const BUILD_TIME: &str    = env!("BUILD_TIME");
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -89,7 +90,7 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
-    info!("Ginger starting");
+    info!("Ginger starting — built {BUILD_TIME}");
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<CarCmd>(32);
 
@@ -243,7 +244,8 @@ fn hardware_thread(
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async fn serve_html() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], HTML)
+    let html = HTML_TEMPLATE.replace("{{BUILD_TIME}}", BUILD_TIME);
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
 }
 
 async fn sensor_stream(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
