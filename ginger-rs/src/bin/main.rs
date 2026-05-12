@@ -18,7 +18,7 @@ use image::{DynamicImage, ImageFormat, RgbImage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use ginger_rs::{camera::Camera, car::Car};
+use ginger_rs::{camera::Camera, car::Car, map::{Map, ScanRay, MAX_RANGE_CM}};
 
 // ── Embedded web UI ───────────────────────────────────────────────────────────
 
@@ -57,6 +57,7 @@ enum CarCmd {
     LedOff,
     Buzzer(bool),
     SetSensors(SensorConfig),
+    Scan,
 }
 
 #[derive(Clone)]
@@ -64,6 +65,7 @@ struct AppState {
     cmd_tx:  mpsc::Sender<CarCmd>,
     sensors: Arc<RwLock<SensorSnapshot>>,
     camera:  Arc<Camera>,
+    map:     Arc<RwLock<Map>>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -76,14 +78,17 @@ async fn main() {
         battery_v: 0.0, light_left: None, light_right: None, ir: None, us_cm: None,
     }));
 
+    let map = Arc::new(RwLock::new(Map::new()));
+
     let sensors_hw = sensors.clone();
-    thread::spawn(move || hardware_thread(cmd_rx, sensors_hw));
+    let map_hw     = map.clone();
+    thread::spawn(move || hardware_thread(cmd_rx, sensors_hw, map_hw));
 
     println!("Initialising camera…");
     let camera = Arc::new(Camera::new().expect("camera init failed"));
     println!("Camera ready.");
 
-    let state = AppState { cmd_tx, sensors, camera };
+    let state = AppState { cmd_tx, sensors, camera, map };
 
     let app = Router::new()
         .route("/",                   get(serve_html))
@@ -97,6 +102,10 @@ async fn main() {
         .route("/api/led/off",        post(led_off))
         .route("/api/buzzer",         post(buzzer))
         .route("/api/sensors/config", post(sensor_config))
+        .route("/api/scan",           post(trigger_scan))
+        .route("/api/map",            get(map_meta))
+        .route("/api/map/png",        get(map_png))
+        .route("/api/map/ascii",      get(map_ascii))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -106,7 +115,25 @@ async fn main() {
 
 // ── Hardware thread ───────────────────────────────────────────────────────────
 
-fn hardware_thread(mut cmd_rx: mpsc::Receiver<CarCmd>, sensors: Arc<RwLock<SensorSnapshot>>) {
+// Pan angles for a sweep, in degrees (left to right)
+const SCAN_ANGLES: &[f32] = &[30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0];
+
+fn do_scan(car: &mut Car, map: &Arc<RwLock<Map>>) {
+    let mut rays = Vec::with_capacity(SCAN_ANGLES.len());
+    for &pan in SCAN_ANGLES {
+        car.pan_tilt().set_pan(pan).ok();
+        thread::sleep(Duration::from_millis(300)); // settle
+        let raw = car.us().distance_cm().unwrap_or(MAX_RANGE_CM + 1.0);
+        let capped = raw >= MAX_RANGE_CM;
+        let dist_cm = raw.min(MAX_RANGE_CM);
+        rays.push(ScanRay { pan_deg: pan, dist_cm, capped });
+    }
+    // Return to centre
+    car.pan_tilt().set_pan(90.0).ok();
+    map.write().unwrap().integrate_scan(&rays);
+}
+
+fn hardware_thread(mut cmd_rx: mpsc::Receiver<CarCmd>, sensors: Arc<RwLock<SensorSnapshot>>, map: Arc<RwLock<Map>>) {
     let mut car    = Car::new().expect("Car init failed");
     let mut config = SensorConfig::default();
     let mut last_drive = Instant::now();
@@ -157,6 +184,7 @@ fn hardware_thread(mut cmd_rx: mpsc::Receiver<CarCmd>, sensors: Arc<RwLock<Senso
                 CarCmd::LedOff               => { car.leds.clear().ok(); }
                 CarCmd::Buzzer(on)           => { if on { car.buzzer.on() } else { car.buzzer.off() } }
                 CarCmd::SetSensors(cfg)      => { config = cfg; }
+                CarCmd::Scan                 => { do_scan(&mut car, &map); }
             }
         }
 
@@ -259,4 +287,30 @@ async fn buzzer(State(st): State<AppState>, Json(b): Json<BuzzerBody>) -> Status
 async fn sensor_config(State(st): State<AppState>, Json(b): Json<SensorConfig>) -> StatusCode {
     st.cmd_tx.send(CarCmd::SetSensors(b)).await.ok();
     StatusCode::OK
+}
+
+async fn trigger_scan(State(st): State<AppState>) -> StatusCode {
+    st.cmd_tx.send(CarCmd::Scan).await.ok();
+    StatusCode::OK
+}
+
+async fn map_meta(State(st): State<AppState>) -> impl IntoResponse {
+    let meta = st.map.read().unwrap().meta();
+    Json(meta)
+}
+
+async fn map_png(State(st): State<AppState>) -> Response {
+    let png = tokio::task::spawn_blocking(move || st.map.read().unwrap().render_png())
+        .await
+        .unwrap();
+    (
+        [(header::CONTENT_TYPE, "image/png"),
+         (header::CACHE_CONTROL, "no-store")],
+        png,
+    ).into_response()
+}
+
+async fn map_ascii(State(st): State<AppState>) -> impl IntoResponse {
+    let ascii = st.map.read().unwrap().to_ascii();
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], ascii)
 }

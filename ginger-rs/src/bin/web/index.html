@@ -31,8 +31,28 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.05em}
 #conn.err{color:var(--err);background:#311}
 
 /* Camera */
-#cam-wrap{flex:1;min-height:0;background:#000;overflow:hidden}
+#cam-wrap{flex:1;min-height:0;background:#000;overflow:hidden;position:relative}
 #cam{width:100%;height:100%;object-fit:contain;display:block}
+
+/* Minimap overlay */
+#minimap-wrap{
+  position:absolute;bottom:8px;right:8px;
+  width:160px;height:160px;
+  border:1px solid rgba(255,255,255,.2);border-radius:6px;
+  overflow:hidden;background:#0e0e1c;
+  box-shadow:0 2px 8px rgba(0,0,0,.6);
+  cursor:pointer;
+  transition:opacity .2s
+}
+#minimap-wrap.hidden{opacity:0;pointer-events:none}
+#minimap{width:160px;height:160px;image-rendering:pixelated}
+#minimap-toggle{
+  position:absolute;bottom:8px;right:176px;
+  background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.2);
+  border-radius:6px;color:#aaa;font-size:.7rem;padding:3px 7px;
+  cursor:pointer;white-space:nowrap
+}
+#minimap-toggle:hover{color:#fff}
 
 /* Sensor strip — mobile only */
 #sensor-strip{
@@ -138,6 +158,10 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 <!-- Camera takes available height; on desktop becomes a grid container -->
 <div id="cam-wrap">
   <img id="cam" alt="camera feed">
+  <button id="minimap-toggle" title="Toggle map">🗺 map</button>
+  <div id="minimap-wrap">
+    <canvas id="minimap" width="160" height="160"></canvas>
+  </div>
 
   <!-- Sidebar (inside cam-wrap so it sits beside camera on desktop) -->
   <aside>
@@ -233,6 +257,7 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
         <button class="btn" id="b-led-set">Set</button>
         <button class="btn" id="b-led-off">Off</button>
         <button class="btn warn" id="b-buzz">🔊 Beep</button>
+        <button class="btn" id="b-scan">Scan</button>
       </div>
     </div>
   </div>
@@ -362,6 +387,73 @@ sse.onmessage = e => {
     ['ir-l-m','ir-c-m','ir-r-m'].forEach(id => document.getElementById(id).className = 'dot');
   }
 };
+
+// ── Scan button ───────────────────────────────────────────────────────────────
+const scanBtn = document.getElementById('b-scan');
+scanBtn.addEventListener('click', () => {
+  scanBtn.disabled = true;
+  scanBtn.textContent = 'Scanning…';
+  post('/api/scan').then(() => {
+    // Re-enable after ~3s (scan takes ~2s on hardware)
+    setTimeout(() => { scanBtn.disabled = false; scanBtn.textContent = 'Scan'; }, 3000);
+    setTimeout(updateMinimap, 3200); // refresh map after scan completes
+  });
+});
+
+// ── Minimap ───────────────────────────────────────────────────────────────────
+const minimapCanvas = document.getElementById('minimap');
+const minimapCtx    = minimapCanvas.getContext('2d');
+const minimapWrap   = document.getElementById('minimap-wrap');
+const minimapToggle = document.getElementById('minimap-toggle');
+let mapMeta = null;
+let minimapVisible = true;
+
+minimapToggle.addEventListener('click', () => {
+  minimapVisible = !minimapVisible;
+  minimapWrap.classList.toggle('hidden', !minimapVisible);
+  minimapToggle.textContent = minimapVisible ? '🗺 map' : '🗺 map';
+});
+
+function renderMinimap(mapImg, meta) {
+  const SIZE = 160;
+  const VIEW = 80; // cells to show (8 m × 8 m)
+  minimapCtx.clearRect(0, 0, SIZE, SIZE);
+
+  // Crop map image around robot, scaled to canvas
+  const sx = meta.robot_gx - VIEW / 2;
+  const sy = meta.robot_gy - VIEW / 2;
+  minimapCtx.drawImage(mapImg, sx, sy, VIEW, VIEW, 0, 0, SIZE, SIZE);
+
+  // Robot arrow centred in canvas
+  const scale = SIZE / VIEW;
+  minimapCtx.save();
+  minimapCtx.translate(SIZE / 2, SIZE / 2);
+  // heading: 0=north=up, clockwise → subtract 90° for canvas rotation
+  minimapCtx.rotate((meta.robot_heading - 90) * Math.PI / 180);
+  minimapCtx.fillStyle = '#4af';
+  minimapCtx.beginPath();
+  minimapCtx.moveTo(0, -8 * scale / 4);
+  minimapCtx.lineTo( 5 * scale / 4,  6 * scale / 4);
+  minimapCtx.lineTo(-5 * scale / 4,  6 * scale / 4);
+  minimapCtx.closePath();
+  minimapCtx.fill();
+  minimapCtx.restore();
+}
+
+async function updateMinimap() {
+  try {
+    const [metaResp] = await Promise.all([fetch('/api/map')]);
+    mapMeta = await metaResp.json();
+
+    const mapImg = new Image();
+    mapImg.onload = () => renderMinimap(mapImg, mapMeta);
+    mapImg.src = '/api/map/png?' + Date.now();
+  } catch (_) {}
+}
+
+// Poll every 2 s; faster updates triggered manually after scan
+updateMinimap();
+setInterval(updateMinimap, 2000);
 
 // ── Camera frame polling ──────────────────────────────────────────────────────
 const camEl = document.getElementById('cam');
