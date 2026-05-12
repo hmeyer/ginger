@@ -33,7 +33,12 @@ pub const TURN_MS:    u64 = 280;   // one turn pulse duration
 pub const TURN_DEG:   f32 = 18.0;  // estimated degrees per turn pulse
 pub const SAFE_CM:    f32 = 40.0;  // min forward clearance before stepping
 pub const ALIGN_DEG:  f32 = 25.0;  // heading tolerance before stepping
-pub const LOW_BAT_V:  f32 = 6.5;   // stop exploring below this voltage
+pub const LOW_BAT_V:  f32 = 6.0;   // stop exploring below this voltage (2S LiPo hard cutoff)
+
+// Minimum squared distance (cells²) a frontier must be from the robot.
+// Prevents picking the robot's own cell (which is always marked free and
+// has unscanned neighbours behind it).
+const MIN_FRONTIER_DIST2: i64 = 9; // 3 cells = 30 cm
 
 pub const SCAN_ANGLES: &[f32] = &[30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0];
 const SETTLE_MS: u64 = 300;        // servo settle time between scan steps
@@ -122,6 +127,7 @@ pub fn find_nearest_frontier(map: &Map) -> Option<(usize, usize)> {
             if !has_unknown { continue; }
 
             let dist2 = (x as i64 - rx).pow(2) + (y as i64 - ry).pow(2);
+            if dist2 < MIN_FRONTIER_DIST2 { continue; } // skip robot's own neighbourhood
             if best.map_or(true, |(_, _, d)| dist2 < d) {
                 best = Some((x, y, dist2));
             }

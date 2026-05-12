@@ -38,9 +38,19 @@ const BUILD_TIME: &str    = env!("BUILD_TIME");
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
+// 2S LiPo: 8.4 V full, 6.0 V cutoff. Log data to refine these constants.
+const BAT_FULL_V:  f32 = 8.4;
+const BAT_EMPTY_V: f32 = 6.0;
+
+fn battery_pct(v: f32) -> u8 {
+    ((v - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V) * 100.0)
+        .clamp(0.0, 100.0) as u8
+}
+
 #[derive(Clone, Serialize)]
 struct SensorSnapshot {
     battery_v:     f32,
+    battery_pct:   u8,
     light_left:    Option<f32>,
     light_right:   Option<f32>,
     ir:            Option<[bool; 3]>,
@@ -95,7 +105,8 @@ async fn main() {
     let (cmd_tx, cmd_rx) = mpsc::channel::<CarCmd>(32);
 
     let sensors = Arc::new(RwLock::new(SensorSnapshot {
-        battery_v: 0.0, light_left: None, light_right: None,
+        battery_v: 0.0, battery_pct: 0,
+        light_left: None, light_right: None,
         ir: None, us_cm: None,
         explore_state: "idle".into(),
     }));
@@ -201,7 +212,9 @@ fn hardware_thread(
             {
                 let mut snap = sensors.write().unwrap();
                 snap.explore_state = status.to_string();
-                snap.battery_v = car.battery_v().unwrap_or(snap.battery_v);
+                let v = car.battery_v().unwrap_or(snap.battery_v);
+                snap.battery_v   = v;
+                snap.battery_pct = battery_pct(v);
             }
             if status == explore::Status::Complete || explore_stop.load(Ordering::Relaxed) {
                 info!("explore: stopped (status={status})");
@@ -226,8 +239,10 @@ fn hardware_thread(
         };
         let us_cm = if config.us { car.us().distance_cm() } else { None };
 
+        let battery_pct = battery_pct(battery_v);
+        info!("bat: {battery_v:.3} V  {battery_pct}%");
         *sensors.write().unwrap() = SensorSnapshot {
-            battery_v, light_left, light_right, ir, us_cm,
+            battery_v, battery_pct, light_left, light_right, ir, us_cm,
             explore_state: "idle".into(),
         };
 
