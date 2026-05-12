@@ -1,6 +1,9 @@
 use std::{
     convert::Infallible,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -18,7 +21,12 @@ use image::{DynamicImage, ImageFormat, RgbImage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use ginger_rs::{camera::Camera, car::Car, map::{Map, ScanRay, MAX_RANGE_CM}};
+use ginger_rs::{
+    camera::Camera,
+    car::Car,
+    explore,
+    map::Map,
+};
 
 // ── Embedded web UI ───────────────────────────────────────────────────────────
 
@@ -28,11 +36,12 @@ const HTML: &str = include_str!("web/index.html");
 
 #[derive(Clone, Serialize)]
 struct SensorSnapshot {
-    battery_v:   f32,
-    light_left:  Option<f32>,
-    light_right: Option<f32>,
-    ir:          Option<[bool; 3]>,
-    us_cm:       Option<f32>,
+    battery_v:     f32,
+    light_left:    Option<f32>,
+    light_right:   Option<f32>,
+    ir:            Option<[bool; 3]>,
+    us_cm:         Option<f32>,
+    explore_state: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -58,14 +67,16 @@ enum CarCmd {
     Buzzer(bool),
     SetSensors(SensorConfig),
     Scan,
+    ExploreStart,
 }
 
 #[derive(Clone)]
 struct AppState {
-    cmd_tx:  mpsc::Sender<CarCmd>,
-    sensors: Arc<RwLock<SensorSnapshot>>,
-    camera:  Arc<Camera>,
-    map:     Arc<RwLock<Map>>,
+    cmd_tx:      mpsc::Sender<CarCmd>,
+    sensors:     Arc<RwLock<SensorSnapshot>>,
+    camera:      Arc<Camera>,
+    map:         Arc<RwLock<Map>>,
+    explore_stop: Arc<AtomicBool>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -75,37 +86,43 @@ async fn main() {
     let (cmd_tx, cmd_rx) = mpsc::channel::<CarCmd>(32);
 
     let sensors = Arc::new(RwLock::new(SensorSnapshot {
-        battery_v: 0.0, light_left: None, light_right: None, ir: None, us_cm: None,
+        battery_v: 0.0, light_left: None, light_right: None,
+        ir: None, us_cm: None,
+        explore_state: "idle".into(),
     }));
 
-    let map = Arc::new(RwLock::new(Map::new()));
+    let map          = Arc::new(RwLock::new(Map::new()));
+    let explore_stop = Arc::new(AtomicBool::new(false));
 
-    let sensors_hw = sensors.clone();
-    let map_hw     = map.clone();
-    thread::spawn(move || hardware_thread(cmd_rx, sensors_hw, map_hw));
+    let sensors_hw      = sensors.clone();
+    let map_hw          = map.clone();
+    let explore_stop_hw = explore_stop.clone();
+    thread::spawn(move || hardware_thread(cmd_rx, sensors_hw, map_hw, explore_stop_hw));
 
     println!("Initialising camera…");
     let camera = Arc::new(Camera::new().expect("camera init failed"));
     println!("Camera ready.");
 
-    let state = AppState { cmd_tx, sensors, camera, map };
+    let state = AppState { cmd_tx, sensors, camera, map, explore_stop };
 
     let app = Router::new()
-        .route("/",                   get(serve_html))
-        .route("/api/sensors/stream", get(sensor_stream))
-        .route("/api/camera/frame",   get(camera_frame))
-        .route("/api/drive",          post(drive))
-        .route("/api/stop",           post(stop_car))
-        .route("/api/pan",            post(pan))
-        .route("/api/tilt",           post(tilt))
-        .route("/api/led",            post(led))
-        .route("/api/led/off",        post(led_off))
-        .route("/api/buzzer",         post(buzzer))
-        .route("/api/sensors/config", post(sensor_config))
-        .route("/api/scan",           post(trigger_scan))
-        .route("/api/map",            get(map_meta))
-        .route("/api/map/png",        get(map_png))
-        .route("/api/map/ascii",      get(map_ascii))
+        .route("/",                    get(serve_html))
+        .route("/api/sensors/stream",  get(sensor_stream))
+        .route("/api/camera/frame",    get(camera_frame))
+        .route("/api/drive",           post(drive))
+        .route("/api/stop",            post(stop_car))
+        .route("/api/pan",             post(pan))
+        .route("/api/tilt",            post(tilt))
+        .route("/api/led",             post(led))
+        .route("/api/led/off",         post(led_off))
+        .route("/api/buzzer",          post(buzzer))
+        .route("/api/sensors/config",  post(sensor_config))
+        .route("/api/scan",            post(trigger_scan))
+        .route("/api/explore/start",   post(explore_start))
+        .route("/api/explore/stop",    post(explore_stop_handler))
+        .route("/api/map",             get(map_meta))
+        .route("/api/map/png",         get(map_png))
+        .route("/api/map/ascii",       get(map_ascii))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -115,77 +132,95 @@ async fn main() {
 
 // ── Hardware thread ───────────────────────────────────────────────────────────
 
-// Pan angles for a sweep, in degrees (left to right)
-const SCAN_ANGLES: &[f32] = &[30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0];
-
-fn do_scan(car: &mut Car, map: &Arc<RwLock<Map>>) {
-    let mut rays = Vec::with_capacity(SCAN_ANGLES.len());
-    for &pan in SCAN_ANGLES {
-        car.pan_tilt().set_pan(pan).ok();
-        thread::sleep(Duration::from_millis(300)); // settle
-        let raw = car.us().distance_cm().unwrap_or(MAX_RANGE_CM + 1.0);
-        let capped = raw >= MAX_RANGE_CM;
-        let dist_cm = raw.min(MAX_RANGE_CM);
-        rays.push(ScanRay { pan_deg: pan, dist_cm, capped });
-    }
-    // Return to centre
-    car.pan_tilt().set_pan(90.0).ok();
-    map.write().unwrap().integrate_scan(&rays);
-}
-
-fn hardware_thread(mut cmd_rx: mpsc::Receiver<CarCmd>, sensors: Arc<RwLock<SensorSnapshot>>, map: Arc<RwLock<Map>>) {
-    let mut car    = Car::new().expect("Car init failed");
-    let mut config = SensorConfig::default();
-    let mut last_drive = Instant::now();
-    let mut is_driving = false;
+fn hardware_thread(
+    mut cmd_rx:   mpsc::Receiver<CarCmd>,
+    sensors:      Arc<RwLock<SensorSnapshot>>,
+    map:          Arc<RwLock<Map>>,
+    explore_stop: Arc<AtomicBool>,
+) {
+    let mut car          = Car::new().expect("Car init failed");
+    let mut config       = SensorConfig::default();
+    let mut last_drive   = Instant::now();
+    let mut is_driving   = false;
+    let mut explore_active = false;
 
     loop {
-        // Poll sensors
-        let battery_v = car.battery_v().unwrap_or(0.0);
+        // ── Command queue ──────────────────────────────────────────────────────
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                CarCmd::ExploreStart => {
+                    explore_stop.store(false, Ordering::Relaxed);
+                    explore_active = true;
+                    is_driving = false;
+                }
+                CarCmd::Stop => {
+                    explore_active = false;
+                    explore_stop.store(true, Ordering::Relaxed);
+                    car.stop().ok();
+                    is_driving = false;
+                }
+                CarCmd::SetMotors { left, right } => {
+                    // Manual drive cancels exploration
+                    explore_active = false;
+                    explore_stop.store(true, Ordering::Relaxed);
+                    car.motors().drive(left, right).ok();
+                    last_drive = Instant::now();
+                    is_driving = left != 0 || right != 0;
+                }
+                CarCmd::SetPan(a)           => { car.pan_tilt().set_pan(a).ok(); }
+                CarCmd::SetTilt(a)          => { car.pan_tilt().set_tilt(a).ok(); }
+                CarCmd::SetLed { r, g, b }  => { car.leds.set_all(r, g, b); car.leds.show().ok(); }
+                CarCmd::LedOff              => { car.leds.clear().ok(); }
+                CarCmd::Buzzer(on)          => { if on { car.buzzer.on() } else { car.buzzer.off() } }
+                CarCmd::SetSensors(cfg)     => { config = cfg; }
+                CarCmd::Scan                => {
+                    let noop = AtomicBool::new(false);
+                    let rays = explore::do_scan(&mut car, &noop);
+                    map.write().unwrap().integrate_scan(&rays);
+                }
+            }
+        }
 
+        // ── Exploration loop ───────────────────────────────────────────────────
+        if explore_active {
+            let status = explore::tick(&mut car, &map, &explore_stop);
+            {
+                let mut snap = sensors.write().unwrap();
+                snap.explore_state = status.to_string();
+                // Refresh battery inside the tick interval
+                snap.battery_v = car.battery_v().unwrap_or(snap.battery_v);
+            }
+            if status == explore::Status::Complete || explore_stop.load(Ordering::Relaxed) {
+                explore_active = false;
+                explore_stop.store(false, Ordering::Relaxed);
+            }
+            continue; // skip normal sensor poll + sleep
+        }
+
+        // ── Normal sensor poll ────────────────────────────────────────────────
+        let battery_v = car.battery_v().unwrap_or(0.0);
         let (light_left, light_right) = if config.light {
             car.light().map(|(l, r)| (Some(l), Some(r))).unwrap_or((None, None))
         } else {
             (None, None)
         };
-
         let ir = if config.ir {
             let (l, c, r) = car.ir.read_all();
             Some([l, c, r])
         } else {
             None
         };
-
         let us_cm = if config.us { car.us().distance_cm() } else { None };
 
-        *sensors.write().unwrap() = SensorSnapshot { battery_v, light_left, light_right, ir, us_cm };
+        *sensors.write().unwrap() = SensorSnapshot {
+            battery_v, light_left, light_right, ir, us_cm,
+            explore_state: "idle".into(),
+        };
 
-        // Safety stop: if motors are spinning and no command for 500ms, stop
+        // Safety stop if motors have been spinning with no command for 500 ms
         if is_driving && last_drive.elapsed() > Duration::from_millis(500) {
             car.stop().ok();
             is_driving = false;
-        }
-
-        // Drain command queue
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                CarCmd::SetMotors { left, right } => {
-                    car.motors().drive(left, right).ok();
-                    last_drive = Instant::now();
-                    is_driving = left != 0 || right != 0;
-                }
-                CarCmd::Stop => {
-                    car.stop().ok();
-                    is_driving = false;
-                }
-                CarCmd::SetPan(a)            => { car.pan_tilt().set_pan(a).ok(); }
-                CarCmd::SetTilt(a)           => { car.pan_tilt().set_tilt(a).ok(); }
-                CarCmd::SetLed { r, g, b }   => { car.leds.set_all(r, g, b); car.leds.show().ok(); }
-                CarCmd::LedOff               => { car.leds.clear().ok(); }
-                CarCmd::Buzzer(on)           => { if on { car.buzzer.on() } else { car.buzzer.off() } }
-                CarCmd::SetSensors(cfg)      => { config = cfg; }
-                CarCmd::Scan                 => { do_scan(&mut car, &map); }
-            }
         }
 
         thread::sleep(Duration::from_millis(80));
@@ -225,14 +260,10 @@ async fn camera_frame(State(st): State<AppState>) -> Response {
     .await
     .unwrap();
 
-    (
-        [
-            (header::CONTENT_TYPE, "image/jpeg"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        jpeg,
-    )
-    .into_response()
+    ([
+        (header::CONTENT_TYPE, "image/jpeg"),
+        (header::CACHE_CONTROL, "no-store"),
+    ], jpeg).into_response()
 }
 
 // ── Control endpoints ─────────────────────────────────────────────────────────
@@ -289,25 +320,38 @@ async fn sensor_config(State(st): State<AppState>, Json(b): Json<SensorConfig>) 
     StatusCode::OK
 }
 
+// ── Scan & exploration endpoints ──────────────────────────────────────────────
+
 async fn trigger_scan(State(st): State<AppState>) -> StatusCode {
     st.cmd_tx.send(CarCmd::Scan).await.ok();
     StatusCode::OK
 }
 
+async fn explore_start(State(st): State<AppState>) -> StatusCode {
+    st.explore_stop.store(false, Ordering::Relaxed);
+    st.cmd_tx.send(CarCmd::ExploreStart).await.ok();
+    StatusCode::OK
+}
+
+async fn explore_stop_handler(State(st): State<AppState>) -> StatusCode {
+    st.explore_stop.store(true, Ordering::Relaxed);
+    StatusCode::OK
+}
+
+// ── Map endpoints ─────────────────────────────────────────────────────────────
+
 async fn map_meta(State(st): State<AppState>) -> impl IntoResponse {
-    let meta = st.map.read().unwrap().meta();
-    Json(meta)
+    Json(st.map.read().unwrap().meta())
 }
 
 async fn map_png(State(st): State<AppState>) -> Response {
     let png = tokio::task::spawn_blocking(move || st.map.read().unwrap().render_png())
         .await
         .unwrap();
-    (
-        [(header::CONTENT_TYPE, "image/png"),
-         (header::CACHE_CONTROL, "no-store")],
-        png,
-    ).into_response()
+    ([
+        (header::CONTENT_TYPE, "image/png"),
+        (header::CACHE_CONTROL, "no-store"),
+    ], png).into_response()
 }
 
 async fn map_ascii(State(st): State<AppState>) -> impl IntoResponse {

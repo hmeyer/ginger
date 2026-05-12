@@ -1,4 +1,5 @@
 pub mod adc;
+pub mod explore;
 pub mod map;
 pub mod buzzer;
 pub mod camera;
