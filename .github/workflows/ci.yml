@@ -15,12 +15,57 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libcamera-dev libclang-dev
+
+      # Ubuntu 24.04 ships libcamera 0.2.0; the Rust crate requires >= 0.4.0.
+      # Build 0.4.0 from source and cache the install tree.
+      - name: Cache libcamera
+        id: libcamera-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/libcamera
+          key: libcamera-0.4.0-${{ runner.os }}
+
+      - name: Install libcamera build deps
+        if: steps.libcamera-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build \
+            python3-yaml python3-ply python3-jinja2 \
+            libudev-dev
+
+      - name: Build libcamera 0.4.0 from source
+        if: steps.libcamera-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v0.4.0 \
+            https://git.libcamera.org/libcamera/libcamera.git lc-src
+          meson setup lc-src/build lc-src \
+            --prefix=/opt/libcamera \
+            -Dpipewire=disabled \
+            -Dgstreamer=disabled \
+            -Dlc-compliance=disabled \
+            -Dcam=disabled \
+            -Dqcam=disabled \
+            -Ddocumentation=disabled \
+            -Dtest=false
+          ninja -C lc-src/build
+          ninja -C lc-src/build install
+
+      - name: Set libcamera env paths
+        run: |
+          # meson installs .pc files under lib/ or lib/<arch>/pkgconfig/
+          echo "PKG_CONFIG_PATH=/opt/libcamera/lib/pkgconfig:/opt/libcamera/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/opt/libcamera/lib:/opt/libcamera/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
+
+      - name: Install Rust linker deps
+        run: sudo apt-get install -y --no-install-recommends libclang-dev
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
       - uses: Swatinem/rust-cache@v2
+
       - run: make lint
 
   audit:
