@@ -3,7 +3,7 @@
 //! Pan channel 8, tilt channel 9. Pan is wired inverted.
 //! Pulse: 500 µs = 0°, 1500 µs = 90°, 2500 µs = 180°.
 
-use crate::{pca9685::Pca9685, Result};
+use crate::{Result, pca9685::Pca9685};
 
 const PAN_CHANNEL: u8 = 8;
 const TILT_CHANNEL: u8 = 9;
@@ -13,7 +13,11 @@ const PULSE_MAX_US: f32 = 2500.0;
 fn angle_to_pulse(angle: f32, invert: bool, trim_us: f32) -> f32 {
     let angle = angle.clamp(0.0, 180.0);
     let pulse = PULSE_MIN_US + angle / 180.0 * (PULSE_MAX_US - PULSE_MIN_US);
-    let pulse = if invert { PULSE_MIN_US + PULSE_MAX_US - pulse } else { pulse };
+    let pulse = if invert {
+        PULSE_MIN_US + PULSE_MAX_US - pulse
+    } else {
+        pulse
+    };
     pulse + trim_us
 }
 
@@ -25,7 +29,11 @@ pub struct PanTilt<'a> {
 
 impl<'a> PanTilt<'a> {
     pub fn new(pwm: &'a mut Pca9685, pan_trim_us: f32, tilt_trim_us: f32) -> Self {
-        Self { pwm, pan_trim_us, tilt_trim_us }
+        Self {
+            pwm,
+            pan_trim_us,
+            tilt_trim_us,
+        }
     }
 
     /// angle: 0–180°, 90 = center.

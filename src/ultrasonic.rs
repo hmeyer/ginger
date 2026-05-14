@@ -11,20 +11,20 @@ use crate::Result;
 const TRIGGER_PIN: u8 = 27;
 const ECHO_PIN: u8 = 22;
 
-const ECHO_IDLE_TIMEOUT:  Duration = Duration::from_millis(100);
+const ECHO_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 const ECHO_START_TIMEOUT: Duration = Duration::from_millis(10);
-const ECHO_END_TIMEOUT:   Duration = Duration::from_millis(50);
+const ECHO_END_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub struct Ultrasonic {
     trigger: OutputPin,
-    echo:    InputPin,
+    echo: InputPin,
 }
 
 impl Ultrasonic {
     pub fn new() -> Result<Self> {
         let gpio = Gpio::new()?;
         let trigger = gpio.get(TRIGGER_PIN)?.into_output_low();
-        let echo    = gpio.get(ECHO_PIN)?.into_input();
+        let echo = gpio.get(ECHO_PIN)?.into_input();
         Ok(Self { trigger, echo })
     }
 

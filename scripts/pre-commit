@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+export PATH="$HOME/.cargo/bin:$PATH"
+make lint

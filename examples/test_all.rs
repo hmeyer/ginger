@@ -15,7 +15,9 @@ fn section(n: u8, name: &str) {
     println!("└─────────────────────────────────────────┘");
 }
 
-fn ok()  { println!("  ✓ PASS"); }
+fn ok() {
+    println!("  ✓ PASS");
+}
 fn wait_enter(prompt: &str) {
     print!("  {prompt} [Enter] ");
     io::stdout().flush().unwrap();
@@ -40,16 +42,18 @@ fn main() -> ginger_rs::Result<()> {
     let (l, r) = car.light()?;
     println!("  Light left:  {l:.2} V");
     println!("  Light right: {r:.2} V");
-    if batt < 6.0 { println!("  ⚠ Battery low!"); }
+    if batt < 6.0 {
+        println!("  ⚠ Battery low!");
+    }
     ok();
 
     // ── 2. LEDs ───────────────────────────────────────────────────────────────
     section(2, "LEDs — 8× WS2812B");
     for (name, r, g, b) in [
-        ("Red",   255u8, 0,   0  ),
-        ("Green", 0,     255, 0  ),
-        ("Blue",  0,     0,   255),
-        ("White", 128,   128, 128),
+        ("Red", 255u8, 0, 0),
+        ("Green", 0, 255, 0),
+        ("Blue", 0, 0, 255),
+        ("White", 128, 128, 128),
     ] {
         println!("  {name}…");
         car.leds.set_all(r, g, b);
@@ -82,7 +86,7 @@ fn main() -> ginger_rs::Result<()> {
         let d = car.us().distance_cm();
         match d {
             Some(cm) => println!("  [{i}]  {cm:.1} cm"),
-            None     => println!("  [{i}]  — (timeout / out of range)"),
+            None => println!("  [{i}]  — (timeout / out of range)"),
         }
         sleep(Duration::from_millis(400));
     }
@@ -107,12 +111,12 @@ fn main() -> ginger_rs::Result<()> {
     wait_enter("Place the car on the floor with space in all directions, then press");
 
     let duty = 1800i32;
-    let dur  = Duration::from_millis(500);
+    let dur = Duration::from_millis(500);
     for (label, l, r) in [
-        ("Forward",    duty,  duty ),
-        ("Backward",  -duty, -duty ),
-        ("Turn left", -duty,  duty ),
-        ("Turn right",  duty, -duty),
+        ("Forward", duty, duty),
+        ("Backward", -duty, -duty),
+        ("Turn left", -duty, duty),
+        ("Turn right", duty, -duty),
     ] {
         println!("  {label}…");
         car.motors().drive(l, r)?;
@@ -125,9 +129,14 @@ fn main() -> ginger_rs::Result<()> {
     // ── 8. Camera ────────────────────────────────────────────────────────────
     section(8, "Camera — OV5647 via libcamera");
     println!("  Starting camera (warmup takes ~1 s)…");
-    let cam   = Camera::new()?;
+    let cam = Camera::new()?;
     let frame = cam.get_frame();
-    println!("  Captured {}×{} YUYV frame ({} bytes)", frame.width, frame.height, frame.data.len());
+    println!(
+        "  Captured {}×{} YUYV frame ({} bytes)",
+        frame.width,
+        frame.height,
+        frame.data.len()
+    );
     frame.save_ppm("/tmp/ginger_test.ppm").unwrap();
     println!("  Saved to /tmp/ginger_test.ppm");
     ok();

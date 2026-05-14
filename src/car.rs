@@ -4,15 +4,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::{
-    adc::Adc,
-    buzzer::Buzzer,
-    infrared::InfraredSensors,
-    led::LedStrip,
-    motors::Motors,
-    pca9685::Pca9685,
-    servo::PanTilt,
-    ultrasonic::Ultrasonic,
-    Result,
+    Result, adc::Adc, buzzer::Buzzer, infrared::InfraredSensors, led::LedStrip, motors::Motors,
+    pca9685::Pca9685, servo::PanTilt, ultrasonic::Ultrasonic,
 };
 
 const SAFE_DISTANCE_CM: f32 = 30.0;
@@ -20,12 +13,12 @@ const PAN_SETTLE: Duration = Duration::from_millis(300);
 const DRIVE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct Car {
-    pwm:       Pca9685,
-    pub adc:   Adc,
-    pub ir:    InfraredSensors,
-    pub leds:  LedStrip,
+    pwm: Pca9685,
+    pub adc: Adc,
+    pub ir: InfraredSensors,
+    pub leds: LedStrip,
     pub buzzer: Buzzer,
-    us:        Ultrasonic,
+    us: Ultrasonic,
     // motors and pan_tilt borrow `pwm`, so we call them via helpers that hold short borrows
 }
 
@@ -42,11 +35,11 @@ impl Car {
 
         Ok(Self {
             pwm,
-            adc:    Adc::new()?,
-            ir:     InfraredSensors::new()?,
-            leds:   LedStrip::new(255)?,
+            adc: Adc::new()?,
+            ir: InfraredSensors::new()?,
+            leds: LedStrip::new(255)?,
             buzzer: Buzzer::new()?,
-            us:     Ultrasonic::new()?,
+            us: Ultrasonic::new()?,
         })
     }
 
@@ -73,7 +66,7 @@ impl Car {
         self.pan_tilt().set_pan(90.0)?;
         sleep(PAN_SETTLE);
         let dist = self.us.distance_cm();
-        let safe = dist.map_or(true, |d| d > SAFE_DISTANCE_CM);
+        let safe = dist.is_none_or(|d| d > SAFE_DISTANCE_CM);
         Ok((safe, dist))
     }
 
@@ -98,14 +91,14 @@ impl Car {
             if Instant::now() >= deadline {
                 break;
             }
-            if left > 0 && right > 0 {
-                if let Some(d) = self.us.distance_cm() {
-                    if d < SAFE_DISTANCE_CM {
-                        println!("STOP: obstacle at {d:.1}cm");
-                        self.motors().stop()?;
-                        return Ok(false);
-                    }
-                }
+            if left > 0
+                && right > 0
+                && let Some(d) = self.us.distance_cm()
+                && d < SAFE_DISTANCE_CM
+            {
+                println!("STOP: obstacle at {d:.1}cm");
+                self.motors().stop()?;
+                return Ok(false);
             }
             sleep(DRIVE_CHECK_INTERVAL);
         }

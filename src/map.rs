@@ -7,7 +7,7 @@
 use image::{DynamicImage, ImageBuffer, Rgb};
 use serde::Serialize;
 
-pub const W: usize = 320;   // cells — 32 m at 10 cm/cell
+pub const W: usize = 320; // cells — 32 m at 10 cm/cell
 pub const H: usize = 320;
 pub const CELL_CM: f32 = 10.0;
 pub const MAX_RANGE_CM: f32 = 150.0;
@@ -18,9 +18,9 @@ pub const UNKNOWN: u8 = 0;
 #[derive(Clone)]
 pub struct Map {
     pub cells: Vec<u8>,
-    pub robot_gx: f32,       // grid coords (floats for sub-cell precision)
+    pub robot_gx: f32, // grid coords (floats for sub-cell precision)
     pub robot_gy: f32,
-    pub robot_heading: f32,  // degrees, 0=north, clockwise
+    pub robot_heading: f32, // degrees, 0=north, clockwise
 }
 
 #[derive(Serialize, Clone)]
@@ -36,9 +36,15 @@ pub struct MapMeta {
 /// One reading from the ultrasonic sensor during a sweep.
 #[derive(Clone, Debug)]
 pub struct ScanRay {
-    pub pan_deg: f32,   // servo angle (90 = forward)
-    pub dist_cm: f32,   // measured distance, already capped at MAX_RANGE_CM
-    pub capped: bool,   // true if we hit the cap (no real obstacle detected)
+    pub pan_deg: f32, // servo angle (90 = forward)
+    pub dist_cm: f32, // measured distance, already capped at MAX_RANGE_CM
+    pub capped: bool, // true if we hit the cap (no real obstacle detected)
+}
+
+impl Default for Map {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Map {
@@ -76,8 +82,8 @@ impl Map {
         // Absolute angle in map coords (sin/cos in image-y-down system)
         let abs_deg = heading_deg + (ray.pan_deg - 90.0);
         let abs_rad = abs_deg.to_radians();
-        let dx = abs_rad.sin();   //  east component
-        let dy = -abs_rad.cos();  // -north = south component (y-down)
+        let dx = abs_rad.sin(); //  east component
+        let dy = -abs_rad.cos(); // -north = south component (y-down)
 
         let cells_along = (ray.dist_cm / CELL_CM).ceil() as usize;
 
@@ -99,7 +105,7 @@ impl Map {
             let gx = (from_gx + dx * ray.dist_cm / CELL_CM).round() as i32;
             let gy = (from_gy + dy * ray.dist_cm / CELL_CM).round() as i32;
             if let Some(cell) = self.cell_mut(gx, gy) {
-                *cell = (*cell).max(128).saturating_add(16).min(255);
+                *cell = (*cell).max(128).saturating_add(16);
             }
         }
     }
@@ -119,14 +125,16 @@ impl Map {
             for x in 0..W {
                 let cell = self.cells[y * W + x];
                 let rgb = match cell {
-                    0 => [14u8, 14, 28],    // unknown — very dark
+                    0 => [14u8, 14, 28], // unknown — very dark
                     1..=127 => {
                         let t = cell as f32 / 127.0;
-                        [(30.0 + t * 10.0) as u8,
-                         (55.0 + t * 80.0) as u8,
-                         (25.0 + t * 10.0) as u8]  // dark→bright green
+                        [
+                            (30.0 + t * 10.0) as u8,
+                            (55.0 + t * 80.0) as u8,
+                            (25.0 + t * 10.0) as u8,
+                        ] // dark→bright green
                     }
-                    _ => [180u8, 48, 38],   // occupied — red
+                    _ => [180u8, 48, 38], // occupied — red
                 };
                 img.put_pixel(x as u32, y as u32, Rgb(rgb));
             }
@@ -160,13 +168,17 @@ impl Map {
     /// ASCII export for LLM consumption. Shows explored bounding box + robot.
     pub fn to_ascii(&self) -> String {
         // Find bounding box of non-unknown cells
-        let mut min_x = W; let mut max_x = 0;
-        let mut min_y = H; let mut max_y = 0;
+        let mut min_x = W;
+        let mut max_x = 0;
+        let mut min_y = H;
+        let mut max_y = 0;
         for y in 0..H {
             for x in 0..W {
                 if self.cells[y * W + x] != UNKNOWN {
-                    min_x = min_x.min(x); max_x = max_x.max(x);
-                    min_y = min_y.min(y); max_y = max_y.max(y);
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
                 }
             }
         }
@@ -189,9 +201,9 @@ impl Map {
                     '@'
                 } else {
                     match self.cells[y * W + x] {
-                        0       => '?',
+                        0 => '?',
                         1..=127 => '.',
-                        _       => '#',
+                        _ => '#',
                     }
                 };
                 out.push(ch);

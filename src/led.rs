@@ -11,15 +11,19 @@ const LED_COUNT: usize = 8;
 const SPI_HZ: u32 = 6_400_000; // 8 bits / 1.25 µs ≈ 6.4 MHz
 
 pub struct LedStrip {
-    spi:        Spi,
-    buf:        [[u8; 3]; LED_COUNT], // stored as [G, R, B]
+    spi: Spi,
+    buf: [[u8; 3]; LED_COUNT], // stored as [G, R, B]
     brightness: u8,
 }
 
 impl LedStrip {
     pub fn new(brightness: u8) -> Result<Self> {
         let spi = Spi::new(Bus::Spi0, SlaveSelect::Ss0, SPI_HZ, Mode::Mode0)?;
-        let mut strip = Self { spi, buf: [[0; 3]; LED_COUNT], brightness };
+        let mut strip = Self {
+            spi,
+            buf: [[0; 3]; LED_COUNT],
+            brightness,
+        };
         strip.show()?;
         Ok(strip)
     }
@@ -44,7 +48,11 @@ impl LedStrip {
         let mut tx = vec![0u8; flat.len() * 8];
         for (byte_idx, &byte) in flat.iter().enumerate() {
             for bit in 0..8u8 {
-                let spi_byte = if (byte >> (7 - bit)) & 1 == 1 { 0xF8 } else { 0x80 };
+                let spi_byte = if (byte >> (7 - bit)) & 1 == 1 {
+                    0xF8
+                } else {
+                    0x80
+                };
                 tx[byte_idx * 8 + bit as usize] = spi_byte;
             }
         }

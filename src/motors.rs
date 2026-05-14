@@ -3,7 +3,10 @@
 //! Channel pairs (forward, reverse) per wheel:
 //!   left_front (7,6), left_rear (5,4), right_front (1,0), right_rear (2,3)
 
-use crate::{pca9685::{Pca9685, MAX_DUTY, FULL_OFF}, Result};
+use crate::{
+    Result,
+    pca9685::{FULL_OFF, MAX_DUTY, Pca9685},
+};
 
 struct WheelChannels {
     fwd: u8,
@@ -31,10 +34,10 @@ impl<'a> Motors<'a> {
         let duty = duty.clamp(-(MAX_DUTY as i32), MAX_DUTY as i32);
         let ch = &WHEELS[wheel_idx];
         if duty > 0 {
-            self.pwm.set_pwm(ch.fwd, 0, FULL_OFF)?;   // inactive pin: guaranteed LOW
+            self.pwm.set_pwm(ch.fwd, 0, FULL_OFF)?; // inactive pin: guaranteed LOW
             self.pwm.set_pwm(ch.rev, 0, duty as u16)?;
         } else if duty < 0 {
-            self.pwm.set_pwm(ch.rev, 0, FULL_OFF)?;   // inactive pin: guaranteed LOW
+            self.pwm.set_pwm(ch.rev, 0, FULL_OFF)?; // inactive pin: guaranteed LOW
             self.pwm.set_pwm(ch.fwd, 0, (-duty) as u16)?;
         } else {
             self.pwm.set_pwm(ch.fwd, 0, MAX_DUTY)?;
@@ -45,8 +48,8 @@ impl<'a> Motors<'a> {
 
     /// Set all wheels: left side / right side duty (-4095..4095).
     pub fn drive(&mut self, left: i32, right: i32) -> Result<()> {
-        self.set_wheel(0, left)?;  // left_front
-        self.set_wheel(1, left)?;  // left_rear
+        self.set_wheel(0, left)?; // left_front
+        self.set_wheel(1, left)?; // left_rear
         self.set_wheel(2, right)?; // right_front
         self.set_wheel(3, right)?; // right_rear
         Ok(())

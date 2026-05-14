@@ -28,7 +28,7 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 // ── Frame ────────────────────────────────────────────────────────────────────
 
 pub struct Frame {
-    pub width:  u32,
+    pub width: u32,
     pub height: u32,
     /// Raw YUYV bytes: 2 bytes per pixel, [Y0 U Y1 V] per 4-byte group.
     pub data: Vec<u8>,
@@ -41,14 +41,16 @@ impl Frame {
         let mut rgb = vec![0u8; w * h * 3];
         for (i, chunk) in self.data[..w * h * 2].chunks_exact(4).enumerate() {
             let (y0, u, y1, v) = (
-                chunk[0] as i32, chunk[1] as i32,
-                chunk[2] as i32, chunk[3] as i32,
+                chunk[0] as i32,
+                chunk[1] as i32,
+                chunk[2] as i32,
+                chunk[3] as i32,
             );
             for (j, &y) in [y0, y1].iter().enumerate() {
                 let base = (i * 2 + j) * 3;
-                rgb[base]     = (y + 1402 * (v - 128) / 1000).clamp(0, 255) as u8;
-                rgb[base + 1] = (y - 344  * (u - 128) / 1000
-                                   - 714  * (v - 128) / 1000).clamp(0, 255) as u8;
+                rgb[base] = (y + 1402 * (v - 128) / 1000).clamp(0, 255) as u8;
+                rgb[base + 1] =
+                    (y - 344 * (u - 128) / 1000 - 714 * (v - 128) / 1000).clamp(0, 255) as u8;
                 rgb[base + 2] = (y + 1772 * (u - 128) / 1000).clamp(0, 255) as u8;
             }
         }
@@ -67,7 +69,7 @@ impl Frame {
 // ── Internal shared state ────────────────────────────────────────────────────
 
 struct FrameState {
-    frame:      Option<Arc<Frame>>,
+    frame: Option<Arc<Frame>>,
     generation: u64,
 }
 
@@ -76,7 +78,7 @@ type Shared = Arc<(Mutex<FrameState>, Condvar)>;
 // ── Camera ───────────────────────────────────────────────────────────────────
 
 pub struct Camera {
-    shared:  Shared,
+    shared: Shared,
     _thread: JoinHandle<()>,
 }
 
@@ -85,10 +87,14 @@ impl Camera {
     /// Blocks until the first real frame is ready (warmup included, ≤10 s).
     pub fn new() -> Result<Self> {
         // Setup handshake: thread sends Ok(()) or Err(msg) once the camera is configured.
-        let (setup_tx, setup_rx) = std::sync::mpsc::sync_channel::<std::result::Result<(), String>>(1);
+        let (setup_tx, setup_rx) =
+            std::sync::mpsc::sync_channel::<std::result::Result<(), String>>(1);
 
         let shared: Shared = Arc::new((
-            Mutex::new(FrameState { frame: None, generation: 0 }),
+            Mutex::new(FrameState {
+                frame: None,
+                generation: 0,
+            }),
             Condvar::new(),
         ));
         let shared_thread = shared.clone();
@@ -120,7 +126,10 @@ impl Camera {
             }
         }
 
-        Ok(Self { shared, _thread: thread })
+        Ok(Self {
+            shared,
+            _thread: thread,
+        })
     }
 
     /// Most recent frame, returned immediately (may be the same as last call).
@@ -142,7 +151,7 @@ impl Camera {
 // ── Background capture loop ───────────────────────────────────────────────────
 
 fn camera_loop(
-    shared:   Shared,
+    shared: Shared,
     setup_tx: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 ) {
     if let Err(e) = run_camera(shared, setup_tx.clone()) {
@@ -151,12 +160,12 @@ fn camera_loop(
 }
 
 fn run_camera(
-    shared:   Shared,
+    shared: Shared,
     setup_tx: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mgr     = CameraManager::new()?;
+    let mgr = CameraManager::new()?;
     let cameras = mgr.cameras();
-    let cam     = cameras.get(0).ok_or("no camera found")?;
+    let cam = cameras.get(0).ok_or("no camera found")?;
     let mut cam = cam.acquire()?;
 
     let mut cfgs = cam
@@ -164,20 +173,19 @@ fn run_camera(
         .ok_or("could not generate camera configuration")?;
     cfgs.get_mut(0).unwrap().set_pixel_format(YUYV);
 
-    match cfgs.validate() {
-        CameraConfigurationStatus::Invalid => return Err("camera config invalid".into()),
-        _ => {}
+    if let CameraConfigurationStatus::Invalid = cfgs.validate() {
+        return Err("camera config invalid".into());
     }
 
-    let width  = cfgs.get(0).unwrap().get_size().width;
+    let width = cfgs.get(0).unwrap().get_size().width;
     let height = cfgs.get(0).unwrap().get_size().height;
 
     cam.configure(&mut cfgs)?;
 
-    let mut alloc  = FrameBufferAllocator::new(&cam);
-    let cfg        = cfgs.get(0).unwrap();
-    let stream     = cfg.stream().unwrap();
-    let buffers    = alloc.alloc(&stream)?;
+    let mut alloc = FrameBufferAllocator::new(&cam);
+    let cfg = cfgs.get(0).unwrap();
+    let stream = cfg.stream().unwrap();
+    let buffers = alloc.alloc(&stream)?;
 
     let buffers: Vec<_> = buffers
         .into_iter()
@@ -194,7 +202,9 @@ fn run_camera(
         .collect();
 
     let (frame_tx, frame_rx) = std::sync::mpsc::channel();
-    cam.on_request_completed(move |req| { let _ = frame_tx.send(req); });
+    cam.on_request_completed(move |req| {
+        let _ = frame_tx.send(req);
+    });
 
     cam.start(None)?;
     for req in reqs.drain(..) {
@@ -216,11 +226,15 @@ fn run_camera(
             .unwrap_or(width as usize * height as usize * 2);
 
         if warmup >= WARMUP_FRAMES {
-            let data  = fb.data()[0][..bytes_used].to_vec();
-            let frame = Arc::new(Frame { width, height, data });
+            let data = fb.data()[0][..bytes_used].to_vec();
+            let frame = Arc::new(Frame {
+                width,
+                height,
+                data,
+            });
             let (lock, cvar) = &*shared;
             let mut st = lock.lock().unwrap();
-            st.frame      = Some(frame);
+            st.frame = Some(frame);
             st.generation += 1;
             cvar.notify_all();
         } else {

@@ -15,7 +15,7 @@ const OSC_FREQ: u32 = 25_000_000;
 const PWM_RES: u32 = 4096;
 
 pub const MAX_DUTY: u16 = (PWM_RES - 1) as u16; // 4095
-pub const FULL_OFF: u16 = PWM_RES as u16;        // 4096 — sets FULL-OFF bit in OFF_H register
+pub const FULL_OFF: u16 = PWM_RES as u16; // 4096 — sets FULL-OFF bit in OFF_H register
 
 pub struct Pca9685 {
     i2c: I2c,
@@ -30,7 +30,8 @@ impl Pca9685 {
     }
 
     pub fn set_pwm_freq(&mut self, freq: f32) -> Result<()> {
-        let prescale = ((OSC_FREQ as f32 / (PWM_RES as f32 * freq)).round() as u8).saturating_sub(1);
+        let prescale =
+            ((OSC_FREQ as f32 / (PWM_RES as f32 * freq)).round() as u8).saturating_sub(1);
         let old_mode = self.i2c.smbus_read_byte(MODE1)?;
         self.i2c.smbus_write_byte(MODE1, (old_mode & 0x7F) | 0x10)?; // sleep
         self.i2c.smbus_write_byte(PRESCALE, prescale)?;
@@ -42,10 +43,10 @@ impl Pca9685 {
 
     pub fn set_pwm(&mut self, channel: u8, on: u16, off: u16) -> Result<()> {
         let base = LED0_ON_L + 4 * channel;
-        self.i2c.smbus_write_byte(base,     (on  & 0xFF) as u8)?;
-        self.i2c.smbus_write_byte(base + 1, (on  >> 8)   as u8)?;
+        self.i2c.smbus_write_byte(base, (on & 0xFF) as u8)?;
+        self.i2c.smbus_write_byte(base + 1, (on >> 8) as u8)?;
         self.i2c.smbus_write_byte(base + 2, (off & 0xFF) as u8)?;
-        self.i2c.smbus_write_byte(base + 3, (off >> 8)   as u8)?;
+        self.i2c.smbus_write_byte(base + 3, (off >> 8) as u8)?;
         Ok(())
     }
 

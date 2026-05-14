@@ -7,7 +7,12 @@ fn main() -> ginger_rs::Result<()> {
     let cam = Camera::new()?;
 
     let frame = cam.get_frame();
-    println!("Frame: {}×{}  {} bytes", frame.width, frame.height, frame.data.len());
+    println!(
+        "Frame: {}×{}  {} bytes",
+        frame.width,
+        frame.height,
+        frame.data.len()
+    );
 
     frame.save_ppm("/tmp/frame.ppm").unwrap();
     println!("Saved /tmp/frame.ppm");

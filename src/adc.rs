@@ -7,10 +7,10 @@ use rppal::i2c::I2c;
 use crate::Result;
 
 const ADDRESS: u16 = 0x48;
-const COMMAND: u8  = 0x84; // single-ended, internal ref + ADC on
+const COMMAND: u8 = 0x84; // single-ended, internal ref + ADC on
 
 const VOLTAGE_COEFF_V2: f32 = 5.2;
-const BATTERY_MULT_V2:  f32 = 2.0;
+const BATTERY_MULT_V2: f32 = 2.0;
 
 // Maps channel 0–7 to ADS7830 MUX bits.
 fn channel_cmd(ch: u8) -> u8 {
@@ -20,7 +20,7 @@ fn channel_cmd(ch: u8) -> u8 {
 
 pub struct Adc {
     i2c: I2c,
-    v_coeff:   f32,
+    v_coeff: f32,
     batt_mult: f32,
 }
 
@@ -28,7 +28,11 @@ impl Adc {
     pub fn new() -> Result<Self> {
         let mut i2c = I2c::new()?;
         i2c.set_slave_address(ADDRESS)?;
-        Ok(Self { i2c, v_coeff: VOLTAGE_COEFF_V2, batt_mult: BATTERY_MULT_V2 })
+        Ok(Self {
+            i2c,
+            v_coeff: VOLTAGE_COEFF_V2,
+            batt_mult: BATTERY_MULT_V2,
+        })
     }
 
     /// Raw 8-bit ADC value for channel 0–7 (reads until two consecutive reads agree).

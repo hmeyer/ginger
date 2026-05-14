@@ -1,5 +1,8 @@
 # Ginger
 
+[![CI](https://github.com/hmeyer/ginger/actions/workflows/ci.yml/badge.svg)](https://github.com/hmeyer/ginger/actions/workflows/ci.yml)
+[![Audit](https://github.com/hmeyer/ginger/actions/workflows/ci.yml/badge.svg?event=push&label=audit)](https://github.com/hmeyer/ginger/actions/workflows/ci.yml)
+
 Rust driver library and web control interface for the [Freenove 4WD Smart Car Kit (FNK0043)](https://docs.freenove.com/projects/fnk0043/en/latest/) running on a Raspberry Pi 4, PCB v2.0.
 
 ## Hardware
@@ -18,26 +21,27 @@ Rust driver library and web control interface for the [Freenove 4WD Smart Car Ki
 ## Crate layout
 
 ```
-ginger-rs/
-  src/
-    pca9685.rs    — I2C PWM driver (PCA9685)
-    motors.rs     — 4WD differential drive
-    servo.rs      — Pan/tilt with invert + trim
-    adc.rs        — ADS7830 battery/voltage/light ADC
-    led.rs        — WS2812B strip over SPI
-    buzzer.rs     — Active buzzer
-    ultrasonic.rs — HC-SR04 distance sensor
-    infrared.rs   — 3-sensor line tracker
-    camera.rs     — OV5647 via libcamera (streaming background thread)
-    car.rs        — Top-level Car struct with obstacle-avoidance safety
+src/
+  pca9685.rs    — I2C PWM driver (PCA9685)
+  motors.rs     — 4WD differential drive
+  servo.rs      — Pan/tilt with invert + trim
+  adc.rs        — ADS7830 battery/voltage/light ADC
+  led.rs        — WS2812B strip over SPI
+  buzzer.rs     — Active buzzer
+  ultrasonic.rs — HC-SR04 distance sensor
+  infrared.rs   — 3-sensor line tracker
+  camera.rs     — OV5647 via libcamera (streaming background thread)
+  car.rs        — Top-level Car struct with obstacle-avoidance safety
+  explore.rs    — Frontier-based autonomous exploration
+  map.rs        — Occupancy grid map (320×320, 10 cm/cell)
   bin/
     main.rs       — Web server (axum) with live sensor stream + controls
     web/
       index.html  — Embedded mobile-first control UI
-  examples/
-    test_all.rs   — Interactive component-by-component hardware test
-    drive_test.rs — Battery check + forward drive smoke test
-    camera_test.rs — Capture one frame and save as PPM
+examples/
+  test_all.rs   — Interactive component-by-component hardware test
+  drive_test.rs — Battery check + forward drive smoke test
+  camera_test.rs — Capture one frame and save as PPM
 ```
 
 ## Dependencies
@@ -51,8 +55,17 @@ Rust toolchain via [rustup](https://rustup.rs).
 ## Building
 
 ```bash
-cd ginger-rs
 cargo build
+# or via make:
+make build
+```
+
+## Linting
+
+```bash
+make lint          # fmt check + clippy (also runs as pre-commit hook)
+make audit         # check dependencies for known CVEs (requires cargo-audit)
+make install-hooks # install git pre-commit hook
 ```
 
 ## Web interface
