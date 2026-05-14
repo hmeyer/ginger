@@ -4,8 +4,15 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::{
-    Result, adc::Adc, buzzer::Buzzer, infrared::InfraredSensors, led::LedStrip, motors::Motors,
-    pca9685::Pca9685, servo::PanTilt, ultrasonic::Ultrasonic,
+    Result,
+    adc::Adc,
+    buzzer::Buzzer,
+    infrared::InfraredSensors,
+    led::LedStrip,
+    motors::Motors,
+    pca9685::Pca9685,
+    servo::{PAN_TRIM_US, PanTilt},
+    ultrasonic::Ultrasonic,
 };
 
 const SAFE_DISTANCE_CM: f32 = 30.0;
@@ -29,7 +36,7 @@ impl Car {
 
         // Center servos on startup
         {
-            let mut pt = PanTilt::new(&mut pwm, 0.0, 0.0);
+            let mut pt = PanTilt::new(&mut pwm, PAN_TRIM_US, 0.0);
             pt.center()?;
         }
 

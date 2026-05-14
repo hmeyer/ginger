@@ -10,6 +10,11 @@ const TILT_CHANNEL: u8 = 9;
 const PULSE_MIN_US: f32 = 500.0;
 const PULSE_MAX_US: f32 = 2500.0;
 
+// Physical straight-ahead is at 83.5° rather than the nominal 90°.
+// Trim shifts set_pan(90.0) to the correct pulse for actual straight.
+const PAN_TRUE_CENTER_DEG: f32 = 83.5;
+pub const PAN_TRIM_US: f32 = (90.0 - PAN_TRUE_CENTER_DEG) / 180.0 * (PULSE_MAX_US - PULSE_MIN_US);
+
 fn angle_to_pulse(angle: f32, invert: bool, trim_us: f32) -> f32 {
     let angle = angle.clamp(0.0, 180.0);
     let pulse = PULSE_MIN_US + angle / 180.0 * (PULSE_MAX_US - PULSE_MIN_US);

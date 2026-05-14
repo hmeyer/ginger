@@ -30,7 +30,7 @@ src/
   buzzer.rs     — Active buzzer
   ultrasonic.rs — HC-SR04 distance sensor
   infrared.rs   — 3-sensor line tracker
-  camera.rs     — OV5647 via libcamera (streaming background thread)
+  camera.rs     — OV5647 via libcamera (streaming background thread, software AE)
   car.rs        — Top-level Car struct with obstacle-avoidance safety
   explore.rs    — Frontier-based autonomous exploration
   map.rs        — Occupancy grid map (320×320, 10 cm/cell)
@@ -42,6 +42,8 @@ examples/
   test_all.rs   — Interactive component-by-component hardware test
   drive_test.rs — Battery check + forward drive smoke test
   camera_test.rs — Capture one frame and save as PPM
+scripts/
+  install-service.sh — Install ginger as a systemd user service
 ```
 
 ## Dependencies
@@ -55,7 +57,7 @@ Rust toolchain via [rustup](https://rustup.rs).
 ## Building
 
 ```bash
-cargo build
+cargo build --release   # always use release; debug is 10-20× slower for JPEG encoding
 # or via make:
 make build
 ```
@@ -68,23 +70,44 @@ make audit         # check dependencies for known CVEs (requires cargo-audit)
 make install-hooks # install git pre-commit hook
 ```
 
+## Running as a system service
+
+Install as a systemd user service that starts at boot and **automatically restarts whenever the binary is rebuilt**:
+
+```bash
+bash scripts/install-service.sh
+```
+
+After that, `cargo build --release` is all you need to deploy — the running server is replaced within a second or two. Logs go to the system journal:
+
+```bash
+journalctl --user -u ginger -f
+```
+
 ## Web interface
 
 The `ginger` binary serves a mobile-first control UI on port 8080:
 
 ```bash
-cargo run --bin ginger
+cargo run --release --bin ginger
 # Open http://<pi-ip>:8080  or  http://ginger.local:8080
 ```
 
 Features:
-- **Live sensor feed** via SSE — battery voltage, light sensors (L/R), IR line tracker (3 dots), ultrasonic distance, all updating at 200 ms
-- **Camera stream** — JPEG frames polled at ~20 fps
+- **Live sensor feed** via SSE — battery voltage, light sensors (L/R), IR line tracker (3 dots), ultrasonic distance + time-to-collision estimate, all updating at 200 ms
+- **Camera stream** — adaptive JPEG, targeting 30 fps; quality and resolution scale down automatically to stay within budget
+- **Onboard FPS** (camera capture rate) and **web FPS** (browser delivery rate) displayed live
+- **Software auto-exposure** — EMA-smoothed luma loop; gain-first policy keeps exposure short for motion-blur-free images; switchable to manual sliders for exposure (0.5–100 ms) and gain (1–16×)
 - **Drive controls** — D-pad (tap or hold), keyboard arrow keys, space to stop; server safety-stops motors after 500 ms of silence
+- **Forward collision avoidance** — hard stop at 20 cm, obstacle lock prevents re-override; time-to-collision displayed with colour coding (red < 1 s, orange < 2 s, green)
+- **Pan/tilt auto-center** — after ~10 cm of sustained forward motion the pan/tilt automatically returns to center so the ultrasonic sensor faces forward
+- **Pan trim** — physical straight-ahead baked in as a servo pulse offset; `set_pan(90°)` always points the sensor forward
 - **Pan / tilt sliders** — 0–180° range
 - **LED** — colour picker + off button
 - **Buzzer** — hold to beep
 - **Sensor toggles** — enable/disable light, IR, and ultrasonic per sensor
+- **Minimap** — live occupancy-grid overlay, updated during exploration
+- **Autonomous exploration** — frontier-based; scan → move → repeat
 
 The UI is mobile-first: on phones it stacks camera → scrollable sensor strip → footer controls. On screens ≥ 700 px it switches to a camera + sidebar layout.
 
@@ -108,6 +131,8 @@ let rgb = frame.to_rgb();          // YUYV → packed RGB
 frame.save_ppm("/tmp/out.ppm")?;   // save without extra deps
 ```
 
+Exposure is controlled via `cam.exposure_cfg` (`Arc<Mutex<ExposureConfig>>`). Default is auto mode with a target luma of 128; switch to manual to set exposure time and gain directly.
+
 ## Car safety
 
 `Car::drive()` checks the ultrasonic sensor before and during forward motion and stops automatically if an obstacle is closer than 30 cm.
@@ -119,3 +144,5 @@ car.turn_right(2000, Duration::from_millis(400))?;
 car.stop()?;
 car.close()?;
 ```
+
+The web server adds a second layer: an obstacle lock in the hardware thread prevents the browser's 150 ms drive-command heartbeat from overriding a collision stop.

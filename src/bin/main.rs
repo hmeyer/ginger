@@ -25,7 +25,12 @@ use tokio::sync::mpsc;
 
 use log::{info, warn};
 
-use ginger_rs::{camera::Camera, car::Car, explore, map::Map};
+use ginger_rs::{
+    camera::{Camera, ExposureMode},
+    car::Car,
+    explore,
+    map::Map,
+};
 
 // ── Embedded web UI ───────────────────────────────────────────────────────────
 
@@ -50,8 +55,13 @@ struct SensorSnapshot {
     light_right: Option<f32>,
     ir: Option<[bool; 3]>,
     us_cm: Option<f32>,
+    ttc_s: Option<f32>, // estimated seconds to collision (None = not closing)
     explore_state: String,
     camera_fps: f32,
+    exposure_us: i32,
+    gain: f32,
+    luma: u8,
+    exposure_mode: String, // "auto" | "manual"
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -129,8 +139,13 @@ async fn main() {
         light_right: None,
         ir: None,
         us_cm: None,
+        ttc_s: None,
         explore_state: "idle".into(),
         camera_fps: 0.0,
+        exposure_us: 8_000,
+        gain: 8.0,
+        luma: 0,
+        exposure_mode: "auto".into(),
     }));
 
     let map = Arc::new(RwLock::new(Map::new()));
@@ -172,6 +187,7 @@ async fn main() {
         .route("/api/map", get(map_meta))
         .route("/api/map/png", get(map_png))
         .route("/api/map/ascii", get(map_ascii))
+        .route("/api/camera/exposure", post(set_exposure))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -180,6 +196,11 @@ async fn main() {
 }
 
 // ── Hardware thread ───────────────────────────────────────────────────────────
+
+// Stop and lock out forward commands when closer than this.
+const COLLISION_STOP_CM: f32 = 20.0;
+// Hysteresis: unlock only after obstacle retreats past this.
+const COLLISION_CLEAR_CM: f32 = 25.0;
 
 fn hardware_thread(
     mut cmd_rx: mpsc::Receiver<CarCmd>,
@@ -192,6 +213,16 @@ fn hardware_thread(
     let mut last_drive = Instant::now();
     let mut is_driving = false;
     let mut explore_active = false;
+    // Motor state for direction detection
+    let mut motor_left: i32 = 0;
+    let mut motor_right: i32 = 0;
+    // Prevents re-applying forward commands while obstacle is in the way
+    let mut obstacle_lock = false;
+    // Previous US reading for TTC estimation
+    let mut prev_us: Option<(f32, Instant)> = None;
+    // Pan/tilt auto-center state
+    let mut fwd_travel_est: f32 = 0.0;
+    let mut pan_auto_centered = false;
 
     loop {
         // ── Command queue ──────────────────────────────────────────────────────
@@ -207,6 +238,9 @@ fn hardware_thread(
                     info!("hw: stop command — cancelling exploration");
                     explore_active = false;
                     explore_stop.store(true, Ordering::Relaxed);
+                    obstacle_lock = false; // explicit stop always clears lock
+                    motor_left = 0;
+                    motor_right = 0;
                     if let Err(e) = car.stop() {
                         warn!("hw: stop error: {e}");
                     }
@@ -218,17 +252,32 @@ fn hardware_thread(
                     }
                     explore_active = false;
                     explore_stop.store(true, Ordering::Relaxed);
-                    if let Err(e) = car.motors().drive(left, right) {
-                        warn!("hw: drive({left},{right}) error: {e}");
+                    motor_left = left;
+                    motor_right = right;
+                    // Any backward component unlocks the obstacle stop
+                    if left < 0 || right < 0 {
+                        obstacle_lock = false;
                     }
-                    last_drive = Instant::now();
-                    is_driving = left != 0 || right != 0;
+                    let going_forward = left > 0 && right > 0;
+                    if obstacle_lock && going_forward {
+                        // silently ignore: obstacle still in the way
+                    } else {
+                        if let Err(e) = car.motors().drive(left, right) {
+                            warn!("hw: drive({left},{right}) error: {e}");
+                        }
+                        last_drive = Instant::now();
+                        is_driving = left != 0 || right != 0;
+                    }
                 }
                 CarCmd::SetPan(a) => {
                     car.pan_tilt().set_pan(a).ok();
+                    pan_auto_centered = false;
+                    fwd_travel_est = 0.0;
                 }
                 CarCmd::SetTilt(a) => {
                     car.pan_tilt().set_tilt(a).ok();
+                    pan_auto_centered = false;
+                    fwd_travel_est = 0.0;
                 }
                 CarCmd::SetLed { r, g, b } => {
                     car.leds.set_all(r, g, b);
@@ -296,6 +345,62 @@ fn hardware_thread(
             None
         };
 
+        // ── TTC estimation ─────────────────────────────────────────────────────
+        let now_t = Instant::now();
+        let ttc_s = if let Some(d_now) = us_cm {
+            let result = prev_us.and_then(|(d_prev, t_prev)| {
+                let dt = now_t.duration_since(t_prev).as_secs_f32();
+                let closing = (d_prev - d_now) / dt; // cm/s, positive = approaching
+                if closing > 2.0 {
+                    Some(d_now / closing)
+                } else {
+                    None
+                }
+            });
+            prev_us = Some((d_now, now_t));
+            result
+        } else {
+            prev_us = None;
+            None
+        };
+
+        // ── Collision stop ────────────────────────────────────────────────────
+        let going_forward = motor_left > 0 && motor_right > 0;
+        if going_forward && us_cm.is_some_and(|d| d < COLLISION_STOP_CM) {
+            warn!("hw: collision stop — obstacle at {:.0}cm", us_cm.unwrap());
+            car.stop().ok();
+            motor_left = 0;
+            motor_right = 0;
+            is_driving = false;
+            obstacle_lock = true;
+        }
+        // Auto-clear lock once obstacle retreats past hysteresis threshold
+        if obstacle_lock && us_cm.is_some_and(|d| d > COLLISION_CLEAR_CM) {
+            obstacle_lock = false;
+        }
+
+        // Auto-center pan when sustained forward motion detected (≥10 cm estimated travel).
+        // Ensures US sensor faces forward for collision detection.
+        const AUTOCENTER_MIN_DUTY: i32 = 2000;
+        const MAX_SPEED_CMS: f32 = 60.0;
+        if motor_left > AUTOCENTER_MIN_DUTY && motor_right > AUTOCENTER_MIN_DUTY {
+            let avg_fraction = (motor_left + motor_right) as f32 / 2.0 / 4095.0;
+            fwd_travel_est += avg_fraction * MAX_SPEED_CMS * 0.080;
+            if fwd_travel_est > 10.0 && !pan_auto_centered {
+                let mut pt = car.pan_tilt();
+                pt.set_pan(90.0).ok();
+                pt.set_tilt(90.0).ok();
+                pan_auto_centered = true;
+                info!(
+                    "hw: auto-centered pan+tilt after ~{:.0}cm forward travel",
+                    fwd_travel_est
+                );
+            }
+        } else {
+            fwd_travel_est = 0.0;
+            pan_auto_centered = false;
+        }
+
         let battery_pct = battery_pct(battery_v);
         info!("bat: {battery_v:.3} V  {battery_pct}%");
         *sensors.write().unwrap() = SensorSnapshot {
@@ -305,8 +410,13 @@ fn hardware_thread(
             light_right,
             ir,
             us_cm,
+            ttc_s,
             explore_state: "idle".into(),
-            camera_fps: 0.0, // filled by SSE handler
+            camera_fps: 0.0,              // filled by SSE handler
+            exposure_us: 0,               // filled by SSE handler
+            gain: 0.0,                    // filled by SSE handler
+            luma: 0,                      // filled by SSE handler
+            exposure_mode: String::new(), // filled by SSE handler
         };
 
         // Safety stop if motors have been spinning with no command for 500 ms
@@ -335,6 +445,18 @@ async fn sensor_stream(
             interval.tick().await;
             let mut snap = st.sensors.read().unwrap().clone();
             snap.camera_fps = st.camera.fps();
+            {
+                let exp = st.camera.exposure_cfg.lock().unwrap();
+                snap.exposure_us = exp.current_exposure_us;
+                snap.gain = exp.current_gain;
+                snap.luma = exp.current_luma;
+                snap.exposure_mode = if exp.mode == ExposureMode::Auto {
+                    "auto"
+                } else {
+                    "manual"
+                }
+                .into();
+            }
             let json = serde_json::to_string(&snap).unwrap();
             yield Ok::<Event, Infallible>(Event::default().data(json));
         }
@@ -482,6 +604,47 @@ async fn buzzer(State(st): State<AppState>, Json(b): Json<BuzzerBody>) -> Status
 
 async fn sensor_config(State(st): State<AppState>, Json(b): Json<SensorConfig>) -> StatusCode {
     st.cmd_tx.send(CarCmd::SetSensors(b)).await.ok();
+    StatusCode::OK
+}
+
+// ── Exposure endpoint ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetExposureBody {
+    mode: Option<String>,
+    target_luma: Option<u8>,
+    max_exposure_us: Option<i32>,
+    max_gain: Option<f32>,
+    manual_exposure_us: Option<i32>,
+    manual_gain: Option<f32>,
+}
+
+async fn set_exposure(State(st): State<AppState>, Json(b): Json<SetExposureBody>) -> StatusCode {
+    let mut cfg = st.camera.exposure_cfg.lock().unwrap();
+    if let Some(m) = b.mode {
+        cfg.mode = if m == "manual" {
+            ExposureMode::Manual
+        } else {
+            ExposureMode::Auto
+        };
+    }
+    if let Some(v) = b.target_luma {
+        cfg.target_luma = v;
+    }
+    if let Some(v) = b.max_exposure_us {
+        cfg.max_exposure_us = v.max(500);
+    }
+    if let Some(v) = b.max_gain {
+        cfg.max_gain = v.clamp(1.0, 16.0);
+    }
+    if let Some(v) = b.manual_exposure_us {
+        cfg.manual_exposure_us = v.max(500);
+        cfg.current_exposure_us = cfg.manual_exposure_us;
+    }
+    if let Some(v) = b.manual_gain {
+        cfg.manual_gain = v.clamp(1.0, 16.0);
+        cfg.current_gain = cfg.manual_gain;
+    }
     StatusCode::OK
 }
 

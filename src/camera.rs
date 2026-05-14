@@ -27,12 +27,102 @@ const YUYV: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'Y', b'U', b'Y',
 const WARMUP_FRAMES: usize = 5;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Fixed exposure for motion-blur-free SLAM images.
-// AE is disabled; raise ANALOGUE_GAIN if images are too dark.
-const EXPOSURE_US: i32 = 8_000; // 8 ms
-const ANALOGUE_GAIN: f32 = 8.0; // 8× — tunable for ambient light; max is 16×
+// ── Exposure control ──────────────────────────────────────────────────────────
 
-// ── Frame ────────────────────────────────────────────────────────────────────
+const AE_DEADZONE: i32 = 10;
+const AE_GAIN_STEP: f32 = 0.25;
+const AE_EXPOSURE_STEP_US: i32 = 200;
+const AE_MIN_EXPOSURE_US: i32 = 500;
+const AE_MIN_GAIN: f32 = 1.0;
+const AE_LUMA_ALPHA: f32 = 0.15; // EMA smoothing; ~7-frame time constant
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExposureMode {
+    Auto,
+    Manual,
+}
+
+pub struct ExposureConfig {
+    pub mode: ExposureMode,
+    /// AE target brightness (0–255).
+    pub target_luma: u8,
+    /// AE ceiling for exposure (µs). Keeps motion blur bounded.
+    pub max_exposure_us: i32,
+    /// AE ceiling for gain.
+    pub max_gain: f32,
+    pub manual_exposure_us: i32,
+    pub manual_gain: f32,
+    /// Live readback written by the camera thread.
+    pub current_exposure_us: i32,
+    pub current_gain: f32,
+    pub current_luma: u8,
+    luma_ema: f32, // internal smoothed luma, not exposed to UI
+}
+
+impl Default for ExposureConfig {
+    fn default() -> Self {
+        Self {
+            mode: ExposureMode::Auto,
+            target_luma: 128,
+            max_exposure_us: 100_000,
+            max_gain: 16.0,
+            manual_exposure_us: 8_000,
+            manual_gain: 8.0,
+            current_exposure_us: 8_000,
+            current_gain: 8.0,
+            current_luma: 0,
+            luma_ema: 0.0,
+        }
+    }
+}
+
+/// Sample mean luma from YUYV data. Y bytes are at even indices; stepping by
+/// 128 always lands on a Y byte and yields ~7 500 samples for 800×600.
+fn mean_luma(data: &[u8]) -> u8 {
+    let mut sum: u64 = 0;
+    let mut count: u64 = 0;
+    let mut i = 0;
+    while i < data.len() {
+        sum += data[i] as u64;
+        count += 1;
+        i += 128;
+    }
+    sum.checked_div(count).map(|v| v as u8).unwrap_or(128)
+}
+
+/// Run one AE step: gain-first when darkening (keeps exposure short for SLAM),
+/// exposure-first when brightening. Returns the (exposure_us, gain) to apply.
+fn ae_step(cfg: &mut ExposureConfig, luma: u8) -> (i32, f32) {
+    // Smooth luma with EMA to filter transient bright spots (windows, reflections).
+    cfg.luma_ema = if cfg.luma_ema == 0.0 {
+        luma as f32
+    } else {
+        AE_LUMA_ALPHA * luma as f32 + (1.0 - AE_LUMA_ALPHA) * cfg.luma_ema
+    };
+    let smoothed = cfg.luma_ema as u8;
+    cfg.current_luma = smoothed;
+    let error = smoothed as i32 - cfg.target_luma as i32;
+    if error < -AE_DEADZONE {
+        // Too dark: raise gain first, then exposure.
+        if cfg.current_gain < cfg.max_gain {
+            cfg.current_gain = (cfg.current_gain + AE_GAIN_STEP).min(cfg.max_gain);
+        } else {
+            cfg.current_exposure_us =
+                (cfg.current_exposure_us + AE_EXPOSURE_STEP_US).min(cfg.max_exposure_us);
+        }
+    } else if error > AE_DEADZONE {
+        // Too bright: lower exposure first, then gain.
+        if cfg.current_exposure_us > AE_MIN_EXPOSURE_US {
+            cfg.current_exposure_us =
+                (cfg.current_exposure_us - AE_EXPOSURE_STEP_US).max(AE_MIN_EXPOSURE_US);
+        } else {
+            cfg.current_gain = (cfg.current_gain - AE_GAIN_STEP).max(AE_MIN_GAIN);
+        }
+    }
+    (cfg.current_exposure_us, cfg.current_gain)
+}
+
+// ── Frame ─────────────────────────────────────────────────────────────────────
 
 pub struct Frame {
     pub width: u32,
@@ -111,7 +201,7 @@ impl Frame {
     }
 }
 
-// ── Internal shared state ────────────────────────────────────────────────────
+// ── Internal shared state ─────────────────────────────────────────────────────
 
 struct FrameState {
     frame: Option<Arc<Frame>>,
@@ -120,12 +210,13 @@ struct FrameState {
 
 type Shared = Arc<(Mutex<FrameState>, Condvar)>;
 
-// ── Camera ───────────────────────────────────────────────────────────────────
+// ── Camera ────────────────────────────────────────────────────────────────────
 
 pub struct Camera {
     shared: Shared,
-    // fps × 10 stored as integer for lock-free reads (e.g. 75 = 7.5 fps)
+    /// fps × 10 stored as integer for lock-free reads (e.g. 75 = 7.5 fps).
     fps_x10: Arc<AtomicU32>,
+    pub exposure_cfg: Arc<Mutex<ExposureConfig>>,
     _thread: JoinHandle<()>,
 }
 
@@ -138,7 +229,6 @@ impl Camera {
     /// Open the first available camera and start streaming in a background thread.
     /// Blocks until the first real frame is ready (warmup included, ≤10 s).
     pub fn new() -> Result<Self> {
-        // Setup handshake: thread sends Ok(()) or Err(msg) once the camera is configured.
         let (setup_tx, setup_rx) =
             std::sync::mpsc::sync_channel::<std::result::Result<(), String>>(1);
 
@@ -150,22 +240,23 @@ impl Camera {
             }),
             Condvar::new(),
         ));
+        let exposure_cfg = Arc::new(Mutex::new(ExposureConfig::default()));
+
         let shared_thread = shared.clone();
         let fps_x10_thread = fps_x10.clone();
+        let exposure_thread = exposure_cfg.clone();
 
         let thread = thread::Builder::new()
             .name("camera".into())
-            .spawn(move || camera_loop(shared_thread, fps_x10_thread, setup_tx))
+            .spawn(move || camera_loop(shared_thread, fps_x10_thread, exposure_thread, setup_tx))
             .map_err(|e| Error::Camera(e.to_string()))?;
 
-        // Wait for setup confirmation
         match setup_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(())) => {}
             Ok(Err(msg)) => return Err(Error::Camera(msg)),
             Err(_) => return Err(Error::Camera("camera thread did not start in time".into())),
         }
 
-        // Wait for first real frame (post-warmup)
         {
             let (lock, cvar) = shared.as_ref();
             let deadline = std::time::Instant::now() + FIRST_FRAME_TIMEOUT;
@@ -183,6 +274,7 @@ impl Camera {
         Ok(Self {
             shared,
             fps_x10,
+            exposure_cfg,
             _thread: thread,
         })
     }
@@ -208,9 +300,10 @@ impl Camera {
 fn camera_loop(
     shared: Shared,
     fps_x10: Arc<AtomicU32>,
+    exposure_cfg: Arc<Mutex<ExposureConfig>>,
     setup_tx: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 ) {
-    if let Err(e) = run_camera(shared, fps_x10, setup_tx.clone()) {
+    if let Err(e) = run_camera(shared, fps_x10, exposure_cfg, setup_tx.clone()) {
         let _ = setup_tx.try_send(Err(e.to_string()));
     }
 }
@@ -218,6 +311,7 @@ fn camera_loop(
 fn run_camera(
     shared: Shared,
     fps_x10: Arc<AtomicU32>,
+    exposure_cfg: Arc<Mutex<ExposureConfig>>,
     setup_tx: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mgr = CameraManager::new()?;
@@ -264,20 +358,24 @@ fn run_camera(
     });
 
     cam.start(None)?;
+
+    let (init_exp, init_gain) = {
+        let cfg = exposure_cfg.lock().unwrap();
+        (cfg.current_exposure_us, cfg.current_gain)
+    };
     log::info!(
-        "camera: AE off, exposure={}µs ({:.0}ms), gain={:.1}× (set per-request)",
-        EXPOSURE_US,
-        EXPOSURE_US as f32 / 1000.0,
-        ANALOGUE_GAIN
+        "camera: AE off, exposure={}µs ({:.0}ms), gain={:.1}× (initial)",
+        init_exp,
+        init_exp as f32 / 1000.0,
+        init_gain
     );
     for mut req in reqs.drain(..) {
         req.controls_mut().set(AeEnable(false)).ok();
-        req.controls_mut().set(ExposureTime(EXPOSURE_US)).ok();
-        req.controls_mut().set(AnalogueGain(ANALOGUE_GAIN)).ok();
+        req.controls_mut().set(ExposureTime(init_exp)).ok();
+        req.controls_mut().set(AnalogueGain(init_gain)).ok();
         cam.queue_request(req).map_err(|(_, e)| e)?;
     }
 
-    // Signal successful setup to Camera::new()
     let _ = setup_tx.send(Ok(()));
 
     let mut warmup = 0usize;
@@ -287,26 +385,46 @@ fn run_camera(
     loop {
         let mut req = frame_rx.recv()?;
 
-        // Verify that the sensor is applying our exposure settings
-        if warmup >= WARMUP_FRAMES && !verified {
-            let actual_exp = req.metadata().get::<ExposureTime>().ok().map(|v| *v);
-            let actual_gain = req.metadata().get::<AnalogueGain>().ok().map(|v| *v);
-            log::info!(
-                "camera: sensor reports exposure={:?}µs  gain={:?}×",
-                actual_exp,
-                actual_gain
-            );
-            verified = true;
-        }
-
         let fb: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(&stream).unwrap();
         let bytes_used = fb
             .metadata()
             .and_then(|m| m.planes().get(0).map(|p| p.bytes_used as usize))
             .unwrap_or(width as usize * height as usize * 2);
 
-        if warmup >= WARMUP_FRAMES {
+        let (next_exp, next_gain) = if warmup >= WARMUP_FRAMES {
             let data = fb.data()[0][..bytes_used].to_vec();
+
+            // Verify sensor is applying our settings (once, post-warmup).
+            if !verified {
+                let actual_exp = req.metadata().get::<ExposureTime>().ok().map(|v| *v);
+                let actual_gain = req.metadata().get::<AnalogueGain>().ok().map(|v| *v);
+                log::info!(
+                    "camera: sensor reports exposure={:?}µs  gain={:?}×",
+                    actual_exp,
+                    actual_gain
+                );
+                verified = true;
+            }
+
+            let luma = mean_luma(&data);
+            let (exp, gain) = {
+                let mut cfg = exposure_cfg.lock().unwrap();
+                match cfg.mode {
+                    ExposureMode::Auto => ae_step(&mut cfg, luma),
+                    ExposureMode::Manual => {
+                        cfg.luma_ema = if cfg.luma_ema == 0.0 {
+                            luma as f32
+                        } else {
+                            AE_LUMA_ALPHA * luma as f32 + (1.0 - AE_LUMA_ALPHA) * cfg.luma_ema
+                        };
+                        cfg.current_luma = cfg.luma_ema as u8;
+                        cfg.current_exposure_us = cfg.manual_exposure_us;
+                        cfg.current_gain = cfg.manual_gain;
+                        (cfg.manual_exposure_us, cfg.manual_gain)
+                    }
+                }
+            };
+
             let frame = Arc::new(Frame {
                 width,
                 height,
@@ -317,7 +435,6 @@ fn run_camera(
             let dt = now.duration_since(last_frame_instant).as_secs_f32();
             last_frame_instant = now;
             if dt > 0.0 {
-                // Exponential moving average: α = 0.2
                 let prev = fps_x10.load(Ordering::Relaxed) as f32 / 10.0;
                 let raw = 1.0 / dt;
                 let smoothed = if prev == 0.0 {
@@ -333,14 +450,18 @@ fn run_camera(
             st.frame = Some(frame);
             st.generation += 1;
             cvar.notify_all();
+
+            (exp, gain)
         } else {
             warmup += 1;
-        }
+            let cfg = exposure_cfg.lock().unwrap();
+            (cfg.current_exposure_us, cfg.current_gain)
+        };
 
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         req.controls_mut().set(AeEnable(false)).ok();
-        req.controls_mut().set(ExposureTime(EXPOSURE_US)).ok();
-        req.controls_mut().set(AnalogueGain(ANALOGUE_GAIN)).ok();
+        req.controls_mut().set(ExposureTime(next_exp)).ok();
+        req.controls_mut().set(AnalogueGain(next_gain)).ok();
         if cam.queue_request(req).map_err(|(_, e)| e).is_err() {
             break;
         }
