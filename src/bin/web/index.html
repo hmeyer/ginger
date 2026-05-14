@@ -184,6 +184,10 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
       </div>
     </div>
     <div class="card">
+      <div class="card-title">Camera</div>
+      <div class="row"><span class="lbl">fps</span><span class="val" id="v-cam-fps">—</span></div>
+    </div>
+    <div class="card">
       <div class="card-title">
         <label><input type="checkbox" id="en-light" checked>Light sensors</label>
       </div>
@@ -214,6 +218,12 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 
 <!-- Mobile sensor strip (hidden on desktop) -->
 <div id="sensor-strip">
+  <div class="sv">
+    <span class="lbl">CAM</span>
+    <span class="val" id="v-cam-fps-m">—</span>
+    <span class="unit">fps</span>
+  </div>
+  <div class="sv-sep"></div>
   <div class="sv">
     <span class="lbl">BAT</span>
     <span class="val" id="v-bat-m">—</span>
@@ -389,6 +399,11 @@ sse.onmessage = e => {
     setExploring(true);
   }
 
+  // Camera FPS
+  const fps = d.camera_fps != null ? d.camera_fps.toFixed(1) : '—';
+  document.getElementById('v-cam-fps').textContent   = fps;
+  document.getElementById('v-cam-fps-m').textContent = fps;
+
   // Update desktop sidebar IDs (also read by Playwright at 1280px)
   document.getElementById('v-bat').textContent     = fmt(d.battery_v, 2);
   document.getElementById('v-bat-pct').textContent = d.battery_pct != null ? d.battery_pct + '%' : '—%';
@@ -517,7 +532,7 @@ scheduleMinimap();
 const camEl = document.getElementById('cam');
 function nextFrame() {
   const img = new Image();
-  img.onload  = () => { camEl.src = img.src; setTimeout(nextFrame, 50); };
+  img.onload  = () => { camEl.src = img.src; nextFrame(); };
   img.onerror = () => setTimeout(nextFrame, 500);
   img.src = '/api/camera/frame?' + Date.now();
 }

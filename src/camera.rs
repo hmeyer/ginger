@@ -4,9 +4,10 @@
 //! publishes them behind an Arc so callers can either poll (`get_frame`)
 //! or block until a new frame arrives (`wait_frame`).
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libcamera::{
     camera::CameraConfigurationStatus,
@@ -85,10 +86,17 @@ type Shared = Arc<(Mutex<FrameState>, Condvar)>;
 
 pub struct Camera {
     shared: Shared,
+    // fps × 10 stored as integer for lock-free reads (e.g. 75 = 7.5 fps)
+    fps_x10: Arc<AtomicU32>,
     _thread: JoinHandle<()>,
 }
 
 impl Camera {
+    /// Current capture rate as measured between the last two frames delivered to callers.
+    pub fn fps(&self) -> f32 {
+        self.fps_x10.load(Ordering::Relaxed) as f32 / 10.0
+    }
+
     /// Open the first available camera and start streaming in a background thread.
     /// Blocks until the first real frame is ready (warmup included, ≤10 s).
     pub fn new() -> Result<Self> {
@@ -96,6 +104,7 @@ impl Camera {
         let (setup_tx, setup_rx) =
             std::sync::mpsc::sync_channel::<std::result::Result<(), String>>(1);
 
+        let fps_x10 = Arc::new(AtomicU32::new(0));
         let shared: Shared = Arc::new((
             Mutex::new(FrameState {
                 frame: None,
@@ -104,10 +113,11 @@ impl Camera {
             Condvar::new(),
         ));
         let shared_thread = shared.clone();
+        let fps_x10_thread = fps_x10.clone();
 
         let thread = thread::Builder::new()
             .name("camera".into())
-            .spawn(move || camera_loop(shared_thread, setup_tx))
+            .spawn(move || camera_loop(shared_thread, fps_x10_thread, setup_tx))
             .map_err(|e| Error::Camera(e.to_string()))?;
 
         // Wait for setup confirmation
@@ -134,6 +144,7 @@ impl Camera {
 
         Ok(Self {
             shared,
+            fps_x10,
             _thread: thread,
         })
     }
@@ -158,15 +169,17 @@ impl Camera {
 
 fn camera_loop(
     shared: Shared,
+    fps_x10: Arc<AtomicU32>,
     setup_tx: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 ) {
-    if let Err(e) = run_camera(shared, setup_tx.clone()) {
+    if let Err(e) = run_camera(shared, fps_x10, setup_tx.clone()) {
         let _ = setup_tx.try_send(Err(e.to_string()));
     }
 }
 
 fn run_camera(
     shared: Shared,
+    fps_x10: Arc<AtomicU32>,
     setup_tx: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mgr = CameraManager::new()?;
@@ -231,6 +244,7 @@ fn run_camera(
 
     let mut warmup = 0usize;
     let mut verified = false;
+    let mut last_frame_instant = Instant::now();
 
     loop {
         let mut req = frame_rx.recv()?;
@@ -260,6 +274,22 @@ fn run_camera(
                 height,
                 data,
             });
+
+            let now = Instant::now();
+            let dt = now.duration_since(last_frame_instant).as_secs_f32();
+            last_frame_instant = now;
+            if dt > 0.0 {
+                // Exponential moving average: α = 0.2
+                let prev = fps_x10.load(Ordering::Relaxed) as f32 / 10.0;
+                let raw = 1.0 / dt;
+                let smoothed = if prev == 0.0 {
+                    raw
+                } else {
+                    0.2 * raw + 0.8 * prev
+                };
+                fps_x10.store((smoothed * 10.0) as u32, Ordering::Relaxed);
+            }
+
             let (lock, cvar) = &*shared;
             let mut st = lock.lock().unwrap();
             st.frame = Some(frame);

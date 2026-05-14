@@ -41,7 +41,6 @@ jobs:
             https://git.libcamera.org/libcamera/libcamera.git lc-src
           meson setup lc-src/build lc-src \
             --prefix=/opt/libcamera \
-            -Dpipewire=disabled \
             -Dgstreamer=disabled \
             -Dlc-compliance=disabled \
             -Dcam=disabled \

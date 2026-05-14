@@ -51,6 +51,7 @@ struct SensorSnapshot {
     ir: Option<[bool; 3]>,
     us_cm: Option<f32>,
     explore_state: String,
+    camera_fps: f32,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -111,6 +112,7 @@ async fn main() {
         ir: None,
         us_cm: None,
         explore_state: "idle".into(),
+        camera_fps: 0.0,
     }));
 
     let map = Arc::new(RwLock::new(Map::new()));
@@ -285,6 +287,7 @@ fn hardware_thread(
             ir,
             us_cm,
             explore_state: "idle".into(),
+            camera_fps: 0.0, // filled in by SSE handler which has camera access
         };
 
         // Safety stop if motors have been spinning with no command for 500 ms
@@ -311,7 +314,8 @@ async fn sensor_stream(
         let mut interval = tokio::time::interval(Duration::from_millis(200));
         loop {
             interval.tick().await;
-            let snap = st.sensors.read().unwrap().clone();
+            let mut snap = st.sensors.read().unwrap().clone();
+            snap.camera_fps = st.camera.fps();
             let json = serde_json::to_string(&snap).unwrap();
             yield Ok::<Event, Infallible>(Event::default().data(json));
         }
