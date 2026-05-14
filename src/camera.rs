@@ -11,7 +11,6 @@ use std::time::Duration;
 use libcamera::{
     camera::CameraConfigurationStatus,
     camera_manager::CameraManager,
-    control::ControlList,
     controls::{AeEnable, AnalogueGain, ExposureTime},
     framebuffer::AsFrameBuffer,
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
@@ -30,7 +29,7 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 // Fixed exposure for motion-blur-free SLAM images.
 // AE is disabled; raise ANALOGUE_GAIN if images are too dark.
 const EXPOSURE_US: i32 = 8_000; // 8 ms
-const ANALOGUE_GAIN: f32 = 8.0; // 8× — tunable for ambient light
+const ANALOGUE_GAIN: f32 = 8.0; // 8× — tunable for ambient light; max is 16×
 
 // ── Frame ────────────────────────────────────────────────────────────────────
 
@@ -213,18 +212,17 @@ fn run_camera(
         let _ = frame_tx.send(req);
     });
 
-    let mut ctrl = ControlList::new();
-    ctrl.set(AeEnable(false)).ok();
-    ctrl.set(ExposureTime(EXPOSURE_US)).ok();
-    ctrl.set(AnalogueGain(ANALOGUE_GAIN)).ok();
-    cam.start(Some(&*ctrl))?;
+    cam.start(None)?;
     log::info!(
-        "camera: AE off, exposure={}µs ({:.0}ms), gain={:.1}×",
+        "camera: AE off, exposure={}µs ({:.0}ms), gain={:.1}× (set per-request)",
         EXPOSURE_US,
         EXPOSURE_US as f32 / 1000.0,
         ANALOGUE_GAIN
     );
-    for req in reqs.drain(..) {
+    for mut req in reqs.drain(..) {
+        req.controls_mut().set(AeEnable(false)).ok();
+        req.controls_mut().set(ExposureTime(EXPOSURE_US)).ok();
+        req.controls_mut().set(AnalogueGain(ANALOGUE_GAIN)).ok();
         cam.queue_request(req).map_err(|(_, e)| e)?;
     }
 
@@ -232,9 +230,22 @@ fn run_camera(
     let _ = setup_tx.send(Ok(()));
 
     let mut warmup = 0usize;
+    let mut verified = false;
 
     loop {
         let mut req = frame_rx.recv()?;
+
+        // Verify that the sensor is applying our exposure settings
+        if warmup >= WARMUP_FRAMES && !verified {
+            let actual_exp = req.metadata().get::<ExposureTime>().ok().map(|v| *v);
+            let actual_gain = req.metadata().get::<AnalogueGain>().ok().map(|v| *v);
+            log::info!(
+                "camera: sensor reports exposure={:?}µs  gain={:?}×",
+                actual_exp,
+                actual_gain
+            );
+            verified = true;
+        }
 
         let fb: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(&stream).unwrap();
         let bytes_used = fb
@@ -259,6 +270,9 @@ fn run_camera(
         }
 
         req.reuse(ReuseFlag::REUSE_BUFFERS);
+        req.controls_mut().set(AeEnable(false)).ok();
+        req.controls_mut().set(ExposureTime(EXPOSURE_US)).ok();
+        req.controls_mut().set(AnalogueGain(ANALOGUE_GAIN)).ok();
         if cam.queue_request(req).map_err(|(_, e)| e).is_err() {
             break;
         }
