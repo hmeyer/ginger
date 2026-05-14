@@ -19,7 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::Stream;
-use image::{DynamicImage, ImageFormat, RgbImage};
+use image::{DynamicImage, RgbImage, codecs::jpeg::JpegEncoder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -84,6 +84,23 @@ enum CarCmd {
     ExploreStart,
 }
 
+// Adaptive JPEG encode parameters, shared across all camera frame requests.
+struct EncodeParams {
+    quality: u8,     // JPEG quality 20–90
+    scale: f32,      // resize factor 0.25–1.0 (applied before encode)
+    fast_streak: u8, // consecutive fast encodes before raising quality
+}
+
+impl Default for EncodeParams {
+    fn default() -> Self {
+        Self {
+            quality: 75,
+            scale: 1.0,
+            fast_streak: 0,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     cmd_tx: mpsc::Sender<CarCmd>,
@@ -91,6 +108,7 @@ struct AppState {
     camera: Arc<Camera>,
     map: Arc<RwLock<Map>>,
     explore_stop: Arc<AtomicBool>,
+    encode_params: Arc<std::sync::Mutex<EncodeParams>>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -133,6 +151,7 @@ async fn main() {
         camera,
         map,
         explore_stop,
+        encode_params: Arc::new(std::sync::Mutex::new(EncodeParams::default())),
     };
 
     let app = Router::new()
@@ -287,7 +306,7 @@ fn hardware_thread(
             ir,
             us_cm,
             explore_state: "idle".into(),
-            camera_fps: 0.0, // filled in by SSE handler which has camera access
+            camera_fps: 0.0, // filled by SSE handler
         };
 
         // Safety stop if motors have been spinning with no command for 500 ms
@@ -324,14 +343,55 @@ async fn sensor_stream(
 }
 
 async fn camera_frame(State(st): State<AppState>) -> Response {
-    let frame = st.camera.get_frame();
     let jpeg = tokio::task::spawn_blocking(move || -> Vec<u8> {
-        let rgb = frame.to_rgb();
-        let img: DynamicImage = RgbImage::from_raw(frame.width, frame.height, rgb)
-            .unwrap()
-            .into();
+        // Block until a NEW frame arrives — never re-encodes the same frame.
+        let frame = st.camera.wait_frame();
+
+        let (quality, scale) = {
+            let p = st.encode_params.lock().unwrap();
+            (p.quality, p.scale)
+        };
+
+        let t0 = Instant::now();
+
+        // Sample YUYV directly at the target resolution — no full-res intermediary.
+        let (rgb, out_w, out_h) = frame.to_rgb_scaled(scale);
+        let img: DynamicImage = RgbImage::from_raw(out_w, out_h, rgb).unwrap().into();
+
         let mut buf = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut buf, ImageFormat::Jpeg).unwrap();
+        JpegEncoder::new_with_quality(&mut buf, quality)
+            .encode_image(&img)
+            .unwrap();
+
+        let encode_ms = t0.elapsed().as_millis() as u32;
+
+        // Adapt quality and scale to keep encode < 15 ms.
+        // Total budget per frame is ~33 ms (30 fps camera); encode must leave room
+        // for wait_frame jitter and HTTP overhead.
+        {
+            let mut p = st.encode_params.lock().unwrap();
+            if encode_ms > 15 {
+                p.fast_streak = 0;
+                if p.quality > 20 {
+                    p.quality = p.quality.saturating_sub(5).max(20);
+                } else if p.scale > 0.25 {
+                    p.scale = (p.scale * 0.75).max(0.25);
+                }
+            } else if encode_ms < 8 {
+                p.fast_streak += 1;
+                if p.fast_streak >= 30 {
+                    p.fast_streak = 0;
+                    if p.quality < 90 {
+                        p.quality = (p.quality + 2).min(90);
+                    } else if p.scale < 1.0 {
+                        p.scale = (p.scale * 1.25).min(1.0);
+                    }
+                }
+            } else {
+                p.fast_streak = 0;
+            }
+        }
+
         buf.into_inner()
     })
     .await

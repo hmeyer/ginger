@@ -185,7 +185,8 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
     </div>
     <div class="card">
       <div class="card-title">Camera</div>
-      <div class="row"><span class="lbl">fps</span><span class="val" id="v-cam-fps">—</span></div>
+      <div class="row"><span class="lbl" style="min-width:32px">onbd</span><span class="val" id="v-cam-ofps">—</span><span style="color:var(--dim2);font-size:.8rem">fps</span></div>
+      <div class="row"><span class="lbl" style="min-width:32px">web</span><span class="val" id="v-cam-wfps">—</span><span style="color:var(--dim2);font-size:.8rem">fps</span></div>
     </div>
     <div class="card">
       <div class="card-title">
@@ -219,8 +220,14 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 <!-- Mobile sensor strip (hidden on desktop) -->
 <div id="sensor-strip">
   <div class="sv">
-    <span class="lbl">CAM</span>
-    <span class="val" id="v-cam-fps-m">—</span>
+    <span class="lbl">onbd</span>
+    <span class="val" id="v-cam-ofps-m">—</span>
+    <span class="unit">fps</span>
+  </div>
+  <div class="sv-sep"></div>
+  <div class="sv">
+    <span class="lbl">web</span>
+    <span class="val" id="v-cam-wfps-m">—</span>
     <span class="unit">fps</span>
   </div>
   <div class="sv-sep"></div>
@@ -399,10 +406,10 @@ sse.onmessage = e => {
     setExploring(true);
   }
 
-  // Camera FPS
-  const fps = d.camera_fps != null ? d.camera_fps.toFixed(1) : '—';
-  document.getElementById('v-cam-fps').textContent   = fps;
-  document.getElementById('v-cam-fps-m').textContent = fps;
+  // Onboard camera FPS (from SSE)
+  const ofps = d.camera_fps != null ? d.camera_fps.toFixed(1) : '—';
+  document.getElementById('v-cam-ofps').textContent   = ofps;
+  document.getElementById('v-cam-ofps-m').textContent = ofps;
 
   // Update desktop sidebar IDs (also read by Playwright at 1280px)
   document.getElementById('v-bat').textContent     = fmt(d.battery_v, 2);
@@ -528,11 +535,25 @@ function scheduleMinimap() {
 updateMinimap();
 scheduleMinimap();
 
-// ── Camera frame polling ──────────────────────────────────────────────────────
+// ── Camera frame polling + web FPS ────────────────────────────────────────────
 const camEl = document.getElementById('cam');
+let _wFrames = 0, _wT0 = performance.now(), _wFps = 0;
+
+function updateWebFps() {
+  const now = performance.now();
+  const dt = (now - _wT0) / 1000;
+  if (dt >= 0.5) {
+    _wFps = _wFps === 0 ? _wFrames / dt : 0.3 * (_wFrames / dt) + 0.7 * _wFps;
+    _wFrames = 0; _wT0 = now;
+    const txt = _wFps.toFixed(1);
+    document.getElementById('v-cam-wfps').textContent   = txt;
+    document.getElementById('v-cam-wfps-m').textContent = txt;
+  }
+}
+
 function nextFrame() {
   const img = new Image();
-  img.onload  = () => { camEl.src = img.src; nextFrame(); };
+  img.onload  = () => { camEl.src = img.src; _wFrames++; updateWebFps(); nextFrame(); };
   img.onerror = () => setTimeout(nextFrame, 500);
   img.src = '/api/camera/frame?' + Date.now();
 }
