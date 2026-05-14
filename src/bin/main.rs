@@ -198,9 +198,9 @@ async fn main() {
 // ── Hardware thread ───────────────────────────────────────────────────────────
 
 // Stop and lock out forward commands when closer than this.
-const COLLISION_STOP_CM: f32 = 20.0;
+const COLLISION_STOP_CM: f32 = 30.0;
 // Hysteresis: unlock only after obstacle retreats past this.
-const COLLISION_CLEAR_CM: f32 = 25.0;
+const COLLISION_CLEAR_CM: f32 = 38.0;
 
 fn hardware_thread(
     mut cmd_rx: mpsc::Receiver<CarCmd>,
@@ -252,16 +252,18 @@ fn hardware_thread(
                     }
                     explore_active = false;
                     explore_stop.store(true, Ordering::Relaxed);
-                    motor_left = left;
-                    motor_right = right;
                     // Any backward component unlocks the obstacle stop
                     if left < 0 || right < 0 {
                         obstacle_lock = false;
                     }
                     let going_forward = left > 0 && right > 0;
                     if obstacle_lock && going_forward {
-                        // silently ignore: obstacle still in the way
+                        // silently ignore: obstacle still in the way.
+                        // Do NOT update motor_left/right so going_forward stays
+                        // false in the sensor poll and the warning doesn't loop.
                     } else {
+                        motor_left = left;
+                        motor_right = right;
                         if let Err(e) = car.motors().drive(left, right) {
                             warn!("hw: drive({left},{right}) error: {e}");
                         }
