@@ -28,50 +28,68 @@ const WARMUP_FRAMES: usize = 5;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Exposure control ──────────────────────────────────────────────────────────
+//
+// Brightness axis: a single 1D control variable in stops above the darkest
+// possible setting. 1 stop = 2× the light hitting the sensor.
+//   brightness 0  → gain=1×,  exp=0.5 ms       (darkest)
+//   brightness 4  → gain=16×, exp=0.5 ms       (gain saturated)
+//   brightness 11.6 → gain=16×, exp=100 ms     (brightest)
+// The mapping enforces gain-first ramping: gain saturates before exposure
+// extends, keeping motion blur bounded for as long as possible.
 
-const AE_DEADZONE: i32 = 10;
-const AE_GAIN_STEP: f32 = 0.25;
-const AE_EXPOSURE_STEP_US: i32 = 200;
+const AE_TARGET_LUMA: u8 = 128;
+const AE_DEADZONE: f32 = 8.0; // luma counts; below this, no step
 const AE_MIN_EXPOSURE_US: i32 = 500;
+const AE_MAX_EXPOSURE_US: i32 = 100_000;
 const AE_MIN_GAIN: f32 = 1.0;
-const AE_LUMA_ALPHA: f32 = 0.15; // EMA smoothing; ~7-frame time constant
+const AE_MAX_GAIN: f32 = 16.0;
+const AE_GAMMA: f32 = 2.2; // approximate luma → linear-light gamma
+const AE_STEP_PER_LUMA: f32 = 1.0 / 80.0; // stops of correction per luma count of error
+const AE_MAX_BRIGHTNESS: f32 = 11.64; // log2(100000/500) + log2(16/1)
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ExposureMode {
-    Auto,
-    Manual,
+/// Map controller brightness (stops) → (exposure_us, gain) with gain-first ramp.
+fn brightness_to_settings(b: f32) -> (i32, f32) {
+    let b = b.clamp(0.0, AE_MAX_BRIGHTNESS);
+    if b <= 4.0 {
+        (AE_MIN_EXPOSURE_US, 2.0_f32.powf(b))
+    } else {
+        let exp = AE_MIN_EXPOSURE_US as f32 * 2.0_f32.powf(b - 4.0);
+        ((exp as i32).min(AE_MAX_EXPOSURE_US), AE_MAX_GAIN)
+    }
 }
 
+/// Inverse of brightness_to_settings: read back brightness from sensor metadata.
+fn settings_to_brightness(exp_us: i32, gain: f32) -> f32 {
+    (exp_us.max(AE_MIN_EXPOSURE_US) as f32 / AE_MIN_EXPOSURE_US as f32).log2()
+        + (gain.max(AE_MIN_GAIN) / AE_MIN_GAIN).log2()
+}
+
+/// Live AE readback. Camera thread writes; UI/SSE reads. No knobs — AE runs
+/// unconditionally with hardcoded constants above.
 pub struct ExposureConfig {
-    pub mode: ExposureMode,
-    /// AE target brightness (0–255).
-    pub target_luma: u8,
-    /// AE ceiling for exposure (µs). Keeps motion blur bounded.
-    pub max_exposure_us: i32,
-    /// AE ceiling for gain.
-    pub max_gain: f32,
-    pub manual_exposure_us: i32,
-    pub manual_gain: f32,
-    /// Live readback written by the camera thread.
+    /// Controller's intended brightness (stops). Steps each frame.
+    brightness: f32,
+    /// Live readback derived from frame metadata each frame.
     pub current_exposure_us: i32,
     pub current_gain: f32,
+    pub current_brightness: f32,
     pub current_luma: u8,
-    luma_ema: f32, // internal smoothed luma, not exposed to UI
+    /// Damping safety net.
+    step_scale: f32,
+    last_step_dir: i8,
 }
 
 impl Default for ExposureConfig {
     fn default() -> Self {
+        let init_b = settings_to_brightness(8_000, 8.0);
         Self {
-            mode: ExposureMode::Auto,
-            target_luma: 128,
-            max_exposure_us: 100_000,
-            max_gain: 16.0,
-            manual_exposure_us: 8_000,
-            manual_gain: 8.0,
+            brightness: init_b,
             current_exposure_us: 8_000,
             current_gain: 8.0,
+            current_brightness: init_b,
             current_luma: 0,
-            luma_ema: 0.0,
+            step_scale: 1.0,
+            last_step_dir: 0,
         }
     }
 }
@@ -90,36 +108,44 @@ fn mean_luma(data: &[u8]) -> u8 {
     sum.checked_div(count).map(|v| v as u8).unwrap_or(128)
 }
 
-/// Run one AE step: gain-first when darkening (keeps exposure short for SLAM),
-/// exposure-first when brightening. Returns the (exposure_us, gain) to apply.
-fn ae_step(cfg: &mut ExposureConfig, luma: u8) -> (i32, f32) {
-    // Smooth luma with EMA to filter transient bright spots (windows, reflections).
-    cfg.luma_ema = if cfg.luma_ema == 0.0 {
-        luma as f32
-    } else {
-        AE_LUMA_ALPHA * luma as f32 + (1.0 - AE_LUMA_ALPHA) * cfg.luma_ema
-    };
-    let smoothed = cfg.luma_ema as u8;
-    cfg.current_luma = smoothed;
-    let error = smoothed as i32 - cfg.target_luma as i32;
-    if error < -AE_DEADZONE {
-        // Too dark: raise gain first, then exposure.
-        if cfg.current_gain < cfg.max_gain {
-            cfg.current_gain = (cfg.current_gain + AE_GAIN_STEP).min(cfg.max_gain);
-        } else {
-            cfg.current_exposure_us =
-                (cfg.current_exposure_us + AE_EXPOSURE_STEP_US).min(cfg.max_exposure_us);
-        }
+/// Run one AE step using the brightness axis + Smith-Predictor luma estimate.
+///
+/// The luma we measure reflects `applied_brightness` (from frame metadata),
+/// not our controller's current target. We predict what luma we'd see if
+/// our latest brightness target were already applied, then step against
+/// that predicted error. This handles the ~3-frame libcamera pipeline delay
+/// without waiting and without overshoot.
+fn ae_step(cfg: &mut ExposureConfig, luma: u8, applied_brightness: f32) -> (i32, f32) {
+    cfg.current_luma = luma;
+    cfg.current_brightness = applied_brightness;
+
+    let in_flight = cfg.brightness - applied_brightness;
+    let predicted_luma = luma as f32 * 2.0_f32.powf(in_flight / AE_GAMMA);
+    let error = predicted_luma - AE_TARGET_LUMA as f32;
+
+    let dir: i8 = if error < -AE_DEADZONE {
+        1
     } else if error > AE_DEADZONE {
-        // Too bright: lower exposure first, then gain.
-        if cfg.current_exposure_us > AE_MIN_EXPOSURE_US {
-            cfg.current_exposure_us =
-                (cfg.current_exposure_us - AE_EXPOSURE_STEP_US).max(AE_MIN_EXPOSURE_US);
-        } else {
-            cfg.current_gain = (cfg.current_gain - AE_GAIN_STEP).max(AE_MIN_GAIN);
+        -1
+    } else {
+        0
+    };
+
+    if dir != 0 {
+        if dir == cfg.last_step_dir {
+            cfg.step_scale = (cfg.step_scale * 1.1).min(1.0);
+        } else if cfg.last_step_dir != 0 {
+            cfg.step_scale = (cfg.step_scale * 0.5).max(0.1);
         }
+        cfg.last_step_dir = dir;
+
+        let step_stops = -error * AE_STEP_PER_LUMA * cfg.step_scale;
+        cfg.brightness = (cfg.brightness + step_stops).clamp(0.0, AE_MAX_BRIGHTNESS);
+    } else {
+        cfg.last_step_dir = 0;
     }
-    (cfg.current_exposure_us, cfg.current_gain)
+
+    brightness_to_settings(cfg.brightness)
 }
 
 // ── Frame ─────────────────────────────────────────────────────────────────────
@@ -379,7 +405,6 @@ fn run_camera(
     let _ = setup_tx.send(Ok(()));
 
     let mut warmup = 0usize;
-    let mut verified = false;
     let mut last_frame_instant = Instant::now();
 
     loop {
@@ -394,35 +419,27 @@ fn run_camera(
         let (next_exp, next_gain) = if warmup >= WARMUP_FRAMES {
             let data = fb.data()[0][..bytes_used].to_vec();
 
-            // Verify sensor is applying our settings (once, post-warmup).
-            if !verified {
-                let actual_exp = req.metadata().get::<ExposureTime>().ok().map(|v| *v);
-                let actual_gain = req.metadata().get::<AnalogueGain>().ok().map(|v| *v);
-                log::info!(
-                    "camera: sensor reports exposure={:?}µs  gain={:?}×",
-                    actual_exp,
-                    actual_gain
-                );
-                verified = true;
-            }
+            // Read the exposure/gain the sensor actually applied to this frame.
+            let actual_exp = req
+                .metadata()
+                .get::<ExposureTime>()
+                .ok()
+                .map(|v| *v)
+                .unwrap_or(init_exp);
+            let actual_gain = req
+                .metadata()
+                .get::<AnalogueGain>()
+                .ok()
+                .map(|v| *v)
+                .unwrap_or(init_gain);
+            let applied_brightness = settings_to_brightness(actual_exp, actual_gain);
 
             let luma = mean_luma(&data);
             let (exp, gain) = {
                 let mut cfg = exposure_cfg.lock().unwrap();
-                match cfg.mode {
-                    ExposureMode::Auto => ae_step(&mut cfg, luma),
-                    ExposureMode::Manual => {
-                        cfg.luma_ema = if cfg.luma_ema == 0.0 {
-                            luma as f32
-                        } else {
-                            AE_LUMA_ALPHA * luma as f32 + (1.0 - AE_LUMA_ALPHA) * cfg.luma_ema
-                        };
-                        cfg.current_luma = cfg.luma_ema as u8;
-                        cfg.current_exposure_us = cfg.manual_exposure_us;
-                        cfg.current_gain = cfg.manual_gain;
-                        (cfg.manual_exposure_us, cfg.manual_gain)
-                    }
-                }
+                cfg.current_exposure_us = actual_exp;
+                cfg.current_gain = actual_gain;
+                ae_step(&mut cfg, luma, applied_brightness)
             };
 
             let frame = Arc::new(Frame {

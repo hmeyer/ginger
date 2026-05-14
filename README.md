@@ -97,9 +97,9 @@ Features:
 - **Live sensor feed** via SSE — battery voltage, light sensors (L/R), IR line tracker (3 dots), ultrasonic distance + time-to-collision estimate, all updating at 200 ms
 - **Camera stream** — adaptive JPEG, targeting 30 fps; quality and resolution scale down automatically to stay within budget
 - **Onboard FPS** (camera capture rate) and **web FPS** (browser delivery rate) displayed live
-- **Software auto-exposure** — EMA-smoothed luma loop; gain-first policy keeps exposure short for motion-blur-free images; switchable to manual sliders for exposure (0.5–100 ms) and gain (1–16×)
+- **Software auto-exposure** — single brightness-axis controller (gain-first ramp: gain 1→16× before exposure 0.5→100 ms) with a Smith Predictor that uses each frame's metadata to compensate for libcamera's pipeline delay. Live readback of luma, brightness (EV stops), exposure, and gain — no knobs
 - **Drive controls** — D-pad (tap or hold), keyboard arrow keys, space to stop; server safety-stops motors after 500 ms of silence
-- **Forward collision avoidance** — hard stop at 20 cm, obstacle lock prevents re-override; time-to-collision displayed with colour coding (red < 1 s, orange < 2 s, green)
+- **Forward collision avoidance** — hard stop at 30 cm with hysteresis to 38 cm, obstacle lock prevents the browser's drive-command heartbeat from re-overriding; time-to-collision displayed with colour coding (red < 1 s, orange < 2 s, green)
 - **Pan/tilt auto-center** — after ~10 cm of sustained forward motion the pan/tilt automatically returns to center so the ultrasonic sensor faces forward
 - **Pan trim** — physical straight-ahead baked in as a servo pulse offset; `set_pan(90°)` always points the sensor forward
 - **Pan / tilt sliders** — 0–180° range
@@ -131,7 +131,9 @@ let rgb = frame.to_rgb();          // YUYV → packed RGB
 frame.save_ppm("/tmp/out.ppm")?;   // save without extra deps
 ```
 
-Exposure is controlled via `cam.exposure_cfg` (`Arc<Mutex<ExposureConfig>>`). Default is auto mode with a target luma of 128; switch to manual to set exposure time and gain directly.
+Exposure is controlled by an internal AE loop that targets luma 128. The current state — luma, brightness (EV stops above darkest), applied exposure, applied gain — is exposed read-only via `cam.exposure_cfg` (`Arc<Mutex<ExposureConfig>>`).
+
+The controller uses a single 1D brightness axis (gain ramps 1→16× before exposure extends 0.5→100 ms) and a Smith Predictor: the luma we measure reflects an *old* sensor setting (libcamera has ~3 frames of pipeline delay), so we predict what luma would be with our latest target applied and step against the predicted error. This converges in well under a second without overshoot or oscillation, and the prediction means we step every frame — no waiting.
 
 ## Car safety
 

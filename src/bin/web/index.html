@@ -184,25 +184,13 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
       </div>
     </div>
     <div class="card">
-      <div class="card-title">
-        Camera
-        <button id="exp-mode-btn" style="font-size:.65rem;padding:2px 8px;background:#252535;border:1px solid #3a3a5a;border-radius:4px;color:#ccc;cursor:pointer">Auto</button>
-      </div>
+      <div class="card-title">Camera</div>
       <div class="row"><span class="lbl" style="min-width:32px">onbd</span><span class="val" id="v-cam-ofps">—</span><span style="color:var(--dim2);font-size:.8rem">fps</span></div>
       <div class="row"><span class="lbl" style="min-width:32px">web</span><span class="val" id="v-cam-wfps">—</span><span style="color:var(--dim2);font-size:.8rem">fps</span></div>
       <div class="row"><span class="lbl" style="min-width:32px">luma</span><span class="val" id="v-luma">—</span></div>
+      <div class="row"><span class="lbl" style="min-width:32px">bri</span><span class="val" id="v-bri">—</span><span style="color:var(--dim2);font-size:.8rem">EV</span></div>
       <div class="row"><span class="lbl" style="min-width:32px">exp</span><span class="val" id="v-exp">—</span><span style="color:var(--dim2);font-size:.8rem">ms</span></div>
       <div class="row"><span class="lbl" style="min-width:32px">gain</span><span class="val" id="v-gain">—</span><span style="color:var(--dim2);font-size:.8rem">×</span></div>
-      <div id="exp-auto-ctrl" style="margin-top:6px">
-        <label style="font-size:.68rem;color:var(--dim);display:flex;justify-content:space-between">Target luma <span id="v-target-luma">128</span></label>
-        <input type="range" id="target-luma" min="32" max="220" value="128">
-      </div>
-      <div id="exp-manual-ctrl" style="margin-top:6px;display:none">
-        <label style="font-size:.68rem;color:var(--dim);display:flex;justify-content:space-between">Exposure <span id="v-exp-slider">8.0</span>ms</label>
-        <input type="range" id="exp-slider" min="500" max="100000" step="500" value="8000">
-        <label style="font-size:.68rem;color:var(--dim);display:flex;justify-content:space-between;margin-top:4px">Gain <span id="v-gain-slider">8.0</span>×</label>
-        <input type="range" id="gain-slider" min="1" max="16" step="0.5" value="8">
-      </div>
     </div>
     <div class="card">
       <div class="card-title">
@@ -432,10 +420,10 @@ sse.onmessage = e => {
   document.getElementById('v-cam-ofps-m').textContent = ofps;
 
   // Exposure readback
-  if (d.luma != null)       document.getElementById('v-luma').textContent = d.luma;
+  if (d.luma != null)        document.getElementById('v-luma').textContent = d.luma;
+  if (d.brightness != null)  document.getElementById('v-bri').textContent  = d.brightness.toFixed(2);
   if (d.exposure_us != null) document.getElementById('v-exp').textContent  = (d.exposure_us / 1000).toFixed(1);
-  if (d.gain != null)       document.getElementById('v-gain').textContent  = d.gain.toFixed(1);
-  if (d.exposure_mode != null && d.exposure_mode !== expMode) setExpMode(d.exposure_mode, false);
+  if (d.gain != null)        document.getElementById('v-gain').textContent = d.gain.toFixed(1);
 
   // Update desktop sidebar IDs (also read by Playwright at 1280px)
   document.getElementById('v-bat').textContent     = fmt(d.battery_v, 2);
@@ -570,38 +558,6 @@ function scheduleMinimap() {
 }
 updateMinimap();
 scheduleMinimap();
-
-// ── Exposure control ──────────────────────────────────────────────────────────
-let expMode = 'auto';
-
-function setExpMode(mode, sendToServer = true) {
-  expMode = mode;
-  const btn = document.getElementById('exp-mode-btn');
-  btn.textContent = mode === 'auto' ? 'Auto' : 'Manual';
-  btn.style.color = mode === 'auto' ? 'var(--accent)' : 'var(--warn)';
-  document.getElementById('exp-auto-ctrl').style.display   = mode === 'auto'   ? '' : 'none';
-  document.getElementById('exp-manual-ctrl').style.display = mode === 'manual' ? '' : 'none';
-  if (sendToServer) post('/api/camera/exposure', {mode});
-}
-
-document.getElementById('exp-mode-btn').addEventListener('click', () => {
-  setExpMode(expMode === 'auto' ? 'manual' : 'auto');
-});
-
-document.getElementById('target-luma').addEventListener('input', e => {
-  document.getElementById('v-target-luma').textContent = e.target.value;
-  post('/api/camera/exposure', {target_luma: +e.target.value});
-});
-
-document.getElementById('exp-slider').addEventListener('input', e => {
-  document.getElementById('v-exp-slider').textContent = (e.target.value / 1000).toFixed(1);
-  post('/api/camera/exposure', {manual_exposure_us: +e.target.value});
-});
-
-document.getElementById('gain-slider').addEventListener('input', e => {
-  document.getElementById('v-gain-slider').textContent = (+e.target.value).toFixed(1);
-  post('/api/camera/exposure', {manual_gain: +e.target.value});
-});
 
 // ── Camera frame polling + web FPS ────────────────────────────────────────────
 const camEl = document.getElementById('cam');

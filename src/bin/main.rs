@@ -25,12 +25,7 @@ use tokio::sync::mpsc;
 
 use log::{info, warn};
 
-use ginger_rs::{
-    camera::{Camera, ExposureMode},
-    car::Car,
-    explore,
-    map::Map,
-};
+use ginger_rs::{camera::Camera, car::Car, explore, map::Map};
 
 // ── Embedded web UI ───────────────────────────────────────────────────────────
 
@@ -60,8 +55,8 @@ struct SensorSnapshot {
     camera_fps: f32,
     exposure_us: i32,
     gain: f32,
+    brightness: f32,
     luma: u8,
-    exposure_mode: String, // "auto" | "manual"
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -144,8 +139,8 @@ async fn main() {
         camera_fps: 0.0,
         exposure_us: 8_000,
         gain: 8.0,
+        brightness: 0.0,
         luma: 0,
-        exposure_mode: "auto".into(),
     }));
 
     let map = Arc::new(RwLock::new(Map::new()));
@@ -187,7 +182,6 @@ async fn main() {
         .route("/api/map", get(map_meta))
         .route("/api/map/png", get(map_png))
         .route("/api/map/ascii", get(map_ascii))
-        .route("/api/camera/exposure", post(set_exposure))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -414,11 +408,11 @@ fn hardware_thread(
             us_cm,
             ttc_s,
             explore_state: "idle".into(),
-            camera_fps: 0.0,              // filled by SSE handler
-            exposure_us: 0,               // filled by SSE handler
-            gain: 0.0,                    // filled by SSE handler
-            luma: 0,                      // filled by SSE handler
-            exposure_mode: String::new(), // filled by SSE handler
+            camera_fps: 0.0, // filled by SSE handler
+            exposure_us: 0,  // filled by SSE handler
+            gain: 0.0,       // filled by SSE handler
+            brightness: 0.0, // filled by SSE handler
+            luma: 0,         // filled by SSE handler
         };
 
         // Safety stop if motors have been spinning with no command for 500 ms
@@ -451,13 +445,8 @@ async fn sensor_stream(
                 let exp = st.camera.exposure_cfg.lock().unwrap();
                 snap.exposure_us = exp.current_exposure_us;
                 snap.gain = exp.current_gain;
+                snap.brightness = exp.current_brightness;
                 snap.luma = exp.current_luma;
-                snap.exposure_mode = if exp.mode == ExposureMode::Auto {
-                    "auto"
-                } else {
-                    "manual"
-                }
-                .into();
             }
             let json = serde_json::to_string(&snap).unwrap();
             yield Ok::<Event, Infallible>(Event::default().data(json));
@@ -606,47 +595,6 @@ async fn buzzer(State(st): State<AppState>, Json(b): Json<BuzzerBody>) -> Status
 
 async fn sensor_config(State(st): State<AppState>, Json(b): Json<SensorConfig>) -> StatusCode {
     st.cmd_tx.send(CarCmd::SetSensors(b)).await.ok();
-    StatusCode::OK
-}
-
-// ── Exposure endpoint ─────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct SetExposureBody {
-    mode: Option<String>,
-    target_luma: Option<u8>,
-    max_exposure_us: Option<i32>,
-    max_gain: Option<f32>,
-    manual_exposure_us: Option<i32>,
-    manual_gain: Option<f32>,
-}
-
-async fn set_exposure(State(st): State<AppState>, Json(b): Json<SetExposureBody>) -> StatusCode {
-    let mut cfg = st.camera.exposure_cfg.lock().unwrap();
-    if let Some(m) = b.mode {
-        cfg.mode = if m == "manual" {
-            ExposureMode::Manual
-        } else {
-            ExposureMode::Auto
-        };
-    }
-    if let Some(v) = b.target_luma {
-        cfg.target_luma = v;
-    }
-    if let Some(v) = b.max_exposure_us {
-        cfg.max_exposure_us = v.max(500);
-    }
-    if let Some(v) = b.max_gain {
-        cfg.max_gain = v.clamp(1.0, 16.0);
-    }
-    if let Some(v) = b.manual_exposure_us {
-        cfg.manual_exposure_us = v.max(500);
-        cfg.current_exposure_us = cfg.manual_exposure_us;
-    }
-    if let Some(v) = b.manual_gain {
-        cfg.manual_gain = v.clamp(1.0, 16.0);
-        cfg.current_gain = cfg.manual_gain;
-    }
     StatusCode::OK
 }
 
