@@ -11,6 +11,8 @@ use std::time::Duration;
 use libcamera::{
     camera::CameraConfigurationStatus,
     camera_manager::CameraManager,
+    control::ControlList,
+    controls::{AeEnable, AnalogueGain, ExposureTime},
     framebuffer::AsFrameBuffer,
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
     framebuffer_map::MemoryMappedFrameBuffer,
@@ -24,6 +26,11 @@ use crate::{Error, Result};
 const YUYV: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'Y', b'U', b'Y', b'V']), 0);
 const WARMUP_FRAMES: usize = 5;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Fixed exposure for motion-blur-free SLAM images.
+// AE is disabled; raise ANALOGUE_GAIN if images are too dark.
+const EXPOSURE_US: i32 = 8_000; // 8 ms
+const ANALOGUE_GAIN: f32 = 8.0; // 8× — tunable for ambient light
 
 // ── Frame ────────────────────────────────────────────────────────────────────
 
@@ -206,7 +213,17 @@ fn run_camera(
         let _ = frame_tx.send(req);
     });
 
-    cam.start(None)?;
+    let mut ctrl = ControlList::new();
+    ctrl.set(AeEnable(false)).ok();
+    ctrl.set(ExposureTime(EXPOSURE_US)).ok();
+    ctrl.set(AnalogueGain(ANALOGUE_GAIN)).ok();
+    cam.start(Some(&*ctrl))?;
+    log::info!(
+        "camera: AE off, exposure={}µs ({:.0}ms), gain={:.1}×",
+        EXPOSURE_US,
+        EXPOSURE_US as f32 / 1000.0,
+        ANALOGUE_GAIN
+    );
     for req in reqs.drain(..) {
         cam.queue_request(req).map_err(|(_, e)| e)?;
     }
