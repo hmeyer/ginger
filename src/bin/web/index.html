@@ -352,11 +352,11 @@ bindDrive('b-right', -DUTY,  DUTY);
 document.getElementById('b-stop').addEventListener('click', stopDrive);
 document.addEventListener('keydown', e => {
   if (e.repeat) return;
-  if (e.key==='ArrowUp')    startDrive( DUTY,  DUTY);
-  if (e.key==='ArrowDown')  startDrive(-DUTY, -DUTY);
-  if (e.key==='ArrowLeft')  startDrive( DUTY, -DUTY);
-  if (e.key==='ArrowRight') startDrive(-DUTY,  DUTY);
-  if (e.key===' ') { e.preventDefault(); stopDrive(); }
+  if (e.key==='ArrowUp')    { e.preventDefault(); startDrive( DUTY,  DUTY); }
+  if (e.key==='ArrowDown')  { e.preventDefault(); startDrive(-DUTY, -DUTY); }
+  if (e.key==='ArrowLeft')  { e.preventDefault(); startDrive( DUTY, -DUTY); }
+  if (e.key==='ArrowRight') { e.preventDefault(); startDrive(-DUTY,  DUTY); }
+  if (e.key===' ')          { e.preventDefault(); stopDrive(); }
 });
 document.addEventListener('keyup', e => {
   if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) stopDrive();
