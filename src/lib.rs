@@ -1,3 +1,4 @@
+pub mod api;
 pub mod camera;
 pub mod devices;
 pub mod hal;

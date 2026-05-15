@@ -20,12 +20,15 @@ use axum::{
     routing::{get, post},
 };
 use futures::Stream;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use log::{info, warn};
 
 use ginger_rs::{
+    api::{
+        AngleBody, BuzzerBody, Command, DriveBody, LedBody, SensorConfig, SensorSnapshot,
+        battery_pct,
+    },
     camera::Camera,
     robot::{car::Car, explore, map::Map},
     video::webrtc,
@@ -38,64 +41,9 @@ const BUILD_TIME: &str = env!("BUILD_TIME");
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
-// 2S LiPo: 8.4 V full, 6.0 V cutoff. Log data to refine these constants.
-const BAT_FULL_V: f32 = 8.4;
-const BAT_EMPTY_V: f32 = 6.0;
-
-fn battery_pct(v: f32) -> u8 {
-    ((v - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V) * 100.0).clamp(0.0, 100.0) as u8
-}
-
-#[derive(Clone, Serialize)]
-struct SensorSnapshot {
-    battery_v: f32,
-    battery_pct: u8,
-    light_left: Option<f32>,
-    light_right: Option<f32>,
-    ir: Option<[bool; 3]>,
-    us_cm: Option<f32>,
-    ttc_s: Option<f32>, // estimated seconds to collision (None = not closing)
-    explore_state: String,
-    camera_fps: f32,
-    exposure_us: i32,
-    gain: f32,
-    brightness: f32,
-    luma: u8,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-struct SensorConfig {
-    light: bool,
-    ir: bool,
-    us: bool,
-}
-
-impl Default for SensorConfig {
-    fn default() -> Self {
-        Self {
-            light: true,
-            ir: true,
-            us: true,
-        }
-    }
-}
-
-enum CarCmd {
-    SetMotors { left: i32, right: i32 },
-    Stop,
-    SetPan(f32),
-    SetTilt(f32),
-    SetLed { r: u8, g: u8, b: u8 },
-    LedOff,
-    Buzzer(bool),
-    SetSensors(SensorConfig),
-    Scan,
-    ExploreStart,
-}
-
 #[derive(Clone)]
 struct AppState {
-    cmd_tx: mpsc::Sender<CarCmd>,
+    cmd_tx: mpsc::Sender<Command>,
     sensors: Arc<RwLock<SensorSnapshot>>,
     camera: Arc<Camera>,
     map: Arc<RwLock<Map>>,
@@ -111,7 +59,7 @@ async fn main() {
         .init();
     info!("Ginger starting — built {BUILD_TIME}");
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<CarCmd>(32);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
 
     let sensors = Arc::new(RwLock::new(SensorSnapshot {
         battery_v: 0.0,
@@ -182,7 +130,7 @@ const COLLISION_STOP_CM: f32 = 30.0;
 const COLLISION_CLEAR_CM: f32 = 38.0;
 
 fn hardware_thread(
-    mut cmd_rx: mpsc::Receiver<CarCmd>,
+    mut cmd_rx: mpsc::Receiver<Command>,
     sensors: Arc<RwLock<SensorSnapshot>>,
     map: Arc<RwLock<Map>>,
     explore_stop: Arc<AtomicBool>,
@@ -207,13 +155,13 @@ fn hardware_thread(
         // ── Command queue ──────────────────────────────────────────────────────
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                CarCmd::ExploreStart => {
+                Command::ExploreStart => {
                     info!("hw: exploration started");
                     explore_stop.store(false, Ordering::Relaxed);
                     explore_active = true;
                     is_driving = false;
                 }
-                CarCmd::Stop => {
+                Command::Stop => {
                     info!("hw: stop command — cancelling exploration");
                     explore_active = false;
                     explore_stop.store(true, Ordering::Relaxed);
@@ -225,7 +173,7 @@ fn hardware_thread(
                     }
                     is_driving = false;
                 }
-                CarCmd::SetMotors { left, right } => {
+                Command::SetMotors { left, right } => {
                     if explore_active {
                         info!("hw: manual drive — cancelling exploration");
                     }
@@ -250,34 +198,34 @@ fn hardware_thread(
                         is_driving = left != 0 || right != 0;
                     }
                 }
-                CarCmd::SetPan(a) => {
+                Command::SetPan(a) => {
                     car.pan_tilt().set_pan(a).ok();
                     pan_auto_centered = false;
                     fwd_travel_est = 0.0;
                 }
-                CarCmd::SetTilt(a) => {
+                Command::SetTilt(a) => {
                     car.pan_tilt().set_tilt(a).ok();
                     pan_auto_centered = false;
                     fwd_travel_est = 0.0;
                 }
-                CarCmd::SetLed { r, g, b } => {
+                Command::SetLed { r, g, b } => {
                     car.leds.set_all(r, g, b);
                     car.leds.show().ok();
                 }
-                CarCmd::LedOff => {
+                Command::LedOff => {
                     car.leds.clear().ok();
                 }
-                CarCmd::Buzzer(on) => {
+                Command::Buzzer(on) => {
                     if on {
                         car.buzzer.on()
                     } else {
                         car.buzzer.off()
                     }
                 }
-                CarCmd::SetSensors(cfg) => {
+                Command::SetSensors(cfg) => {
                     config = cfg;
                 }
-                CarCmd::Scan => {
+                Command::Scan => {
                     let noop = AtomicBool::new(false);
                     let rays = explore::do_scan(&mut car, &noop);
                     map.write().unwrap().integrate_scan(&rays);
@@ -459,15 +407,9 @@ async fn webrtc_whep(State(st): State<AppState>, body: String) -> Response {
 
 // ── Control endpoints ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct DriveBody {
-    left: i32,
-    right: i32,
-}
-
 async fn drive(State(st): State<AppState>, Json(b): Json<DriveBody>) -> StatusCode {
     st.cmd_tx
-        .send(CarCmd::SetMotors {
+        .send(Command::SetMotors {
             left: b.left,
             right: b.right,
         })
@@ -477,35 +419,23 @@ async fn drive(State(st): State<AppState>, Json(b): Json<DriveBody>) -> StatusCo
 }
 
 async fn stop_car(State(st): State<AppState>) -> StatusCode {
-    st.cmd_tx.send(CarCmd::Stop).await.ok();
+    st.cmd_tx.send(Command::Stop).await.ok();
     StatusCode::OK
 }
 
-#[derive(Deserialize)]
-struct AngleBody {
-    angle: f32,
-}
-
 async fn pan(State(st): State<AppState>, Json(b): Json<AngleBody>) -> StatusCode {
-    st.cmd_tx.send(CarCmd::SetPan(b.angle)).await.ok();
+    st.cmd_tx.send(Command::SetPan(b.angle)).await.ok();
     StatusCode::OK
 }
 
 async fn tilt(State(st): State<AppState>, Json(b): Json<AngleBody>) -> StatusCode {
-    st.cmd_tx.send(CarCmd::SetTilt(b.angle)).await.ok();
+    st.cmd_tx.send(Command::SetTilt(b.angle)).await.ok();
     StatusCode::OK
-}
-
-#[derive(Deserialize)]
-struct LedBody {
-    r: u8,
-    g: u8,
-    b: u8,
 }
 
 async fn led(State(st): State<AppState>, Json(b): Json<LedBody>) -> StatusCode {
     st.cmd_tx
-        .send(CarCmd::SetLed {
+        .send(Command::SetLed {
             r: b.r,
             g: b.g,
             b: b.b,
@@ -516,42 +446,37 @@ async fn led(State(st): State<AppState>, Json(b): Json<LedBody>) -> StatusCode {
 }
 
 async fn led_off(State(st): State<AppState>) -> StatusCode {
-    st.cmd_tx.send(CarCmd::LedOff).await.ok();
+    st.cmd_tx.send(Command::LedOff).await.ok();
     StatusCode::OK
 }
 
-#[derive(Deserialize)]
-struct BuzzerBody {
-    on: bool,
-}
-
 async fn buzzer(State(st): State<AppState>, Json(b): Json<BuzzerBody>) -> StatusCode {
-    st.cmd_tx.send(CarCmd::Buzzer(b.on)).await.ok();
+    st.cmd_tx.send(Command::Buzzer(b.on)).await.ok();
     StatusCode::OK
 }
 
 async fn sensor_config(State(st): State<AppState>, Json(b): Json<SensorConfig>) -> StatusCode {
-    st.cmd_tx.send(CarCmd::SetSensors(b)).await.ok();
+    st.cmd_tx.send(Command::SetSensors(b)).await.ok();
     StatusCode::OK
 }
 
 // ── Scan & exploration endpoints ──────────────────────────────────────────────
 
 async fn trigger_scan(State(st): State<AppState>) -> StatusCode {
-    st.cmd_tx.send(CarCmd::Scan).await.ok();
+    st.cmd_tx.send(Command::Scan).await.ok();
     StatusCode::OK
 }
 
 async fn explore_start(State(st): State<AppState>) -> StatusCode {
     st.explore_stop.store(false, Ordering::Relaxed);
-    st.cmd_tx.send(CarCmd::ExploreStart).await.ok();
+    st.cmd_tx.send(Command::ExploreStart).await.ok();
     StatusCode::OK
 }
 
 async fn explore_stop_handler(State(st): State<AppState>) -> StatusCode {
     st.explore_stop.store(true, Ordering::Relaxed);
     // Also queue Stop so motors are halted immediately after the current tick exits
-    st.cmd_tx.send(CarCmd::Stop).await.ok();
+    st.cmd_tx.send(Command::Stop).await.ok();
     StatusCode::OK
 }
 
