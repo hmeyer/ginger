@@ -3,6 +3,7 @@ pub mod buzzer;
 pub mod camera;
 pub mod car;
 pub mod explore;
+pub mod h264_encoder;
 pub mod infrared;
 pub mod led;
 pub mod map;

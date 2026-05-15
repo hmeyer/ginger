@@ -20,6 +20,8 @@ async-stream = "0.3"
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 webrtc = "0.17"
+v4l = "0.14"
+libc = "0.2.186"
 
 [[bin]]
 name = "ginger"

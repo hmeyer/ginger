@@ -1,18 +1,21 @@
 //! WebRTC publisher for the camera feed.
 //!
-//! Pipeline: camera YUYV frames → ffmpeg (`h264_v4l2m2m`, Annex B output) →
-//! NAL parser → `TrackLocalStaticSample` → browser `<video>` via
-//! `RTCPeerConnection`. Signalling is a minimal WHEP-style POST/answer:
-//! the client posts its SDP offer, the server returns its SDP answer.
+//! Pipeline: camera YUYV frames → `to_i420()` → in-process V4L2 H.264
+//! encoder (the Pi's bcm2835 hardware codec) → `TrackLocalStaticSample` →
+//! browser `<video>` via `RTCPeerConnection`. Signalling is a minimal
+//! WHEP-style POST/answer.
+//!
+//! Adaptive: RTCP feedback from the receiver drives the encoder. A Picture
+//! Loss Indication / Full Intra Request forces an immediate IDR; the
+//! Receiver-Estimated Max Bitrate (and packet-loss in Receiver Reports)
+//! retargets the encoder bitrate with no re-encode glitch.
 
-use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use log::{info, warn};
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -24,14 +27,30 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use crate::camera::Camera;
+use crate::h264_encoder::{EncoderControl, H264Encoder};
 
-const FFMPEG_BITRATE: &str = "2500000";
-const FFMPEG_GOP: &str = "30";
-const FRAME_DURATION: Duration = Duration::from_millis(33); // ~30 fps
+const FPS: u32 = 30;
+const FRAME_DURATION: Duration = Duration::from_millis(33);
+
+// Bitrate envelope for adaptation (bits/sec).
+const INITIAL_BITRATE: u32 = 2_500_000;
+const MIN_BITRATE: u32 = 300_000;
+const MAX_BITRATE: u32 = 4_000_000;
+// AIMD on Receiver-Report loss. fraction_lost is 0..=255 (fraction × 256);
+// 13 ≈ 5 % loss. Multiplicative decrease on loss, additive recovery when
+// clean. We deliberately do NOT chase REMB: without a sender-side bandwidth
+// estimator REMB just tracks the (low) send rate of a static VBR scene and
+// spirals the bitrate to the floor even on an idle network.
+const LOSS_BACKOFF_THRESHOLD: u8 = 13;
+const LOSS_BACKOFF_FACTOR: f64 = 0.85;
+const RECOVERY_STEP: f64 = 150_000.0;
 
 /// Accept a client SDP offer, set up a PeerConnection that publishes the
 /// camera's H.264 feed, and return our SDP answer.
@@ -52,7 +71,6 @@ pub async fn whep_handle(
 
     let pc = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await?);
 
-    // Outbound H.264 track.
     let track = Arc::new(TrackLocalStaticSample::new(
         RTCRtpCodecCapability {
             mime_type: MIME_TYPE_H264.to_owned(),
@@ -66,35 +84,116 @@ pub async fn whep_handle(
         .add_track(track.clone() as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
         .await?;
 
-    // Drain RTCP from the sender (otherwise it back-pressures and stalls).
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 1500];
-        while rtp_sender.read(&mut buf).await.is_ok() {}
-    });
-
     // Frame dimensions for the encoder.
     let frame = camera.get_frame();
     let width = frame.width;
     let height = frame.height;
     drop(frame);
 
-    // Spawn ffmpeg + NAL feeder. Tied to PC lifetime via state callback below.
-    let cam_for_feeder = camera.clone();
-    let track_for_feeder = track.clone();
-    let feeder = tokio::spawn(async move {
-        if let Err(e) = run_feeder(cam_for_feeder, track_for_feeder, width, height).await {
-            warn!("webrtc: feeder ended: {e}");
+    // Encoder runs on its own blocking thread (V4L2 DQBUF blocks). It owns
+    // the codec; other threads steer it only via the atomics in
+    // EncoderControl. A stop flag lets us tear it down on disconnect.
+    let stop = Arc::new(AtomicBool::new(false));
+    let (au_tx, mut au_rx) = tokio::sync::mpsc::channel::<crate::h264_encoder::Encoded>(8);
+    let (ctl_tx, ctl_rx) = tokio::sync::oneshot::channel::<EncoderControl>();
+
+    let cam_for_enc = camera.clone();
+    let stop_for_enc = stop.clone();
+    let encoder_thread = std::thread::Builder::new()
+        .name("h264-enc".into())
+        .spawn(move || {
+            let mut enc = match H264Encoder::new(width, height, FPS, INITIAL_BITRATE) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("webrtc: encoder init failed: {e}");
+                    return;
+                }
+            };
+            let _ = ctl_tx.send(enc.control());
+            while !stop_for_enc.load(Ordering::Relaxed) {
+                let frame = cam_for_enc.wait_frame();
+                match enc.encode(&frame.data) {
+                    Ok(au) => {
+                        if au_tx.blocking_send(au).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("webrtc: encode error: {e}");
+                        break;
+                    }
+                }
+            }
+        })?;
+
+    let control = match ctl_rx.await {
+        Ok(c) => c,
+        Err(_) => return Err("encoder failed to start".into()),
+    };
+
+    // Writer: encoded access units → WebRTC track.
+    let track_w = track.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(au) = au_rx.recv().await {
+            let sample = Sample {
+                data: Bytes::from(au.data),
+                duration: FRAME_DURATION,
+                ..Default::default()
+            };
+            if track_w.write_sample(&sample).await.is_err() {
+                break;
+            }
         }
     });
 
-    // Aborter that lives inside the on_state_change closure: when the PC
-    // dies, kill the feeder task (which also drops the ffmpeg Child →
-    // kill_on_drop terminates it).
-    let feeder_abort = Arc::new(std::sync::Mutex::new(Some(feeder)));
-    let feeder_abort_cb = feeder_abort.clone();
+    // RTCP feedback. PLI/FIR → immediate keyframe. Receiver-Report loss →
+    // AIMD: multiplicative cut on loss, gradual additive recovery when the
+    // link is clean. REMB is intentionally ignored (see constant docs).
+    let ctl_rtcp = control.clone();
+    let rtcp_task = tokio::spawn(async move {
+        let mut target = INITIAL_BITRATE as f64;
+        loop {
+            let pkts = match rtp_sender.read_rtcp().await {
+                Ok((p, _)) => p,
+                Err(_) => break,
+            };
+            for p in pkts {
+                let any = p.as_any();
+                if any.is::<PictureLossIndication>() || any.is::<FullIntraRequest>() {
+                    ctl_rtcp.request_keyframe();
+                } else if let Some(rr) = any.downcast_ref::<ReceiverReport>() {
+                    let worst = rr
+                        .reports
+                        .iter()
+                        .map(|r| r.fraction_lost)
+                        .max()
+                        .unwrap_or(0);
+                    let prev = target;
+                    if worst >= LOSS_BACKOFF_THRESHOLD {
+                        target = (target * LOSS_BACKOFF_FACTOR).max(MIN_BITRATE as f64);
+                        info!("webrtc: loss {worst}/256 → bitrate {} bps", target as u32);
+                    } else {
+                        target = (target + RECOVERY_STEP).min(MAX_BITRATE as f64);
+                    }
+                    if (target - prev).abs() >= 1.0 {
+                        ctl_rtcp.set_bitrate(target as u32);
+                    }
+                }
+            }
+        }
+    });
+
+    // Lifecycle: on disconnect, stop the encoder thread and abort tasks.
+    let teardown = Arc::new(std::sync::Mutex::new(Some((
+        writer,
+        rtcp_task,
+        encoder_thread,
+        stop.clone(),
+    ))));
+    let teardown_cb = teardown.clone();
     let pc_for_cb = Arc::downgrade(&pc);
     pc.on_peer_connection_state_change(Box::new(move |s| {
-        let feeder_abort = feeder_abort_cb.clone();
+        let teardown = teardown_cb.clone();
         let pc_weak = pc_for_cb.clone();
         Box::pin(async move {
             info!("webrtc: pc state = {s}");
@@ -102,8 +201,18 @@ pub async fn whep_handle(
                 RTCPeerConnectionState::Disconnected
                 | RTCPeerConnectionState::Failed
                 | RTCPeerConnectionState::Closed => {
-                    if let Some(h) = feeder_abort.lock().unwrap().take() {
-                        h.abort();
+                    if let Some((writer, rtcp_task, enc_thread, stop)) =
+                        teardown.lock().unwrap().take()
+                    {
+                        stop.store(true, Ordering::Relaxed);
+                        writer.abort();
+                        rtcp_task.abort();
+                        // Encoder thread observes `stop` within one frame
+                        // (~33 ms) and exits, running its Drop (STREAMOFF +
+                        // munmap + close).
+                        tokio::task::spawn_blocking(move || {
+                            let _ = enc_thread.join();
+                        });
                     }
                     if let Some(pc) = pc_weak.upgrade() {
                         let _ = pc.close().await;
@@ -120,7 +229,6 @@ pub async fn whep_handle(
         })
     }));
 
-    // Apply offer, build answer, wait for ICE gathering, return SDP.
     let offer = RTCSessionDescription::offer(offer_sdp)?;
     pc.set_remote_description(offer).await?;
 
@@ -131,27 +239,19 @@ pub async fn whep_handle(
 
     let local = pc.local_description().await.ok_or("no local description")?;
 
-    // Keep the PeerConnection alive for the session. The state-change closure
-    // owns the abort handle; ICE failure / close drops everything.
-    leak_pc(pc);
+    keep_alive(pc);
 
     Ok(local.sdp)
 }
 
-/// Intentional leak — the PeerConnection is kept alive by an internal task
-/// graph; we lose the explicit handle once we've returned the SDP answer,
-/// but its destructors will fire when the on_peer_connection_state_change
-/// handler closes it on ICE failure.
-fn leak_pc(pc: Arc<RTCPeerConnection>) {
+/// Hold a strong reference to the PeerConnection until the session ends.
+/// Events drive the work; this future just owns `pc` for its lifetime.
+fn keep_alive(pc: Arc<RTCPeerConnection>) {
     tokio::spawn(async move {
-        // Hold a strong reference until the connection truly closes. Polling
-        // is fine here — events drive the work; we just need this future to
-        // hang on to `pc` until the connection ends.
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let s = pc.connection_state();
             if matches!(
-                s,
+                pc.connection_state(),
                 RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed
             ) {
                 break;
@@ -159,159 +259,4 @@ fn leak_pc(pc: Arc<RTCPeerConnection>) {
         }
         info!("webrtc: session ended");
     });
-}
-
-async fn run_feeder(
-    camera: Arc<Camera>,
-    track: Arc<TrackLocalStaticSample>,
-    width: u32,
-    height: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-loglevel",
-            "error",
-            "-fflags",
-            "+genpts+nobuffer",
-            "-flags",
-            "low_delay",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "yuyv422",
-            "-s",
-            &format!("{width}x{height}"),
-            "-r",
-            "30",
-            "-i",
-            "pipe:0",
-            "-c:v",
-            "h264_v4l2m2m",
-            "-pix_fmt",
-            "yuv420p",
-            "-b:v",
-            FFMPEG_BITRATE,
-            "-g",
-            FFMPEG_GOP,
-            // AUD NAL between access units → unambiguous frame splitter.
-            "-bsf:v",
-            "h264_metadata=aud=insert",
-            "-f",
-            "h264",
-            "-flush_packets",
-            "1",
-            "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-
-    let mut stdin = child.stdin.take().ok_or("ffmpeg stdin")?;
-    let stdout = child.stdout.take().ok_or("ffmpeg stdout")?;
-
-    // Writer: pulls camera frames, writes YUYV to ffmpeg stdin.
-    let cam_for_writer = camera.clone();
-    let writer = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        loop {
-            let cam = cam_for_writer.clone();
-            let frame = match tokio::task::spawn_blocking(move || cam.wait_frame()).await {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            if stdin.write_all(&frame.data).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Reader: parses Annex B stream, emits one AU per Sample.
-    let mut splitter = AccessUnitSplitter::new();
-    let mut reader = stdout;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        for au in splitter.feed(&buf[..n]) {
-            track
-                .write_sample(&Sample {
-                    data: au,
-                    duration: FRAME_DURATION,
-                    ..Default::default()
-                })
-                .await?;
-        }
-    }
-
-    writer.abort();
-    Ok(())
-}
-
-/// Split an H.264 Annex B byte stream into access units. Each AU starts at
-/// an AUD NAL (type 9), which we ask ffmpeg to insert. The first chunk before
-/// any AUD is treated as part of the first AU.
-struct AccessUnitSplitter {
-    pending: Vec<u8>,
-}
-
-impl AccessUnitSplitter {
-    fn new() -> Self {
-        Self {
-            pending: Vec::with_capacity(64 * 1024),
-        }
-    }
-
-    fn feed(&mut self, chunk: &[u8]) -> Vec<Bytes> {
-        self.pending.extend_from_slice(chunk);
-        let mut out = Vec::new();
-
-        // Search for AUD start sequences in self.pending, leaving incomplete
-        // tail bytes (up to 3) plus the current AU prefix.
-        // Boundary pattern: <start_code> <AUD nal byte = 0x09>
-        // where <start_code> is `00 00 01` or `00 00 00 01`.
-        let mut last_cut = 0usize;
-        let mut i = 0usize;
-        let buf = &self.pending;
-        while i + 4 <= buf.len() {
-            // Look for 3-byte or 4-byte start code followed by AUD (0x09).
-            let three = buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1;
-            let four = i + 5 <= buf.len()
-                && buf[i] == 0
-                && buf[i + 1] == 0
-                && buf[i + 2] == 0
-                && buf[i + 3] == 1;
-            let (sc_len, ok) = if four {
-                (4, buf[i + 4] & 0x1f == 0x09)
-            } else if three {
-                (3, buf[i + 3] & 0x1f == 0x09)
-            } else {
-                (0, false)
-            };
-            if ok {
-                if i > last_cut {
-                    let au = buf[last_cut..i].to_vec();
-                    // Skip the very first slice if it's empty (no NALs yet).
-                    if au.iter().any(|&b| b != 0) {
-                        out.push(Bytes::from(au));
-                    }
-                }
-                last_cut = i;
-                i += sc_len + 1;
-            } else {
-                i += 1;
-            }
-        }
-
-        // Keep an unsearched tail of up to 4 bytes so we don't miss a start
-        // code straddling chunk boundaries.
-        let drain_end = last_cut;
-        if drain_end > 0 {
-            self.pending.drain(..drain_end);
-        }
-        out
-    }
 }
