@@ -38,10 +38,6 @@ src/
     main.rs       — Web server (axum) with live sensor stream + controls
     web/
       index.html  — Embedded mobile-first control UI
-examples/
-  test_all.rs   — Interactive component-by-component hardware test
-  drive_test.rs — Battery check + forward drive smoke test
-  camera_test.rs — Capture one frame and save as PPM
 scripts/
   install-service.sh — Install ginger as a systemd user service
 ```
@@ -110,14 +106,6 @@ Features:
 - **Autonomous exploration** — frontier-based; scan → move → repeat
 
 The UI is mobile-first: on phones it stacks camera → scrollable sensor strip → footer controls. On screens ≥ 700 px it switches to a camera + sidebar layout.
-
-## Running the hardware test
-
-```bash
-cargo run --example test_all
-```
-
-Tests each subsystem in order: ADC → LEDs → Buzzer → IR sensors → Ultrasonic → Servos → Motors → Camera. Motor test prompts before moving.
 
 ## Camera
 
