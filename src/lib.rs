@@ -1,32 +1,10 @@
-pub mod adc;
-pub mod buzzer;
+pub mod api;
 pub mod camera;
-pub mod car;
-pub mod explore;
-pub mod h264_encoder;
-pub mod infrared;
-pub mod led;
-pub mod map;
-pub mod motors;
-pub mod pca9685;
-pub mod servo;
-pub mod ultrasonic;
-pub mod webrtc_stream;
+pub mod devices;
+pub mod hal;
+pub mod robot;
+pub mod server;
+pub mod video;
 
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("I2C error: {0}")]
-    I2c(#[from] rppal::i2c::Error),
-    #[error("SPI error: {0}")]
-    Spi(#[from] rppal::spi::Error),
-    #[error("GPIO error: {0}")]
-    Gpio(#[from] rppal::gpio::Error),
-    #[error("Timeout waiting for {0}")]
-    Timeout(&'static str),
-    #[error("Camera: {0}")]
-    Camera(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+mod error;
+pub use error::{Error, Result};

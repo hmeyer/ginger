@@ -2,7 +2,8 @@
 //!
 //! Runs a background thread that continuously captures YUYV frames and
 //! publishes them behind an Arc so callers can either poll (`get_frame`)
-//! or block until a new frame arrives (`wait_frame`).
+//! or block until a new frame arrives (`wait_frame`). Exposure is driven
+//! by the [`super::auto_exposure`] controller.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -21,132 +22,12 @@ use libcamera::{
     stream::StreamRole,
 };
 
+use crate::camera::auto_exposure::{ExposureConfig, ae_step, mean_luma, settings_to_brightness};
 use crate::{Error, Result};
 
 const YUYV: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'Y', b'U', b'Y', b'V']), 0);
 const WARMUP_FRAMES: usize = 5;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
-
-// ── Exposure control ──────────────────────────────────────────────────────────
-//
-// Brightness axis: a single 1D control variable in stops above the darkest
-// possible setting. 1 stop = 2× the light hitting the sensor.
-//   brightness 0  → gain=1×,  exp=0.5 ms       (darkest)
-//   brightness 4  → gain=16×, exp=0.5 ms       (gain saturated)
-//   brightness 11.6 → gain=16×, exp=100 ms     (brightest)
-// The mapping enforces gain-first ramping: gain saturates before exposure
-// extends, keeping motion blur bounded for as long as possible.
-
-const AE_TARGET_LUMA: u8 = 128;
-const AE_DEADZONE: f32 = 8.0; // luma counts; below this, no step
-const AE_MIN_EXPOSURE_US: i32 = 500;
-const AE_MAX_EXPOSURE_US: i32 = 100_000;
-const AE_MIN_GAIN: f32 = 1.0;
-const AE_MAX_GAIN: f32 = 16.0;
-const AE_GAMMA: f32 = 2.2; // approximate luma → linear-light gamma
-const AE_STEP_PER_LUMA: f32 = 1.0 / 80.0; // stops of correction per luma count of error
-const AE_MAX_BRIGHTNESS: f32 = 11.64; // log2(100000/500) + log2(16/1)
-
-/// Map controller brightness (stops) → (exposure_us, gain) with gain-first ramp.
-fn brightness_to_settings(b: f32) -> (i32, f32) {
-    let b = b.clamp(0.0, AE_MAX_BRIGHTNESS);
-    if b <= 4.0 {
-        (AE_MIN_EXPOSURE_US, 2.0_f32.powf(b))
-    } else {
-        let exp = AE_MIN_EXPOSURE_US as f32 * 2.0_f32.powf(b - 4.0);
-        ((exp as i32).min(AE_MAX_EXPOSURE_US), AE_MAX_GAIN)
-    }
-}
-
-/// Inverse of brightness_to_settings: read back brightness from sensor metadata.
-fn settings_to_brightness(exp_us: i32, gain: f32) -> f32 {
-    (exp_us.max(AE_MIN_EXPOSURE_US) as f32 / AE_MIN_EXPOSURE_US as f32).log2()
-        + (gain.max(AE_MIN_GAIN) / AE_MIN_GAIN).log2()
-}
-
-/// Live AE readback. Camera thread writes; UI/SSE reads. No knobs — AE runs
-/// unconditionally with hardcoded constants above.
-pub struct ExposureConfig {
-    /// Controller's intended brightness (stops). Steps each frame.
-    brightness: f32,
-    /// Live readback derived from frame metadata each frame.
-    pub current_exposure_us: i32,
-    pub current_gain: f32,
-    pub current_brightness: f32,
-    pub current_luma: u8,
-    /// Damping safety net.
-    step_scale: f32,
-    last_step_dir: i8,
-}
-
-impl Default for ExposureConfig {
-    fn default() -> Self {
-        let init_b = settings_to_brightness(8_000, 8.0);
-        Self {
-            brightness: init_b,
-            current_exposure_us: 8_000,
-            current_gain: 8.0,
-            current_brightness: init_b,
-            current_luma: 0,
-            step_scale: 1.0,
-            last_step_dir: 0,
-        }
-    }
-}
-
-/// Sample mean luma from YUYV data. Y bytes are at even indices; stepping by
-/// 128 always lands on a Y byte and yields ~7 500 samples for 800×600.
-fn mean_luma(data: &[u8]) -> u8 {
-    let mut sum: u64 = 0;
-    let mut count: u64 = 0;
-    let mut i = 0;
-    while i < data.len() {
-        sum += data[i] as u64;
-        count += 1;
-        i += 128;
-    }
-    sum.checked_div(count).map(|v| v as u8).unwrap_or(128)
-}
-
-/// Run one AE step using the brightness axis + Smith-Predictor luma estimate.
-///
-/// The luma we measure reflects `applied_brightness` (from frame metadata),
-/// not our controller's current target. We predict what luma we'd see if
-/// our latest brightness target were already applied, then step against
-/// that predicted error. This handles the ~3-frame libcamera pipeline delay
-/// without waiting and without overshoot.
-fn ae_step(cfg: &mut ExposureConfig, luma: u8, applied_brightness: f32) -> (i32, f32) {
-    cfg.current_luma = luma;
-    cfg.current_brightness = applied_brightness;
-
-    let in_flight = cfg.brightness - applied_brightness;
-    let predicted_luma = luma as f32 * 2.0_f32.powf(in_flight / AE_GAMMA);
-    let error = predicted_luma - AE_TARGET_LUMA as f32;
-
-    let dir: i8 = if error < -AE_DEADZONE {
-        1
-    } else if error > AE_DEADZONE {
-        -1
-    } else {
-        0
-    };
-
-    if dir != 0 {
-        if dir == cfg.last_step_dir {
-            cfg.step_scale = (cfg.step_scale * 1.1).min(1.0);
-        } else if cfg.last_step_dir != 0 {
-            cfg.step_scale = (cfg.step_scale * 0.5).max(0.1);
-        }
-        cfg.last_step_dir = dir;
-
-        let step_stops = -error * AE_STEP_PER_LUMA * cfg.step_scale;
-        cfg.brightness = (cfg.brightness + step_stops).clamp(0.0, AE_MAX_BRIGHTNESS);
-    } else {
-        cfg.last_step_dir = 0;
-    }
-
-    brightness_to_settings(cfg.brightness)
-}
 
 // ── Frame ─────────────────────────────────────────────────────────────────────
 

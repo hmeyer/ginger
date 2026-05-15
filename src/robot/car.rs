@@ -5,14 +5,14 @@ use std::time::{Duration, Instant};
 
 use crate::{
     Result,
-    adc::Adc,
-    buzzer::Buzzer,
-    infrared::InfraredSensors,
-    led::LedStrip,
-    motors::Motors,
-    pca9685::Pca9685,
-    servo::{PAN_TRIM_US, PanTilt},
-    ultrasonic::Ultrasonic,
+    devices::{
+        motors::Motors,
+        pan_tilt::{PAN_TRIM_US, PanTilt},
+    },
+    hal::{
+        adc::Adc, buzzer::Buzzer, infrared::InfraredSensors, led::LedStrip, pca9685::Pca9685,
+        ultrasonic::Ultrasonic,
+    },
 };
 
 const SAFE_DISTANCE_CM: f32 = 30.0;

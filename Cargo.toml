@@ -26,12 +26,3 @@ libc = "0.2.186"
 [[bin]]
 name = "ginger"
 path = "src/bin/main.rs"
-
-[[example]]
-name = "drive_test"
-
-[[example]]
-name = "camera_test"
-
-[[example]]
-name = "test_all"

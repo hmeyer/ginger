@@ -20,28 +20,41 @@ Rust driver library and web control interface for the [Freenove 4WD Smart Car Ki
 
 ## Crate layout
 
+The crate is layered so the dependency direction reads top-down:
+`hal → devices → robot → server → bin`, with `camera`/`video` as
+parallel media stacks and `api` as the shared wire contract.
+
 ```
 src/
-  pca9685.rs    — I2C PWM driver (PCA9685)
-  motors.rs     — 4WD differential drive
-  servo.rs      — Pan/tilt with invert + trim
-  adc.rs        — ADS7830 battery/voltage/light ADC
-  led.rs        — WS2812B strip over SPI
-  buzzer.rs     — Active buzzer
-  ultrasonic.rs — HC-SR04 distance sensor
-  infrared.rs   — 3-sensor line tracker
-  camera.rs     — OV5647 via libcamera (streaming background thread, software AE)
-  car.rs        — Top-level Car struct with obstacle-avoidance safety
-  explore.rs    — Frontier-based autonomous exploration
-  map.rs        — Occupancy grid map (320×320, 10 cm/cell)
+  error.rs        — crate-wide Error / Result
+  api.rs          — wire contract: telemetry, command protocol, request bodies
+  hal/            — raw bus/peripheral drivers (rppal-facing)
+    pca9685.rs    — I2C PWM driver (PCA9685)
+    adc.rs        — ADS7830 battery/voltage/light ADC
+    led.rs        — WS2812B strip over SPI
+    buzzer.rs     — Active buzzer
+    ultrasonic.rs — HC-SR04 distance sensor
+    infrared.rs   — 3-sensor line tracker
+  devices/        — actuators on the HAL
+    motors.rs     — 4WD differential drive
+    pan_tilt.rs   — Pan/tilt with invert + trim
+  camera/
+    capture.rs       — OV5647 via libcamera (streaming background thread)
+    auto_exposure.rs — pure software-AE controller (unit-tested)
+  video/
+    h264.rs       — V4L2 hardware H.264 encoder
+    webrtc.rs     — WHEP signalling + adaptive bitrate
+  robot/          — domain
+    car.rs        — Top-level Car struct with obstacle-avoidance safety
+    map.rs        — Occupancy grid map (320×320, 10 cm/cell)
+    map/render.rs — PNG / ASCII rendering (isolates the image crate)
+    explore.rs    — Frontier-based autonomous exploration
+    supervisor.rs — Teleop control loop: collision lock, TTC, auto-center
+  server.rs       — axum router + route handlers
   bin/
-    main.rs       — Web server (axum) with live sensor stream + controls
+    main.rs       — Composition root: wire up state, spawn supervisor, serve
     web/
       index.html  — Embedded mobile-first control UI
-examples/
-  test_all.rs   — Interactive component-by-component hardware test
-  drive_test.rs — Battery check + forward drive smoke test
-  camera_test.rs — Capture one frame and save as PPM
 scripts/
   install-service.sh — Install ginger as a systemd user service
 ```
@@ -110,14 +123,6 @@ Features:
 - **Autonomous exploration** — frontier-based; scan → move → repeat
 
 The UI is mobile-first: on phones it stacks camera → scrollable sensor strip → footer controls. On screens ≥ 700 px it switches to a camera + sidebar layout.
-
-## Running the hardware test
-
-```bash
-cargo run --example test_all
-```
-
-Tests each subsystem in order: ADC → LEDs → Buzzer → IR sensors → Ultrasonic → Servos → Motors → Camera. Motor test prompts before moving.
 
 ## Camera
 
