@@ -34,7 +34,7 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use crate::camera::Camera;
-use crate::h264_encoder::{EncoderControl, H264Encoder};
+use crate::video::h264::{EncoderControl, H264Encoder};
 
 const FPS: u32 = 30;
 const FRAME_DURATION: Duration = Duration::from_millis(33);
@@ -94,7 +94,7 @@ pub async fn whep_handle(
     // the codec; other threads steer it only via the atomics in
     // EncoderControl. A stop flag lets us tear it down on disconnect.
     let stop = Arc::new(AtomicBool::new(false));
-    let (au_tx, mut au_rx) = tokio::sync::mpsc::channel::<crate::h264_encoder::Encoded>(8);
+    let (au_tx, mut au_rx) = tokio::sync::mpsc::channel::<crate::video::h264::Encoded>(8);
     let (ctl_tx, ctl_rx) = tokio::sync::oneshot::channel::<EncoderControl>();
 
     let cam_for_enc = camera.clone();

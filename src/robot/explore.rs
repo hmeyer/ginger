@@ -19,7 +19,7 @@ use std::{
 use log::{info, warn};
 use serde::Serialize;
 
-use crate::{
+use crate::robot::{
     car::Car,
     map::{CELL_CM, H, MAX_RANGE_CM, Map, ScanRay, W},
 };

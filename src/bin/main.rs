@@ -25,7 +25,11 @@ use tokio::sync::mpsc;
 
 use log::{info, warn};
 
-use ginger_rs::{camera::Camera, car::Car, explore, map::Map, webrtc_stream};
+use ginger_rs::{
+    camera::Camera,
+    robot::{car::Car, explore, map::Map},
+    video::webrtc,
+};
 
 // ── Embedded web UI ───────────────────────────────────────────────────────────
 
@@ -439,7 +443,7 @@ async fn sensor_stream(
 // ── WebRTC signalling ─────────────────────────────────────────────────────────
 
 async fn webrtc_whep(State(st): State<AppState>, body: String) -> Response {
-    match webrtc_stream::whep_handle(st.camera.clone(), body).await {
+    match webrtc::whep_handle(st.camera.clone(), body).await {
         Ok(answer_sdp) => Response::builder()
             .status(StatusCode::CREATED)
             .header(header::CONTENT_TYPE, "application/sdp")

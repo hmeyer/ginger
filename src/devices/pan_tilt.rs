@@ -3,7 +3,7 @@
 //! Pan channel 8, tilt channel 9. Pan is wired inverted.
 //! Pulse: 500 µs = 0°, 1500 µs = 90°, 2500 µs = 180°.
 
-use crate::{Result, pca9685::Pca9685};
+use crate::{Result, hal::pca9685::Pca9685};
 
 const PAN_CHANNEL: u8 = 8;
 const TILT_CHANNEL: u8 = 9;

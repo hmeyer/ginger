@@ -5,7 +5,7 @@
 
 use crate::{
     Result,
-    pca9685::{FULL_OFF, MAX_DUTY, Pca9685},
+    hal::pca9685::{FULL_OFF, MAX_DUTY, Pca9685},
 };
 
 struct WheelChannels {
