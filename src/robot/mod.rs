@@ -3,3 +3,4 @@
 pub mod car;
 pub mod explore;
 pub mod map;
+pub mod supervisor;
