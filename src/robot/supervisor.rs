@@ -33,9 +33,8 @@ const COLLISION_CLEAR_CM: f32 = 38.0;
 // old value of 2000 the strict `>` made the common case never trigger.
 const AUTOCENTER_MIN_DUTY: i32 = 1500;
 const AUTOCENTER_TRAVEL_CM: f32 = 10.0;
-const MAX_SPEED_CMS: f32 = 60.0;
+const MAX_SPEED_CMS: f32 = 100.0;
 const POLL_PERIOD: Duration = Duration::from_millis(80);
-const POLL_DT_S: f32 = 0.080;
 const DEAD_MAN_TIMEOUT: Duration = Duration::from_millis(500);
 
 // ── Pure safety helpers ───────────────────────────────────────────────────────
@@ -78,13 +77,15 @@ fn collision_step(going_forward: bool, us_cm: Option<f32>, lock: bool) -> Collis
     CollisionDecision { stop, lock }
 }
 
-/// Estimated forward travel (cm) accrued in one poll period for the given
-/// motor command, or `None` when not driving forward hard enough to count
-/// (which also resets the auto-center accumulator).
-fn fwd_travel_step(motor_left: i32, motor_right: i32) -> Option<f32> {
+/// Estimated forward travel (cm) over `dt` seconds for the given motor
+/// command, or `None` when not driving forward hard enough to count
+/// (which also resets the auto-center accumulator). `dt` is the *measured*
+/// loop period, not a constant: the supervisor loop also does blocking
+/// sensor I/O, so the real period runs well over the nominal 80 ms sleep.
+fn fwd_travel_step(motor_left: i32, motor_right: i32, dt: f32) -> Option<f32> {
     if motor_left > AUTOCENTER_MIN_DUTY && motor_right > AUTOCENTER_MIN_DUTY {
         let avg_fraction = (motor_left + motor_right) as f32 / 2.0 / 4095.0;
-        Some(avg_fraction * MAX_SPEED_CMS * POLL_DT_S)
+        Some(avg_fraction * MAX_SPEED_CMS * dt)
     } else {
         None
     }
@@ -114,6 +115,9 @@ pub fn run(
     // Pan/tilt auto-center state
     let mut fwd_travel_est: f32 = 0.0;
     let mut pan_auto_centered = false;
+    // Wall-clock of the last travel accumulation, for measured-dt
+    // integration (real loop period varies with sensor I/O cost).
+    let mut last_travel_t = Instant::now();
     // Last commanded bracket angles, mirrored into the snapshot so the
     // web UI can keep its camera joystick in sync (esp. when we
     // auto-center after forward driving).
@@ -273,7 +277,9 @@ pub fn run(
 
         // Auto-center pan when sustained forward motion detected.
         // Ensures US sensor faces forward for collision detection.
-        if let Some(inc) = fwd_travel_step(motor_left, motor_right) {
+        let travel_dt = now_t.duration_since(last_travel_t).as_secs_f32();
+        last_travel_t = now_t;
+        if let Some(inc) = fwd_travel_step(motor_left, motor_right, travel_dt) {
             fwd_travel_est += inc;
             if fwd_travel_est > AUTOCENTER_TRAVEL_CM && !pan_auto_centered {
                 let mut pt = car.pan_tilt();
@@ -374,13 +380,14 @@ mod tests {
 
     #[test]
     fn fwd_travel_only_counts_strong_forward() {
-        assert!(fwd_travel_step(0, 0).is_none());
-        assert!(fwd_travel_step(1000, 1000).is_none()); // below threshold
-        assert!(fwd_travel_step(3000, 1000).is_none()); // one wheel too slow
+        let dt = 0.080;
+        assert!(fwd_travel_step(0, 0, dt).is_none());
+        assert!(fwd_travel_step(1000, 1000, dt).is_none()); // below threshold
+        assert!(fwd_travel_step(3000, 1000, dt).is_none()); // one wheel too slow
         // The web UI drives forward at exactly DUTY = 2000; that must
         // accumulate travel (regression guard for the auto-center bug).
-        assert!(fwd_travel_step(2000, 2000).is_some());
-        let inc = fwd_travel_step(4095, 4095).unwrap();
-        assert!((inc - MAX_SPEED_CMS * POLL_DT_S).abs() < 1e-3);
+        assert!(fwd_travel_step(2000, 2000, dt).is_some());
+        let inc = fwd_travel_step(4095, 4095, dt).unwrap();
+        assert!((inc - MAX_SPEED_CMS * dt).abs() < 1e-3);
     }
 }
