@@ -10,6 +10,7 @@ pub mod motors;
 pub mod pca9685;
 pub mod servo;
 pub mod ultrasonic;
+pub mod webrtc_stream;
 
 use thiserror::Error;
 

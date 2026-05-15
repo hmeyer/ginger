@@ -41,7 +41,7 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.05em}
 
 /* Camera */
 #cam-wrap{flex:1;min-height:0;background:#000;overflow:hidden;position:relative}
-#cam{width:100%;height:100%;object-fit:contain;display:block}
+#cam{width:100%;height:100%;object-fit:contain;display:block;background:#000}
 
 /* Minimap overlay */
 #minimap-wrap{
@@ -168,7 +168,7 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 
 <!-- Camera takes available height; on desktop becomes a grid container -->
 <div id="cam-wrap">
-  <img id="cam" alt="camera feed">
+  <video id="cam" autoplay muted playsinline></video>
   <button id="minimap-toggle" title="Toggle map">🗺 map</button>
   <div id="minimap-wrap">
     <canvas id="minimap" width="160" height="160"></canvas>
@@ -559,7 +559,12 @@ function scheduleMinimap() {
 updateMinimap();
 scheduleMinimap();
 
-// ── Camera frame polling + web FPS ────────────────────────────────────────────
+// ── Camera H.264 stream via WebRTC ────────────────────────────────────────────
+//
+// Server (webrtc_stream.rs) runs ffmpeg with h264_v4l2m2m (Pi HW encoder),
+// parses Annex-B NAL access units, and pushes them into a
+// TrackLocalStaticSample. The browser negotiates a recv-only video
+// PeerConnection via a single POST/SDP-answer ("WHEP") exchange.
 const camEl = document.getElementById('cam');
 let _wFrames = 0, _wT0 = performance.now(), _wFps = 0;
 
@@ -575,13 +580,83 @@ function updateWebFps() {
   }
 }
 
-function nextFrame() {
-  const img = new Image();
-  img.onload  = () => { camEl.src = img.src; _wFrames++; updateWebFps(); nextFrame(); };
-  img.onerror = () => setTimeout(nextFrame, 500);
-  img.src = '/api/camera/frame?' + Date.now();
+function tickFrame(_now, _meta) {
+  _wFrames++;
+  updateWebFps();
+  camEl.requestVideoFrameCallback(tickFrame);
 }
-nextFrame();
+if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+  camEl.requestVideoFrameCallback(tickFrame);
+}
+
+async function startStream() {
+  while (true) {
+    try {
+      await runWebRTC();
+    } catch (e) {
+      console.warn('webrtc error, reconnecting in 1s', e);
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+function runWebRTC() {
+  return new Promise(async (resolve, reject) => {
+    const pc = new RTCPeerConnection();
+    window.__pc = pc; // expose for debugging / latency probes
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    pc.ontrack = (event) => {
+      // First track event wires the stream to the <video>.
+      if (camEl.srcObject !== event.streams[0]) {
+        camEl.srcObject = event.streams[0];
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      if (s === 'failed' || s === 'disconnected' || s === 'closed') {
+        try { pc.close(); } catch (_) {}
+        resolve();
+      }
+    };
+
+    let offer;
+    try {
+      offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      // Wait for ICE gathering to complete so our offer includes candidates.
+      await new Promise(r => {
+        if (pc.iceGatheringState === 'complete') return r();
+        const cb = () => {
+          if (pc.iceGatheringState === 'complete') {
+            pc.removeEventListener('icegatheringstatechange', cb);
+            r();
+          }
+        };
+        pc.addEventListener('icegatheringstatechange', cb);
+      });
+    } catch (e) { reject(e); return; }
+
+    let answerSdp;
+    try {
+      const resp = await fetch('/api/webrtc/whep', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/sdp' },
+        body: pc.localDescription.sdp,
+      });
+      if (!resp.ok) { reject(new Error('WHEP HTTP ' + resp.status)); return; }
+      answerSdp = await resp.text();
+    } catch (e) { reject(e); return; }
+
+    try {
+      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    } catch (e) { reject(e); return; }
+    // Promise stays pending until the ICE state turns terminal.
+  });
+}
+
+startStream();
 </script>
 </body>
 </html>

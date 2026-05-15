@@ -180,44 +180,6 @@ impl Frame {
         rgb
     }
 
-    /// Convert YUYV to packed RGB at a reduced resolution by sampling every Nth pixel.
-    /// This avoids converting pixels that will be discarded, making it proportionally faster.
-    /// Returns `(rgb_bytes, out_width, out_height)`.
-    pub fn to_rgb_scaled(&self, scale: f32) -> (Vec<u8>, u32, u32) {
-        let sw = self.width as usize;
-        let sh = self.height as usize;
-        let dw = ((sw as f32 * scale) as usize).max(1);
-        let dh = ((sh as f32 * scale) as usize).max(1);
-        let x_stride = sw as f32 / dw as f32;
-        let y_stride = sh as f32 / dh as f32;
-
-        let mut rgb = vec![0u8; dw * dh * 3];
-        for dy in 0..dh {
-            let sy = (dy as f32 * y_stride) as usize;
-            let row_base = sy * sw;
-            for dx in 0..dw {
-                let sx = (dx as f32 * x_stride) as usize;
-                // YUYV: 4 bytes represent 2 pixels [Y0 U Y1 V].
-                // Pixel at column sx lives in chunk (sx/2); Y is at byte 0 or 2.
-                let chunk = &self.data[(row_base + sx) / 2 * 4..];
-                let y = if sx.is_multiple_of(2) {
-                    chunk[0] as i32
-                } else {
-                    chunk[2] as i32
-                };
-                let u = chunk[1] as i32;
-                let v = chunk[3] as i32;
-
-                let base = (dy * dw + dx) * 3;
-                rgb[base] = (y + 1402 * (v - 128) / 1000).clamp(0, 255) as u8;
-                rgb[base + 1] =
-                    (y - 344 * (u - 128) / 1000 - 714 * (v - 128) / 1000).clamp(0, 255) as u8;
-                rgb[base + 2] = (y + 1772 * (u - 128) / 1000).clamp(0, 255) as u8;
-            }
-        }
-        (rgb, dw as u32, dh as u32)
-    }
-
     /// Write a binary PPM file (viewable without any extra library).
     pub fn save_ppm(&self, path: &str) -> std::io::Result<()> {
         let header = format!("P6\n{} {}\n255\n", self.width, self.height);
