@@ -92,26 +92,33 @@ footer{
   display:flex;align-items:center;gap:10px
 }
 
-/* D-pad */
-.dpad{
-  display:grid;grid-template-columns:repeat(3,52px);grid-template-rows:repeat(3,52px);
-  gap:4px;flex-shrink:0
-}
-.dpad button{
-  background:#252535;border:1px solid #3a3a5a;border-radius:8px;
-  color:#ccc;font-size:1.3rem;cursor:pointer;
+/* Virtual joysticks */
+.joy-block{display:flex;flex-direction:column;align-items:center;gap:6px;flex-shrink:0}
+.joy{
+  position:relative;width:92px;height:92px;border-radius:50%;
+  background:radial-gradient(circle at 50% 45%,#26263f,#15151f);
+  border:1px solid #3a3a5a;flex-shrink:0;
   touch-action:none;user-select:none;-webkit-user-select:none;
-  display:flex;align-items:center;justify-content:center;transition:background .08s
+  cursor:grab;outline:none
 }
-.dpad .gap{background:transparent;border:none;pointer-events:none}
-.dpad button.held,.dpad button:active{background:var(--accent);color:#000;border-color:var(--accent)}
+.joy::after{
+  content:"";position:absolute;left:50%;top:50%;width:8px;height:8px;
+  margin:-4px 0 0 -4px;border-radius:50%;background:#3a3a5a
+}
+.joy:active{cursor:grabbing}
+.joy.focused{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent),0 0 14px #4af7}
+.joy-knob{
+  position:absolute;left:50%;top:50%;width:40px;height:40px;border-radius:50%;
+  background:#3a3a5a;border:1px solid #6a6aa0;
+  transform:translate(-50%,-50%);transition:transform .12s ease-out;
+  pointer-events:none
+}
+.joy.dragging .joy-knob{transition:none;background:var(--accent);border-color:var(--accent)}
+.joy-label{font-size:.62rem;color:var(--dim);text-align:center;white-space:nowrap;letter-spacing:.03em}
 
 /* Right-side controls */
 .right-controls{display:flex;flex-direction:column;gap:8px;flex:1;min-width:0}
-.sliders{display:flex;flex-direction:column;gap:4px}
-.sliders label{font-size:.68rem;color:var(--dim);display:flex;justify-content:space-between}
-input[type=range]{width:100%;accent-color:var(--accent);height:6px;cursor:pointer}
-.leds{display:flex;align-items:center;gap:6px}
+.leds{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .leds>.lbl{font-size:.68rem;color:var(--dim)}
 input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px;cursor:pointer;background:none;padding:2px;flex-shrink:0}
 .btn-row{display:flex;gap:6px;flex:1}
@@ -126,7 +133,7 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 
 /* ── DESKTOP (≥ 700 px) ───────────────────────────────────────────────────── */
 @media (min-width: 700px) {
-  body{display:grid;grid-template-rows:44px 1fr 100px;grid-template-columns:1fr;overflow:hidden;touch-action:auto}
+  body{display:grid;grid-template-rows:44px 1fr 180px;grid-template-columns:1fr;overflow:hidden;touch-action:auto}
 
   /* Camera + sidebar in a row */
   #cam-wrap{display:grid;grid-template-columns:1fr 260px;grid-row:2;grid-column:1;overflow:hidden;background:transparent;flex:unset;min-height:0}
@@ -151,9 +158,9 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
   .row{display:flex;align-items:center;gap:8px;padding:2px 0;font-size:.85rem}
   .lbl{color:var(--dim);min-width:18px}
 
-  footer{height:100px;padding:10px 16px;grid-row:3;grid-column:1}
-  .dpad{grid-template-columns:repeat(3,42px);grid-template-rows:repeat(3,42px)}
-  .dpad button{font-size:1.1rem;border-radius:6px}
+  footer{height:180px;padding:14px 16px;grid-row:3;grid-column:1;gap:18px}
+  .joy{width:140px;height:140px}
+  .joy-knob{width:58px;height:58px}
 }
 </style>
 </head>
@@ -271,25 +278,23 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 </div>
 
 <footer>
-  <div class="dpad">
-    <div class="gap"></div>
-    <button id="b-fwd">↑</button>
-    <div class="gap"></div>
-    <button id="b-left">←</button>
-    <button id="b-stop">■</button>
-    <button id="b-right">→</button>
-    <div class="gap"></div>
-    <button id="b-bwd">↓</button>
-    <div class="gap"></div>
+  <div class="joy-block">
+    <div class="joy" id="drive-joy" tabindex="0" role="application"
+         aria-label="Drive joystick — click or tap to focus, then steer with the arrow keys; space stops">
+      <div class="joy-knob"></div>
+    </div>
+    <div class="joy-label" id="drive-hint">Drive · tap to focus</div>
+  </div>
+
+  <div class="joy-block">
+    <div class="joy" id="cam-joy" role="application"
+         aria-label="Camera bracket joystick — drag to pan/tilt, double-tap to center">
+      <div class="joy-knob"></div>
+    </div>
+    <div class="joy-label">Pan <span id="pan-v">90</span>° · Tilt <span id="tilt-v">90</span>°</div>
   </div>
 
   <div class="right-controls">
-    <div class="sliders">
-      <label>Pan <span id="pan-v">90</span>°</label>
-      <input type="range" id="pan" min="0" max="180" value="90">
-      <label>Tilt <span id="tilt-v">90</span>°</label>
-      <input type="range" id="tilt" min="0" max="180" value="90">
-    </div>
     <div class="leds">
       <span class="lbl">LED</span>
       <input type="color" id="led-color" value="#00aaff">
@@ -314,51 +319,182 @@ function post(url, body) {
   return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined});
 }
 
-// ── Drive ─────────────────────────────────────────────────────────────────────
-function startDrive(l, r) {
-  clearInterval(driveTimer);
-  post('/api/drive', {left:l, right:r});
-  driveTimer = setInterval(() => post('/api/drive', {left:l, right:r}), 150);
+// ── Virtual joystick ──────────────────────────────────────────────────────────
+// Pointer-driven analog stick. `sticky` keeps the knob where it was left
+// (camera bracket); otherwise it springs back to center on release (drive).
+function makeJoystick(el, { sticky = false, onMove, onEnd }) {
+  const knob = el.querySelector('.joy-knob');
+  let dragging = false, pid = null, raf = 0, pending = null;
+
+  const radius = () => Math.max(1, el.clientWidth / 2 - knob.clientWidth / 2);
+  function place(nx, ny) {
+    if (nx === 0 && ny === 0) { center(); return; }
+    const R = radius();
+    knob.style.transform =
+      `translate(calc(-50% + ${(nx * R).toFixed(1)}px), calc(-50% + ${(ny * R).toFixed(1)}px))`;
+  }
+  function center() { knob.style.transform = 'translate(-50%, -50%)'; }
+  function emit(nx, ny) {
+    pending = [nx, ny];
+    if (!raf) raf = requestAnimationFrame(() => {
+      raf = 0;
+      if (pending && onMove) onMove(pending[0], pending[1]);
+    });
+  }
+  function vec(e) {
+    const r = el.getBoundingClientRect();
+    let dx = e.clientX - (r.left + r.width / 2);
+    let dy = e.clientY - (r.top + r.height / 2);
+    const R = radius(), d = Math.hypot(dx, dy);
+    if (d > R) { dx = dx / d * R; dy = dy / d * R; }
+    return [dx / R, dy / R];
+  }
+  el.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if (el.tabIndex >= 0) el.focus();
+    dragging = true; pid = e.pointerId;
+    try { el.setPointerCapture(pid); } catch (_) {}
+    el.classList.add('dragging');
+    const [nx, ny] = vec(e); place(nx, ny); emit(nx, ny);
+  });
+  el.addEventListener('pointermove', e => {
+    if (!dragging || e.pointerId !== pid) return;
+    const [nx, ny] = vec(e); place(nx, ny); emit(nx, ny);
+  });
+  function release(e) {
+    if (!dragging || (e && e.pointerId !== pid)) return;
+    dragging = false;
+    try { el.releasePointerCapture(pid); } catch (_) {}
+    el.classList.remove('dragging');
+    if (!sticky) center();
+    if (onEnd) onEnd();
+  }
+  el.addEventListener('pointerup', release);
+  el.addEventListener('pointercancel', release);
+
+  return {
+    isDragging: () => dragging,
+    place,                 // move the knob without emitting onMove
+    center,
+  };
 }
-function stopDrive() {
-  clearInterval(driveTimer);
-  driveTimer = null;
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+
+// ── Drive joystick — momentary, spring-back, keyboard only when focused ───────
+const driveEl   = document.getElementById('drive-joy');
+const driveHint = document.getElementById('drive-hint');
+let driveCmd = null;                       // last {left,right} dispatched
+
+function driveMix(nx, ny) {
+  // Arcade mixing. Up = forward (ny < 0); x = turn. Preserves the old
+  // D-pad semantics: full-left → {+DUTY,-DUTY}, full-fwd → {+DUTY,+DUTY}.
+  let throttle = -ny, turn = nx;
+  if (Math.hypot(nx, ny) < 0.10) { throttle = 0; turn = 0; }   // center deadzone
+  let l = throttle - turn, r = throttle + turn;
+  const m = Math.max(1, Math.abs(l), Math.abs(r));
+  return { left: Math.round(l / m * DUTY), right: Math.round(r / m * DUTY) };
+}
+function driveSend(nx, ny) {
+  const cmd = driveMix(nx, ny);
+  const changed = !driveCmd || cmd.left !== driveCmd.left || cmd.right !== driveCmd.right;
+  driveCmd = cmd;
+  if (changed) post('/api/drive', cmd);
+  if (!driveTimer) driveTimer = setInterval(() => {
+    if (driveCmd) post('/api/drive', driveCmd);   // dead-man heartbeat
+  }, 150);
+}
+function driveStop() {
+  driveCmd = null;
+  clearInterval(driveTimer); driveTimer = null;
   post('/api/stop');
 }
-function bindDrive(id, l, r) {
-  const el = document.getElementById(id);
-  const press = e => { e.preventDefault(); el.classList.add('held'); startDrive(l, r); };
-  const rel   = () => { el.classList.remove('held'); stopDrive(); };
-  el.addEventListener('mousedown', press);
-  el.addEventListener('touchstart', press, {passive:false});
-  ['mouseup','touchend','mouseleave','touchcancel'].forEach(ev => el.addEventListener(ev, rel));
+const driveJoy = makeJoystick(driveEl, { sticky: false, onMove: driveSend, onEnd: driveStop });
+
+// Keyboard control is intentionally scoped to the joystick element: arrow
+// keys only steer the car while this joystick is focused (click/tab to it).
+const ARROWS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+const held = new Set();
+let kbActive = false;
+function kbVec() {
+  let x = 0, y = 0;
+  if (held.has('ArrowUp'))    y -= 1;
+  if (held.has('ArrowDown'))  y += 1;
+  if (held.has('ArrowLeft'))  x -= 1;
+  if (held.has('ArrowRight')) x += 1;
+  const m = Math.hypot(x, y) || 1;            // normalize so diagonals aren't faster
+  return [x / m, y / m];
 }
-bindDrive('b-fwd',   DUTY,  DUTY);
-bindDrive('b-bwd',  -DUTY, -DUTY);
-bindDrive('b-left',  DUTY, -DUTY);
-bindDrive('b-right', -DUTY,  DUTY);
-document.getElementById('b-stop').addEventListener('click', stopDrive);
-document.addEventListener('keydown', e => {
+function kbApply() {
+  if (held.size === 0) {
+    if (kbActive) { kbActive = false; driveJoy.center(); driveStop(); }
+    return;
+  }
+  const [nx, ny] = kbVec();
+  kbActive = true;
+  driveJoy.place(nx, ny);
+  driveSend(nx, ny);
+}
+driveEl.addEventListener('keydown', e => {
+  if (e.key === ' ') { e.preventDefault(); held.clear(); kbApply(); return; }
+  if (!ARROWS.includes(e.key)) return;
+  e.preventDefault();
   if (e.repeat) return;
-  if (e.key==='ArrowUp')    { e.preventDefault(); startDrive( DUTY,  DUTY); }
-  if (e.key==='ArrowDown')  { e.preventDefault(); startDrive(-DUTY, -DUTY); }
-  if (e.key==='ArrowLeft')  { e.preventDefault(); startDrive( DUTY, -DUTY); }
-  if (e.key==='ArrowRight') { e.preventDefault(); startDrive(-DUTY,  DUTY); }
-  if (e.key===' ')          { e.preventDefault(); stopDrive(); }
+  held.add(e.key); kbApply();
 });
-document.addEventListener('keyup', e => {
-  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) stopDrive();
+driveEl.addEventListener('keyup', e => {
+  if (!ARROWS.includes(e.key)) return;
+  e.preventDefault();
+  held.delete(e.key); kbApply();
+});
+driveEl.addEventListener('focus', () => {
+  driveEl.classList.add('focused');
+  driveHint.textContent = 'Drive · arrow keys active';
+});
+driveEl.addEventListener('blur', () => {
+  driveEl.classList.remove('focused');
+  driveHint.textContent = 'Drive · tap to focus';
+  if (kbActive || held.size) { held.clear(); kbActive = false; driveJoy.center(); driveStop(); }
 });
 
-// ── Pan / Tilt ────────────────────────────────────────────────────────────────
-document.getElementById('pan').addEventListener('input', e => {
-  document.getElementById('pan-v').textContent = e.target.value;
-  post('/api/pan', {angle: +e.target.value});
+// ── Camera/US-bracket joystick — sticky; sends degrees; telemetry-synced ──────
+const camJoyEl = document.getElementById('cam-joy');
+const panSpan  = document.getElementById('pan-v');
+const tiltSpan = document.getElementById('tilt-v');
+let camPan = 90, camTilt = 90, camTouchedAt = 0;
+
+function camShow(p, t) { panSpan.textContent = p; tiltSpan.textContent = t; }
+function camSend(nx, ny) {
+  camTouchedAt = performance.now();
+  const p = Math.round(clamp(90 + nx * 90, 0, 180));
+  const t = Math.round(clamp(90 - ny * 90, 0, 180));
+  if (p !== camPan)  { camPan  = p; post('/api/pan',  { angle: p }); }
+  if (t !== camTilt) { camTilt = t; post('/api/tilt', { angle: t }); }
+  camShow(camPan, camTilt);
+}
+const camJoy = makeJoystick(camJoyEl, { sticky: true, onMove: camSend });
+camJoyEl.addEventListener('pointerup', () => { camTouchedAt = performance.now(); });
+camJoyEl.addEventListener('dblclick', () => {
+  camJoy.center();
+  camPan = 90; camTilt = 90; camShow(90, 90);
+  post('/api/pan',  { angle: 90 });
+  post('/api/tilt', { angle: 90 });
+  camTouchedAt = performance.now();
 });
-document.getElementById('tilt').addEventListener('input', e => {
-  document.getElementById('tilt-v').textContent = e.target.value;
-  post('/api/tilt', {angle: +e.target.value});
-});
+
+// Mirror the bracket's real angle reported by telemetry so the knob
+// follows server-side moves — in particular the supervisor's auto-center
+// after sustained forward driving. Suppressed while the user is (or just
+// was) interacting so we never fight live input.
+function camSync(p, t) {
+  if (p == null || t == null || camJoy.isDragging()) return;
+  if (performance.now() - camTouchedAt < 700) return;
+  const rp = Math.round(p), rt = Math.round(t);
+  if (rp === camPan && rt === camTilt) return;
+  camPan = rp; camTilt = rt;
+  camJoy.place((rp - 90) / 90, -(rt - 90) / 90);
+  camShow(rp, rt);
+}
 
 // ── LED ───────────────────────────────────────────────────────────────────────
 document.getElementById('b-led-set').addEventListener('click', () => {
@@ -403,6 +539,10 @@ sse.onerror = () => { conn.textContent = 'disconnected'; conn.className = 'err';
 sse.onmessage = e => {
   const d = JSON.parse(e.data);
   const fmt = (v, n) => v != null ? v.toFixed(n) : '—';
+
+  // Keep the camera joystick in sync with the bracket's real angle
+  // (notably the supervisor's forward-drive auto-center).
+  camSync(d.pan, d.tilt);
 
   // Explore state badge
   const es = d.explore_state || 'idle';

@@ -27,7 +27,11 @@ const COLLISION_STOP_CM: f32 = 30.0;
 // Hysteresis: unlock only after obstacle retreats past this.
 const COLLISION_CLEAR_CM: f32 = 38.0;
 // Auto-center pan/tilt after this much sustained forward travel.
-const AUTOCENTER_MIN_DUTY: i32 = 2000;
+// Both wheels must exceed this duty (of 4095) to count as "driving
+// forward". Kept below the teleop forward duty (DUTY = 2000 in the web
+// UI) so ordinary forward driving actually accumulates travel — at the
+// old value of 2000 the strict `>` made the common case never trigger.
+const AUTOCENTER_MIN_DUTY: i32 = 1500;
 const AUTOCENTER_TRAVEL_CM: f32 = 10.0;
 const MAX_SPEED_CMS: f32 = 60.0;
 const POLL_PERIOD: Duration = Duration::from_millis(80);
@@ -110,6 +114,11 @@ pub fn run(
     // Pan/tilt auto-center state
     let mut fwd_travel_est: f32 = 0.0;
     let mut pan_auto_centered = false;
+    // Last commanded bracket angles, mirrored into the snapshot so the
+    // web UI can keep its camera joystick in sync (esp. when we
+    // auto-center after forward driving).
+    let mut cur_pan: f32 = 90.0;
+    let mut cur_tilt: f32 = 90.0;
 
     loop {
         // ── Command queue ──────────────────────────────────────────────────────
@@ -160,11 +169,13 @@ pub fn run(
                 }
                 Command::SetPan(a) => {
                     car.pan_tilt().set_pan(a).ok();
+                    cur_pan = a;
                     pan_auto_centered = false;
                     fwd_travel_est = 0.0;
                 }
                 Command::SetTilt(a) => {
                     car.pan_tilt().set_tilt(a).ok();
+                    cur_tilt = a;
                     pan_auto_centered = false;
                     fwd_travel_est = 0.0;
                 }
@@ -268,6 +279,8 @@ pub fn run(
                 let mut pt = car.pan_tilt();
                 pt.set_pan(90.0).ok();
                 pt.set_tilt(90.0).ok();
+                cur_pan = 90.0;
+                cur_tilt = 90.0;
                 pan_auto_centered = true;
                 info!(
                     "hw: auto-centered pan+tilt after ~{:.0}cm forward travel",
@@ -289,6 +302,8 @@ pub fn run(
             ir,
             us_cm,
             ttc_s,
+            pan: cur_pan,
+            tilt: cur_tilt,
             explore_state: "idle".into(),
             camera_fps: 0.0, // filled by SSE handler
             exposure_us: 0,  // filled by SSE handler
@@ -360,8 +375,11 @@ mod tests {
     #[test]
     fn fwd_travel_only_counts_strong_forward() {
         assert!(fwd_travel_step(0, 0).is_none());
-        assert!(fwd_travel_step(2000, 2000).is_none()); // not strictly greater
+        assert!(fwd_travel_step(1000, 1000).is_none()); // below threshold
         assert!(fwd_travel_step(3000, 1000).is_none()); // one wheel too slow
+        // The web UI drives forward at exactly DUTY = 2000; that must
+        // accumulate travel (regression guard for the auto-center bug).
+        assert!(fwd_travel_step(2000, 2000).is_some());
         let inc = fwd_travel_step(4095, 4095).unwrap();
         assert!((inc - MAX_SPEED_CMS * POLL_DT_S).abs() < 1e-3);
     }

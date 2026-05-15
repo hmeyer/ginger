@@ -26,6 +26,8 @@ pub struct SensorSnapshot {
     pub ir: Option<[bool; 3]>,
     pub us_cm: Option<f32>,
     pub ttc_s: Option<f32>, // estimated seconds to collision (None = not closing)
+    pub pan: f32,           // current pan-bracket angle, degrees (UI joystick sync)
+    pub tilt: f32,          // current tilt-bracket angle, degrees
     pub explore_state: String,
     pub camera_fps: f32,
     pub exposure_us: i32,
@@ -46,6 +48,8 @@ impl SensorSnapshot {
             ir: None,
             us_cm: None,
             ttc_s: None,
+            pan: 90.0,
+            tilt: 90.0,
             explore_state: "idle".into(),
             camera_fps: 0.0,
             exposure_us: 8_000,
