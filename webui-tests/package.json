@@ -1,0 +1,12 @@
+{
+  "name": "ginger-webui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright UI tests for the Ginger web control interface",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0"
+  }
+}

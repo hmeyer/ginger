@@ -1,2 +1,7 @@
 ginger-rs/target/
 /target/
+
+# Playwright web UI tests
+webui-tests/node_modules/
+webui-tests/test-results/
+webui-tests/playwright-report/
