@@ -34,6 +34,28 @@ pub struct SensorSnapshot {
     pub luma: u8,
 }
 
+impl SensorSnapshot {
+    /// Startup state before the first sensor poll. Exposure/gain seed the
+    /// camera AE loop's initial guess.
+    pub fn initial() -> Self {
+        Self {
+            battery_v: 0.0,
+            battery_pct: 0,
+            light_left: None,
+            light_right: None,
+            ir: None,
+            us_cm: None,
+            ttc_s: None,
+            explore_state: "idle".into(),
+            camera_fps: 0.0,
+            exposure_us: 8_000,
+            gain: 8.0,
+            brightness: 0.0,
+            luma: 0,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct SensorConfig {
     pub light: bool,
