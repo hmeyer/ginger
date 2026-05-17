@@ -160,23 +160,43 @@ const RATIO: f32 = 0.8;
 
 /// Brute-force mutual-nearest-neighbour matcher with the ratio test.
 /// Returns `(i, j)` index pairs into `a` and `b`.
+///
+/// The full `a × b` Hamming matrix is computed **once** (row `i` = all
+/// distances from `a[i]`); the forward best-two/ratio pass reads it
+/// row-wise and the backward best pass reads it column-wise. This is
+/// output-identical to scoring each direction independently — same scan
+/// order, so ties break the same way — but halves the Hamming work, which
+/// previously recomputed every distance a second time for `bwd`.
 pub fn match_descriptors(a: &[Descriptor], b: &[Descriptor]) -> Vec<(u32, u32)> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
-    // Best b for each a, with the ratio test applied.
-    let fwd: Vec<Option<usize>> = a
-        .par_iter()
-        .map(|da| {
+    let (na, nb) = (a.len(), b.len());
+
+    // Distance matrix, one row per `a`, computed in parallel over rows.
+    // Max distance is 256 bits, so `u16` holds it exactly.
+    let mut dist = vec![0u16; na * nb];
+    dist.par_chunks_mut(nb)
+        .zip(a.par_iter())
+        .for_each(|(row, da)| {
+            for (slot, db) in row.iter_mut().zip(b) {
+                *slot = hamming(da, db) as u16;
+            }
+        });
+
+    // Forward: best b for each a (best two + ratio test), reading row i.
+    let fwd: Vec<Option<usize>> = dist
+        .par_chunks(nb)
+        .map(|row| {
             let (mut bi, mut d1, mut d2) = (usize::MAX, u32::MAX, u32::MAX);
-            for (j, db) in b.iter().enumerate() {
-                let dist = hamming(da, db);
-                if dist < d1 {
+            for (j, &d) in row.iter().enumerate() {
+                let d = d as u32;
+                if d < d1 {
                     d2 = d1;
-                    d1 = dist;
+                    d1 = d;
                     bi = j;
-                } else if dist < d2 {
-                    d2 = dist;
+                } else if d < d2 {
+                    d2 = d;
                 }
             }
             let ratio_ok = d2 == u32::MAX || (d1 as f32) < RATIO * d2 as f32;
@@ -187,21 +207,24 @@ pub fn match_descriptors(a: &[Descriptor], b: &[Descriptor]) -> Vec<(u32, u32)> 
             }
         })
         .collect();
-    // Best a for each b — used only for the mutual-consistency check.
-    let bwd: Vec<usize> = b
-        .par_iter()
-        .map(|db| {
+
+    // Backward: best a for each b — same matrix, read column-wise. Used
+    // only for the mutual-consistency check.
+    let bwd: Vec<usize> = (0..nb)
+        .into_par_iter()
+        .map(|j| {
             let (mut ai, mut best) = (usize::MAX, u32::MAX);
-            for (i, da) in a.iter().enumerate() {
-                let dist = hamming(da, db);
-                if dist < best {
-                    best = dist;
+            for i in 0..na {
+                let d = dist[i * nb + j] as u32;
+                if d < best {
+                    best = d;
                     ai = i;
                 }
             }
             ai
         })
         .collect();
+
     fwd.iter()
         .enumerate()
         .filter_map(|(i, &mj)| {
