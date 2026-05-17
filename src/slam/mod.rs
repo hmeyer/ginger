@@ -17,6 +17,7 @@ use log::info;
 use serde::Serialize;
 
 use crate::camera::Camera;
+use crate::marker;
 use image::{GrayImage, build_pyramid};
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
@@ -26,6 +27,8 @@ const N_LEVELS: usize = 8;
 const SCALE_FACTOR: f32 = 1.2;
 /// FAST intensity threshold (0–255).
 const FAST_THRESHOLD: u8 = 20;
+/// Extra guard band (px) around the marker ROI to mask from detection.
+const ROI_GUARD: usize = 2;
 /// Grid cell (level-0 px) and max features per cell — spreads features
 /// so they don't all clump on the strongest texture.
 const CELL_PX: u16 = 24;
@@ -49,6 +52,10 @@ pub struct FeaturePoint {
 pub struct SlamSnapshot {
     pub width: u16,
     pub height: u16,
+    /// Camera frame id these features were detected on (matches the
+    /// luma marker burned into the video — the client uses it to draw
+    /// features over the exact frame they came from).
+    pub frame_id: u64,
     /// Total corners after NMS, before the grid-spread cap.
     pub n_total: u32,
     /// Frontend time for the last frame (ms), EWMA-smoothed.
@@ -64,6 +71,7 @@ impl SlamSnapshot {
         Self {
             width: 0,
             height: 0,
+            frame_id: 0,
             n_total: 0,
             detect_ms: 0.0,
             fps: 0.0,
@@ -78,6 +86,17 @@ impl SlamSnapshot {
 /// capped) features in level-0 coordinates, plus the pre-cap NMS total.
 pub fn detect_features(gray: &GrayImage) -> (Vec<FeaturePoint>, u32) {
     let (w, h) = (gray.width, gray.height);
+    // Mask the bottom-right marker ROI (+ guard) so the frame-id code
+    // never produces features. ROI is flush to the corner, so a point
+    // is excluded iff it's past the (guard-expanded) top-left of it.
+    let roi_origin = if w >= marker::ROI_W && h >= marker::ROI_H {
+        let (rx, ry, _, _) = marker::roi_rect(w, h);
+        Some((rx.saturating_sub(ROI_GUARD), ry.saturating_sub(ROI_GUARD)))
+    } else {
+        None
+    };
+    let in_roi = |x: usize, y: usize| roi_origin.is_some_and(|(ex, ey)| x >= ex && y >= ey);
+
     let pyramid = build_pyramid(gray.clone(), N_LEVELS, SCALE_FACTOR);
 
     let mut all: Vec<FeaturePoint> = Vec::new();
@@ -88,6 +107,9 @@ pub fn detect_features(gray: &GrayImage) -> (Vec<FeaturePoint>, u32) {
             // Map this level's coords back onto level 0.
             let x = ((c.x as f32 * level.scale).round() as usize).min(w.saturating_sub(1));
             let y = ((c.y as f32 * level.scale).round() as usize).min(h.saturating_sub(1));
+            if in_roi(x, y) {
+                continue;
+            }
             all.push(FeaturePoint {
                 x: x as u16,
                 y: y as u16,
@@ -116,6 +138,22 @@ pub fn detect_features(gray: &GrayImage) -> (Vec<FeaturePoint>, u32) {
     (out, n_total)
 }
 
+/// Detect features on `gray` and assemble a snapshot tagged with
+/// `frame_id` (propagated verbatim — never re-stamped). Timing fields
+/// are left at 0 for the caller to fill with smoothed values.
+pub fn build_snapshot(gray: &GrayImage, frame_id: u64) -> SlamSnapshot {
+    let (points, n_total) = detect_features(gray);
+    SlamSnapshot {
+        width: gray.width as u16,
+        height: gray.height as u16,
+        frame_id,
+        n_total,
+        detect_ms: 0.0,
+        fps: 0.0,
+        points,
+    }
+}
+
 // ── Frontend thread ───────────────────────────────────────────────────────────
 
 /// Own a dedicated thread: pull frames (independently of the video
@@ -130,7 +168,7 @@ pub fn run(camera: Arc<Camera>, snapshot: Arc<RwLock<SlamSnapshot>>) {
         let frame = camera.wait_frame();
         let t0 = Instant::now();
         let gray = GrayImage::from_yuyv(&frame);
-        let (points, n_total) = detect_features(&gray);
+        let mut snap = build_snapshot(&gray, frame.id);
         let elapsed = t0.elapsed().as_secs_f32() * 1000.0;
 
         let now = Instant::now();
@@ -151,15 +189,10 @@ pub fn run(camera: Arc<Camera>, snapshot: Arc<RwLock<SlamSnapshot>>) {
             };
         }
 
+        snap.detect_ms = detect_ms;
+        snap.fps = fps;
         if let Ok(mut s) = snapshot.write() {
-            *s = SlamSnapshot {
-                width: gray.width as u16,
-                height: gray.height as u16,
-                n_total,
-                detect_ms,
-                fps,
-                points,
-            };
+            *s = snap;
         }
     }
 }
@@ -196,5 +229,36 @@ mod tests {
         let (pts, n_total) = detect_features(&g);
         assert_eq!(n_total, 0);
         assert!(pts.is_empty());
+    }
+
+    #[test]
+    fn frame_id_propagates_verbatim() {
+        let g = GrayImage::new(160, 120);
+        for fid in [0u64, 1, 255, 4242, u64::MAX] {
+            assert_eq!(build_snapshot(&g, fid).frame_id, fid);
+        }
+    }
+
+    #[test]
+    fn no_features_inside_marker_roi() {
+        // Full-frame checkerboard so corners would otherwise land in
+        // the bottom-right marker ROI too.
+        let (w, h) = (640usize, 480usize);
+        let mut g = GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                g.data[y * w + x] = if (x / 6 + y / 6) % 2 == 0 { 235 } else { 16 };
+            }
+        }
+        let (rx, ry, _, _) = marker::roi_rect(w, h);
+        let (ex, ey) = (rx - ROI_GUARD, ry - ROI_GUARD);
+        let snap = build_snapshot(&g, 7);
+        assert!(!snap.points.is_empty());
+        assert!(
+            snap.points
+                .iter()
+                .all(|p| (p.x as usize) < ex || (p.y as usize) < ey),
+            "a feature landed inside the masked marker ROI"
+        );
     }
 }

@@ -723,10 +723,12 @@ function runWebRTC() {
 
 startStream();
 
-// ── SLAM feature overlay ──────────────────────────────────────────────────────
-// Draws /api/slam/stream points over the video. The video uses
-// object-fit:contain, so we letterbox-map detector (level-0) coords into
-// the displayed image rect and keep the canvas aligned to the <video>.
+// ── SLAM feature overlay — frame-exact via the burned-in marker ───────────────
+// Each displayed video frame carries an 8-bit frame-id marker in its
+// bottom-right luma (see src/marker.rs). In requestVideoFrameCallback we
+// read that marker off the *displayed* frame, look up the SLAM features
+// computed from that exact camera frame in a ring buffer, and draw them.
+// This is robust to any WebRTC latency/jitter/drops — no clock sync.
 (() => {
   const wrap   = document.getElementById('cam-wrap');
   const camEl  = document.getElementById('cam');
@@ -734,18 +736,72 @@ startStream();
   const ctx    = canvas.getContext('2d');
   const modeSel = document.getElementById('feat-mode');
   const stat   = document.getElementById('feat-stat');
-  let snap = null;
 
+  // Marker codec — JS port of src/marker.rs; keep the two in lock-step.
+  const M = { W: 48, H: 16, COLS: 12, ROWS: 4, BORDER: 4, MARGIN: 4 };
+  const N_CELLS = M.COLS * M.ROWS, SYNC = 0xA5C, SYNC_BITS = 12,
+        ID_BITS = 8, CRC_BITS = 8, THRESH = (16 + 235) >> 1; // 125
+  function crc8(b) {
+    let c = b & 0xFF;
+    for (let i = 0; i < 8; i++) c = (c & 0x80) ? ((c << 1) ^ 0x07) & 0xFF : (c << 1) & 0xFF;
+    return c;
+  }
+  function decodeMarker(rgba, w, h) {
+    if (w < M.COLS || h < M.ROWS) return null;
+    const cells = new Array(N_CELLS);
+    for (let c = 0; c < N_CELLS; c++) {
+      const col = c % M.COLS, row = (c / M.COLS) | 0;
+      const px = Math.min(w - 1, ((col + 0.5) / M.COLS * w) | 0);
+      const py = Math.min(h - 1, ((row + 0.5) / M.ROWS * h) | 0);
+      const i = (py * w + px) * 4;
+      const luma = ((rgba[i] * 299 + rgba[i + 1] * 587 + rgba[i + 2] * 114) / 1000) | 0;
+      cells[c] = luma > THRESH;
+    }
+    let sync = 0;
+    for (let i = 0; i < SYNC_BITS; i++) sync = (sync << 1) | (cells[i] ? 1 : 0);
+    if (sync !== SYNC) return null;
+    let id = 0;
+    for (let k = 0; k < ID_BITS; k++) id = (id << 1) | (cells[SYNC_BITS + k] ? 1 : 0);
+    let crc = 0;
+    for (let k = 0; k < CRC_BITS; k++) crc = (crc << 1) | (cells[SYNC_BITS + ID_BITS + k] ? 1 : 0);
+    return crc8(id) === crc ? id : null;
+  }
+
+  // Feature ring buffer keyed by full frame_id (FIFO, cap 60 ≈ 2 s).
+  const RING_CAP = 60;
+  const ring = new Map();
+  let lastSnap = null;
   const es = new EventSource('/api/slam/stream');
-  es.onmessage = e => { try { snap = JSON.parse(e.data); } catch (_) {} };
+  es.onmessage = e => {
+    try {
+      const s = JSON.parse(e.data);
+      lastSnap = s;
+      ring.set(s.frame_id, s);
+      while (ring.size > RING_CAP) ring.delete(ring.keys().next().value);
+    } catch (_) {}
+  };
   es.onerror = () => {};
 
-  // Distinct-ish colour per pyramid level.
+  const off = document.createElement('canvas');
+  off.width = M.W; off.height = M.H;
+  const offCtx = off.getContext('2d', { willReadFrequently: true });
   const levelColor = l => `hsl(${(l * 40) % 360} 90% 60%)`;
 
-  function frame() {
-    const mode = modeSel.value;
-    // Align the canvas to the <video> box within the positioned wrap.
+  let lastMatched = null, held = null, missCycles = 0;
+
+  // Among buffered ids with this low byte, the one closest to the last
+  // match (handles the 256-id wrap; buffer span ≪ wrap interval).
+  function pickCandidate(id8) {
+    let best = null, bestD = Infinity;
+    for (const k of ring.keys()) {
+      if ((k & 0xFF) !== id8) continue;
+      const d = lastMatched == null ? -k : Math.abs(k - lastMatched);
+      if (d < bestD) { bestD = d; best = k; }
+    }
+    return best;
+  }
+
+  function syncCanvas() {
     const cr = camEl.getBoundingClientRect();
     const wr = wrap.getBoundingClientRect();
     const bw = cr.width, bh = cr.height;
@@ -755,34 +811,75 @@ startStream();
       canvas.height = Math.round(bh * dpr);
     }
     canvas.style.left = (cr.left - wr.left) + 'px';
-    canvas.style.top  = (cr.top  - wr.top) + 'px';
+    canvas.style.top = (cr.top - wr.top) + 'px';
     canvas.style.width = bw + 'px';
     canvas.style.height = bh + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, bw, bh);
+    return [bw, bh];
+  }
 
-    if (mode === 'off' || !snap || !snap.width || !snap.points) {
-      stat.textContent = mode === 'off' ? 'off' : '—';
-      requestAnimationFrame(frame);
-      return;
-    }
-
+  function drawSnap(s, mode, bw, bh) {
     // object-fit:contain letterbox of the detector image in the box.
-    const s = Math.min(bw / snap.width, bh / snap.height);
-    const ox = (bw - snap.width * s) / 2;
-    const oy = (bh - snap.height * s) / 2;
-    const pts = mode === '300' ? snap.points.slice(0, 300) : snap.points;
+    const sc = Math.min(bw / s.width, bh / s.height);
+    const ox = (bw - s.width * sc) / 2, oy = (bh - s.height * sc) / 2;
+    const pts = mode === '300' ? s.points.slice(0, 300) : s.points;
     for (const p of pts) {
       ctx.beginPath();
-      ctx.arc(ox + p.x * s, oy + p.y * s, 2.2, 0, 6.283);
+      ctx.arc(ox + p.x * sc, oy + p.y * sc, 2.2, 0, 6.283);
       ctx.fillStyle = levelColor(p.level);
       ctx.fill();
     }
     stat.textContent =
-      `${pts.length}/${snap.n_total} · ${snap.detect_ms.toFixed(0)}ms · ${snap.fps.toFixed(1)}f/s`;
-    requestAnimationFrame(frame);
+      `${pts.length}/${s.n_total} · ${s.detect_ms.toFixed(0)}ms · ${s.fps.toFixed(1)}f/s`;
   }
-  requestAnimationFrame(frame);
+
+  function onFrame() {
+    const mode = modeSel.value;
+    const [bw, bh] = syncCanvas();
+    if (mode === 'off') { stat.textContent = 'off'; camEl.requestVideoFrameCallback(onFrame); return; }
+
+    const vw = camEl.videoWidth, vh = camEl.videoHeight;
+    let matched = null;
+    if (vw && vh) {
+      const gx = vw - M.MARGIN - M.BORDER - M.W;
+      const gy = vh - M.MARGIN - M.BORDER - M.H;
+      try {
+        offCtx.drawImage(camEl, gx, gy, M.W, M.H, 0, 0, M.W, M.H);
+        const id8 = decodeMarker(offCtx.getImageData(0, 0, M.W, M.H).data, M.W, M.H);
+        if (id8 != null) {
+          const k = pickCandidate(id8);
+          if (k != null) { matched = ring.get(k); lastMatched = k; }
+        }
+      } catch (_) { /* frame not yet readable */ }
+    }
+
+    if (matched && matched.width) {
+      held = matched; missCycles = 0;
+      drawSnap(matched, mode, bw, bh);
+    } else if (held && missCycles < 2) {
+      // Marker miss: briefly hold the last overlay; never extrapolate.
+      missCycles++;
+      drawSnap(held, mode, bw, bh);
+    } else {
+      held = null;
+      stat.textContent = lastSnap ? 'sync…' : '—';
+    }
+    camEl.requestVideoFrameCallback(onFrame);
+  }
+
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    camEl.requestVideoFrameCallback(onFrame);
+  } else {
+    // No rvfc → can't frame-sync; fall back to latest-over-current.
+    (function raf() {
+      const mode = modeSel.value;
+      const [bw, bh] = syncCanvas();
+      if (mode !== 'off' && lastSnap && lastSnap.width) drawSnap(lastSnap, mode, bw, bh);
+      else stat.textContent = mode === 'off' ? 'off' : '—';
+      requestAnimationFrame(raf);
+    })();
+  }
 })();
 </script>
 </body>
