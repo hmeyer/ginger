@@ -118,7 +118,6 @@ mod tests {
         Frame {
             width: w,
             height: h,
-            id: 0,
             data,
         }
     }
