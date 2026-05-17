@@ -47,7 +47,7 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.05em}
   background:#1a1a28;color:#cde;border:1px solid #3a3a5a;
   border-radius:4px;font-size:.7rem;padding:2px 4px;cursor:pointer
 }
-#feat-stat{font-family:monospace;color:var(--dim);white-space:nowrap}
+#feat-stat{font-family:monospace;color:var(--dim);white-space:pre;line-height:1.35}
 
 /* Sensor strip — mobile only */
 #sensor-strip{
@@ -815,8 +815,16 @@ startStream();
     }
 
     const mtxt = showMatch ? ` · ${ms.length} match` : '';
+    const kept = snap.n_kept != null ? snap.n_kept : pts.length;
+    const st = snap.stages;
+    const brk = st
+      ? `\ngr${st.gray.toFixed(0)} py${st.pyramid.toFixed(0)} fa${st.fast.toFixed(0)} ` +
+        `bl${st.blur.toFixed(0)} or${st.orient.toFixed(0)} ds${st.describe.toFixed(0)} ` +
+        `mt${st.matching.toFixed(0)}`
+      : '';
     stat.textContent =
-      `${pts.length}/${snap.n_total}${mtxt} · ${snap.detect_ms.toFixed(0)}ms · ${snap.fps.toFixed(1)}f/s`;
+      `${kept}/${snap.n_total}${mtxt} · ${snap.detect_ms.toFixed(0)}ms · ` +
+      `${snap.fps.toFixed(1)}f/s${brk}`;
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
