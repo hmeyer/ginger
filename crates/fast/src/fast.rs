@@ -248,9 +248,10 @@ fn detect_row_neon(img: &GrayImage, y: usize, t: i32) -> Vec<Corner> {
                     out.push(Corner {
                         x: (x0 + lane) as u16,
                         y: y as u16,
-                        // ≤ 16*255 = 4080, so .min() matches the scalar
-                        // `s.min(u16::MAX)` (a no-op here).
-                        score: scores[lane].min(u16::MAX),
+                        // SAD ≤ 16*255 = 4080: the u16 lane store already
+                        // holds it exactly. (The scalar path clamps an i32
+                        // with `min(u16::MAX)`; here the type guarantees it.)
+                        score: scores[lane],
                     });
                 }
             }
