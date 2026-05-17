@@ -101,16 +101,17 @@ async fn slam_stream(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
         let mut interval = tokio::time::interval(Duration::from_millis(66));
-        let mut last_sent = u32::MAX;
+        let mut last_sent = u64::MAX;
         loop {
             interval.tick().await;
             let snap = st.slam.read().unwrap().clone();
-            // Skip resends when the frontend hasn't produced a new frame.
-            let stamp = snap.n_total ^ ((snap.detect_ms * 100.0) as u32);
-            if stamp == last_sent {
+            // Gate strictly on the camera frame id: emit once per new
+            // processed frame so the client can match each payload to
+            // the exact video frame (via the burned-in marker).
+            if snap.frame_id == last_sent {
                 continue;
             }
-            last_sent = stamp;
+            last_sent = snap.frame_id;
             let json = serde_json::to_string(&snap).unwrap();
             yield Ok::<Event, Infallible>(Event::default().data(json));
         }
