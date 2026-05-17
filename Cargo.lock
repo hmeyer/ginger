@@ -958,6 +958,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginger-fast"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "ginger-rs"
 version = "0.1.0"
 dependencies = [
@@ -966,6 +973,7 @@ dependencies = [
  "bytes",
  "env_logger",
  "futures",
+ "ginger-fast",
  "libc",
  "libcamera",
  "log",

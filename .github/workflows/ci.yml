@@ -67,6 +67,24 @@ jobs:
 
       - run: make lint
 
+  aarch64-fast:
+    name: aarch64 FAST check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Compile-only check of the NEON path. `ginger-fast` depends only
+      # on `rayon`, so this needs no libcamera/v4l cross-build and no
+      # linker (cargo check does not link). Correctness is verified by
+      # the `neon_parity` differential test run natively on the Pi.
+      - run: cargo check -p ginger-fast --target aarch64-unknown-linux-gnu
+
   audit:
     name: Audit
     runs-on: ubuntu-latest
