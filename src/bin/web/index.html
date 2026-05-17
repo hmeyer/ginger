@@ -34,6 +34,21 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.05em}
 #cam-wrap{flex:1;min-height:0;background:#000;overflow:hidden;position:relative}
 #cam{width:100%;height:100%;object-fit:contain;display:block;background:#000}
 
+/* SLAM feature overlay (sits exactly over the video's contained image) */
+#feat-overlay{position:absolute;pointer-events:none;z-index:5;left:0;top:0}
+#slam-hud{
+  position:absolute;left:8px;top:8px;z-index:6;
+  display:flex;align-items:center;gap:8px;
+  font-size:.7rem;color:#9cf;
+  background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.15);
+  border-radius:6px;padding:3px 7px
+}
+#slam-hud select{
+  background:#1a1a28;color:#cde;border:1px solid #3a3a5a;
+  border-radius:4px;font-size:.7rem;padding:2px 4px;cursor:pointer
+}
+#feat-stat{font-family:monospace;color:var(--dim);white-space:nowrap}
+
 /* Sensor strip — mobile only */
 #sensor-strip{
   background:var(--bg2);border-top:1px solid var(--border);
@@ -145,6 +160,15 @@ footer{
 <!-- Camera takes available height; on desktop becomes a grid container -->
 <div id="cam-wrap">
   <video id="cam" autoplay muted playsinline></video>
+  <canvas id="feat-overlay"></canvas>
+  <div id="slam-hud">
+    <select id="feat-mode" title="Feature overlay">
+      <option value="off">feat: off</option>
+      <option value="300" selected>feat: 300</option>
+      <option value="all">feat: all</option>
+    </select>
+    <span id="feat-stat">—</span>
+  </div>
 
   <!-- Sidebar (inside cam-wrap so it sits beside camera on desktop) -->
   <aside>
@@ -698,6 +722,68 @@ function runWebRTC() {
 }
 
 startStream();
+
+// ── SLAM feature overlay ──────────────────────────────────────────────────────
+// Draws /api/slam/stream points over the video. The video uses
+// object-fit:contain, so we letterbox-map detector (level-0) coords into
+// the displayed image rect and keep the canvas aligned to the <video>.
+(() => {
+  const wrap   = document.getElementById('cam-wrap');
+  const camEl  = document.getElementById('cam');
+  const canvas = document.getElementById('feat-overlay');
+  const ctx    = canvas.getContext('2d');
+  const modeSel = document.getElementById('feat-mode');
+  const stat   = document.getElementById('feat-stat');
+  let snap = null;
+
+  const es = new EventSource('/api/slam/stream');
+  es.onmessage = e => { try { snap = JSON.parse(e.data); } catch (_) {} };
+  es.onerror = () => {};
+
+  // Distinct-ish colour per pyramid level.
+  const levelColor = l => `hsl(${(l * 40) % 360} 90% 60%)`;
+
+  function frame() {
+    const mode = modeSel.value;
+    // Align the canvas to the <video> box within the positioned wrap.
+    const cr = camEl.getBoundingClientRect();
+    const wr = wrap.getBoundingClientRect();
+    const bw = cr.width, bh = cr.height;
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(bw * dpr) || canvas.height !== Math.round(bh * dpr)) {
+      canvas.width = Math.round(bw * dpr);
+      canvas.height = Math.round(bh * dpr);
+    }
+    canvas.style.left = (cr.left - wr.left) + 'px';
+    canvas.style.top  = (cr.top  - wr.top) + 'px';
+    canvas.style.width = bw + 'px';
+    canvas.style.height = bh + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, bw, bh);
+
+    if (mode === 'off' || !snap || !snap.width || !snap.points) {
+      stat.textContent = mode === 'off' ? 'off' : '—';
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    // object-fit:contain letterbox of the detector image in the box.
+    const s = Math.min(bw / snap.width, bh / snap.height);
+    const ox = (bw - snap.width * s) / 2;
+    const oy = (bh - snap.height * s) / 2;
+    const pts = mode === '300' ? snap.points.slice(0, 300) : snap.points;
+    for (const p of pts) {
+      ctx.beginPath();
+      ctx.arc(ox + p.x * s, oy + p.y * s, 2.2, 0, 6.283);
+      ctx.fillStyle = levelColor(p.level);
+      ctx.fill();
+    }
+    stat.textContent =
+      `${pts.length}/${snap.n_total} · ${snap.detect_ms.toFixed(0)}ms · ${snap.fps.toFixed(1)}f/s`;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
 </script>
 </body>
 </html>

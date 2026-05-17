@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use crate::{
     api::{AngleBody, Command, DriveBody, SensorConfig, SensorSnapshot},
     camera::Camera,
+    slam::SlamSnapshot,
     video::webrtc,
 };
 
@@ -39,6 +40,7 @@ pub struct AppState {
     pub cmd_tx: mpsc::Sender<Command>,
     pub sensors: Arc<RwLock<SensorSnapshot>>,
     pub camera: Arc<Camera>,
+    pub slam: Arc<RwLock<SlamSnapshot>>,
 }
 
 /// Build the router and serve forever on `0.0.0.0:8080`.
@@ -46,6 +48,7 @@ pub async fn serve(state: AppState) {
     let app = Router::new()
         .route("/", get(serve_html))
         .route("/api/sensors/stream", get(sensor_stream))
+        .route("/api/slam/stream", get(slam_stream))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -83,6 +86,31 @@ async fn sensor_stream(
                 snap.brightness = exp.current_brightness;
                 snap.luma = exp.current_luma;
             }
+            let json = serde_json::to_string(&snap).unwrap();
+            yield Ok::<Event, Infallible>(Event::default().data(json));
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// SLAM frontend stream: latest detected features for the live overlay.
+/// ~15 Hz, decoupled from the 5 Hz telemetry stream so neither stalls
+/// the other. Only emits when a new frame has been processed.
+async fn slam_stream(
+    State(st): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = async_stream::stream! {
+        let mut interval = tokio::time::interval(Duration::from_millis(66));
+        let mut last_sent = u32::MAX;
+        loop {
+            interval.tick().await;
+            let snap = st.slam.read().unwrap().clone();
+            // Skip resends when the frontend hasn't produced a new frame.
+            let stamp = snap.n_total ^ ((snap.detect_ms * 100.0) as u32);
+            if stamp == last_sent {
+                continue;
+            }
+            last_sent = stamp;
             let json = serde_json::to_string(&snap).unwrap();
             yield Ok::<Event, Infallible>(Event::default().data(json));
         }

@@ -4,6 +4,7 @@ pub mod devices;
 pub mod hal;
 pub mod robot;
 pub mod server;
+pub mod slam;
 pub mod video;
 
 mod error;
