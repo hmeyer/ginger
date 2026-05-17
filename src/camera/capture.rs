@@ -34,11 +34,7 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Monotonic capture counter (also burned into the luma marker so
-    /// the browser can match displayed video frames to SLAM features).
-    pub id: u64,
     /// Raw YUYV bytes: 2 bytes per pixel, [Y0 U Y1 V] per 4-byte group.
-    /// The bottom-right [`crate::marker`] ROI carries the frame-id code.
     pub data: Vec<u8>,
 }
 
@@ -252,7 +248,6 @@ fn run_camera(
     let _ = setup_tx.send(Ok(()));
 
     let mut warmup = 0usize;
-    let mut frame_id: u64 = 0;
     let mut last_frame_instant = Instant::now();
 
     loop {
@@ -265,12 +260,7 @@ fn run_camera(
             .unwrap_or(width as usize * height as usize * 2);
 
         let (next_exp, next_gain) = if warmup >= WARMUP_FRAMES {
-            let mut data = fb.data()[0][..bytes_used].to_vec();
-            // Burn this frame's id into the luma marker before anyone
-            // (encoder or SLAM) sees the buffer — single shared copy.
-            let id = frame_id;
-            frame_id = frame_id.wrapping_add(1);
-            crate::marker::encode_marker_yuyv(&mut data, width as usize, height as usize, id);
+            let data = fb.data()[0][..bytes_used].to_vec();
 
             // Read the exposure/gain the sensor actually applied to this frame.
             let actual_exp = req
@@ -298,7 +288,6 @@ fn run_camera(
             let frame = Arc::new(Frame {
                 width,
                 height,
-                id,
                 data,
             });
 
