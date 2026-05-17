@@ -74,6 +74,39 @@ impl GrayImage {
         }
         out
     }
+
+    /// Separable box blur (window `2*radius+1`), edges use a shrinking
+    /// window. Cheap low-pass so BRIEF samples single pixels instead of
+    /// averaging a neighbourhood per test.
+    pub fn box_blur(&self, radius: usize) -> GrayImage {
+        if radius == 0 {
+            return self.clone();
+        }
+        let (w, h) = (self.width, self.height);
+        let mut tmp = vec![0u8; w * h];
+        for y in 0..h {
+            let row = &self.data[y * w..y * w + w];
+            for x in 0..w {
+                let x0 = x.saturating_sub(radius);
+                let x1 = (x + radius).min(w - 1);
+                let acc: u32 = row[x0..=x1].iter().map(|&p| p as u32).sum();
+                tmp[y * w + x] = (acc / (x1 - x0 + 1) as u32) as u8;
+            }
+        }
+        let mut out = GrayImage::new(w, h);
+        for x in 0..w {
+            for y in 0..h {
+                let y0 = y.saturating_sub(radius);
+                let y1 = (y + radius).min(h - 1);
+                let mut acc = 0u32;
+                for yy in y0..=y1 {
+                    acc += tmp[yy * w + x] as u32;
+                }
+                out.data[y * w + x] = (acc / (y1 - y0 + 1) as u32) as u8;
+            }
+        }
+        out
+    }
 }
 
 /// One pyramid level: the image plus the factor mapping a coordinate at
@@ -151,5 +184,21 @@ mod tests {
         let r = g.resized(7, 9);
         assert_eq!((r.width, r.height), (7, 9));
         assert!(r.data.iter().all(|&p| p == 123));
+    }
+
+    #[test]
+    fn box_blur_preserves_size_and_constant_and_smooths() {
+        let mut g = GrayImage::new(16, 12);
+        g.data.iter_mut().for_each(|p| *p = 90);
+        let b = g.box_blur(2);
+        assert_eq!((b.width, b.height), (16, 12));
+        assert!(b.data.iter().all(|&p| p == 90));
+
+        // A lone bright pixel must spread (centre drops, a neighbour rises).
+        let mut g = GrayImage::new(16, 16);
+        g.data[8 * 16 + 8] = 255;
+        let b = g.box_blur(1);
+        assert!(b.at(8, 8) < 255);
+        assert!(b.at(8, 9) > 0);
     }
 }

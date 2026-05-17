@@ -164,8 +164,11 @@ footer{
   <div id="slam-hud">
     <select id="feat-mode" title="Feature overlay">
       <option value="off">feat: off</option>
-      <option value="300" selected>feat: 300</option>
-      <option value="all">feat: all</option>
+      <option value="300" selected>FAST: 300</option>
+      <option value="all">FAST: all</option>
+      <option value="orient">BRIEF: orient</option>
+      <option value="match">BRIEF: match</option>
+      <option value="both">BRIEF: both</option>
     </select>
     <span id="feat-stat">—</span>
   </div>
@@ -771,15 +774,49 @@ startStream();
     const s = Math.min(bw / snap.width, bh / snap.height);
     const ox = (bw - snap.width * s) / 2;
     const oy = (bh - snap.height * s) / 2;
+    const X = p => ox + p.x * s, Y = p => oy + p.y * s;
+
+    const showOrient = mode === 'orient' || mode === 'both';
+    const showMatch  = mode === 'match'  || mode === 'both';
     const pts = mode === '300' ? snap.points.slice(0, 300) : snap.points;
+
+    // Keypoint dots, coloured by pyramid level.
     for (const p of pts) {
       ctx.beginPath();
-      ctx.arc(ox + p.x * s, oy + p.y * s, 2.2, 0, 6.283);
+      ctx.arc(X(p), Y(p), 2.2, 0, 6.283);
       ctx.fillStyle = levelColor(p.level);
       ctx.fill();
     }
+
+    // Orientation ticks: the BRIEF steering angle per keypoint.
+    if (showOrient) {
+      ctx.strokeStyle = 'rgba(255,255,255,.8)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (const p of pts) {
+        const a = p.angle || 0, L = 9;
+        ctx.moveTo(X(p), Y(p));
+        ctx.lineTo(X(p) + Math.cos(a) * L, Y(p) + Math.sin(a) * L);
+      }
+      ctx.stroke();
+    }
+
+    // Descriptor matches to the previous frame.
+    const ms = snap.matches || [];
+    if (showMatch) {
+      ctx.strokeStyle = 'rgba(60,255,120,.7)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (const m of ms) {
+        ctx.moveTo(ox + m.x0 * s, oy + m.y0 * s);
+        ctx.lineTo(ox + m.x1 * s, oy + m.y1 * s);
+      }
+      ctx.stroke();
+    }
+
+    const mtxt = showMatch ? ` · ${ms.length} match` : '';
     stat.textContent =
-      `${pts.length}/${snap.n_total} · ${snap.detect_ms.toFixed(0)}ms · ${snap.fps.toFixed(1)}f/s`;
+      `${pts.length}/${snap.n_total}${mtxt} · ${snap.detect_ms.toFixed(0)}ms · ${snap.fps.toFixed(1)}f/s`;
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
