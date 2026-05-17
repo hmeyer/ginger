@@ -20,7 +20,7 @@ use log::info;
 use serde::Serialize;
 
 use crate::camera::Camera;
-use image::{GrayImage, build_pyramid};
+use image::{GrayImage, build_pyramid, gray_from_yuyv};
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
 
@@ -169,7 +169,7 @@ pub fn run(camera: Arc<Camera>, snapshot: Arc<RwLock<SlamSnapshot>>) {
     loop {
         let frame = camera.wait_frame();
         let t0 = Instant::now();
-        let gray = GrayImage::from_yuyv(&frame);
+        let gray = gray_from_yuyv(&frame);
         let (points, descs, n_total) = detect_features(&gray);
 
         // Brute-force match against the previous frame's descriptors.

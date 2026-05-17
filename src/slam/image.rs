@@ -1,141 +1,26 @@
 //! Grayscale image + scale pyramid for the SLAM frontend.
 //!
+//! The compute lives in the dependency-light `ginger-fast` crate (so it
+//! cross-compiles for aarch64 without the camera stack); this module
+//! re-exports it and adds the camera-coupled YUYV→luma adapter.
+//!
 //! The camera publishes YUYV (`[Y0 U Y1 V]` per 4 bytes), so the luma
 //! plane the detectors want is simply every even byte — extracting it is
 //! a cheap strided copy, no colour conversion.
 
+pub use ginger_fast::image::{GrayImage, PyramidLevel, build_pyramid};
+
 use crate::camera::Frame;
 
-/// A single-channel 8-bit image, row-major, no padding.
-#[derive(Clone)]
-pub struct GrayImage {
-    pub width: usize,
-    pub height: usize,
-    pub data: Vec<u8>,
-}
-
-impl GrayImage {
-    pub fn new(width: usize, height: usize) -> Self {
-        Self {
-            width,
-            height,
-            data: vec![0; width * height],
-        }
+/// Extract the luma plane from a YUYV [`Frame`] (every even byte).
+pub fn gray_from_yuyv(frame: &Frame) -> GrayImage {
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let mut img = GrayImage::new(w, h);
+    // YUYV is 2 bytes/pixel; byte 2*i is the Y for pixel i.
+    for (dst, src) in img.data.iter_mut().zip(frame.data.chunks_exact(2)) {
+        *dst = src[0];
     }
-
-    #[inline]
-    pub fn at(&self, x: usize, y: usize) -> u8 {
-        self.data[y * self.width + x]
-    }
-
-    /// Extract the luma plane from a YUYV [`Frame`] (every even byte).
-    pub fn from_yuyv(frame: &Frame) -> Self {
-        let (w, h) = (frame.width as usize, frame.height as usize);
-        let mut data = vec![0u8; w * h];
-        // YUYV is 2 bytes/pixel; byte 2*i is the Y for pixel i.
-        for (dst, src) in data.iter_mut().zip(frame.data.chunks_exact(2)) {
-            *dst = src[0];
-        }
-        Self {
-            width: w,
-            height: h,
-            data,
-        }
-    }
-
-    /// Bilinear downscale to `(w, h)`. Used to build the pyramid; the
-    /// source is larger so this is a reduction (mild low-pass + sample).
-    pub fn resized(&self, w: usize, h: usize) -> Self {
-        let mut out = GrayImage::new(w, h);
-        if w == 0 || h == 0 {
-            return out;
-        }
-        // Map output centre back to input space.
-        let sx = self.width as f32 / w as f32;
-        let sy = self.height as f32 / h as f32;
-        for oy in 0..h {
-            let fy = ((oy as f32 + 0.5) * sy - 0.5).max(0.0);
-            let y0 = fy.floor() as usize;
-            let y1 = (y0 + 1).min(self.height - 1);
-            let wy = fy - y0 as f32;
-            for ox in 0..w {
-                let fx = ((ox as f32 + 0.5) * sx - 0.5).max(0.0);
-                let x0 = fx.floor() as usize;
-                let x1 = (x0 + 1).min(self.width - 1);
-                let wx = fx - x0 as f32;
-                let p00 = self.at(x0, y0) as f32;
-                let p10 = self.at(x1, y0) as f32;
-                let p01 = self.at(x0, y1) as f32;
-                let p11 = self.at(x1, y1) as f32;
-                let top = p00 + (p10 - p00) * wx;
-                let bot = p01 + (p11 - p01) * wx;
-                out.data[oy * w + ox] = (top + (bot - top) * wy).round() as u8;
-            }
-        }
-        out
-    }
-
-    /// Separable box blur (window `2*radius+1`), edges use a shrinking
-    /// window. Cheap low-pass so BRIEF samples single pixels instead of
-    /// averaging a neighbourhood per test.
-    pub fn box_blur(&self, radius: usize) -> GrayImage {
-        if radius == 0 {
-            return self.clone();
-        }
-        let (w, h) = (self.width, self.height);
-        let mut tmp = vec![0u8; w * h];
-        for y in 0..h {
-            let row = &self.data[y * w..y * w + w];
-            for x in 0..w {
-                let x0 = x.saturating_sub(radius);
-                let x1 = (x + radius).min(w - 1);
-                let acc: u32 = row[x0..=x1].iter().map(|&p| p as u32).sum();
-                tmp[y * w + x] = (acc / (x1 - x0 + 1) as u32) as u8;
-            }
-        }
-        let mut out = GrayImage::new(w, h);
-        for x in 0..w {
-            for y in 0..h {
-                let y0 = y.saturating_sub(radius);
-                let y1 = (y + radius).min(h - 1);
-                let mut acc = 0u32;
-                for yy in y0..=y1 {
-                    acc += tmp[yy * w + x] as u32;
-                }
-                out.data[y * w + x] = (acc / (y1 - y0 + 1) as u32) as u8;
-            }
-        }
-        out
-    }
-}
-
-/// One pyramid level: the image plus the factor mapping a coordinate at
-/// this level back to level 0 (`scale_factor ** level`).
-pub struct PyramidLevel {
-    pub image: GrayImage,
-    pub scale: f32,
-}
-
-/// ORB-SLAM-style scale pyramid: `n_levels` images, each `scale_factor`×
-/// smaller than the previous (level 0 is the original).
-pub fn build_pyramid(base: GrayImage, n_levels: usize, scale_factor: f32) -> Vec<PyramidLevel> {
-    let mut levels = Vec::with_capacity(n_levels);
-    let mut scale = 1.0f32;
-    for lvl in 0..n_levels {
-        let image = if lvl == 0 {
-            base.clone()
-        } else {
-            let w = (base.width as f32 / scale).round() as usize;
-            let h = (base.height as f32 / scale).round() as usize;
-            if w < 8 || h < 8 {
-                break;
-            }
-            base.resized(w, h)
-        };
-        levels.push(PyramidLevel { image, scale });
-        scale *= scale_factor;
-    }
-    levels
+    img
 }
 
 #[cfg(test)]
@@ -158,47 +43,8 @@ mod tests {
     #[test]
     fn yuyv_luma_extraction() {
         let f = yuyv_frame(4, 2, 200);
-        let g = GrayImage::from_yuyv(&f);
+        let g = gray_from_yuyv(&f);
         assert_eq!((g.width, g.height), (4, 2));
         assert!(g.data.iter().all(|&p| p == 200));
-    }
-
-    #[test]
-    fn pyramid_shrinks_and_stops() {
-        let base = GrayImage::new(640, 480);
-        let levels = build_pyramid(base, 8, 1.2);
-        assert_eq!(levels.len(), 8);
-        assert_eq!((levels[0].image.width, levels[0].image.height), (640, 480));
-        assert!((levels[0].scale - 1.0).abs() < 1e-6);
-        // Each level is strictly smaller and scale grows by ~1.2.
-        for w in levels.windows(2) {
-            assert!(w[1].image.width < w[0].image.width);
-            assert!((w[1].scale / w[0].scale - 1.2).abs() < 1e-3);
-        }
-    }
-
-    #[test]
-    fn resize_preserves_constant_image() {
-        let mut g = GrayImage::new(20, 20);
-        g.data.iter_mut().for_each(|p| *p = 123);
-        let r = g.resized(7, 9);
-        assert_eq!((r.width, r.height), (7, 9));
-        assert!(r.data.iter().all(|&p| p == 123));
-    }
-
-    #[test]
-    fn box_blur_preserves_size_and_constant_and_smooths() {
-        let mut g = GrayImage::new(16, 12);
-        g.data.iter_mut().for_each(|p| *p = 90);
-        let b = g.box_blur(2);
-        assert_eq!((b.width, b.height), (16, 12));
-        assert!(b.data.iter().all(|&p| p == 90));
-
-        // A lone bright pixel must spread (centre drops, a neighbour rises).
-        let mut g = GrayImage::new(16, 16);
-        g.data[8 * 16 + 8] = 255;
-        let b = g.box_blur(1);
-        assert!(b.at(8, 8) < 255);
-        assert!(b.at(8, 9) > 0);
     }
 }

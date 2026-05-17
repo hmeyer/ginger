@@ -1,0 +1,5 @@
+# The deployment target is a Raspberry Pi 4 (Cortex-A72, ARMv8-A).
+# Tuning for it lets the scalar tail / SAD widening schedule well; NEON
+# itself is already baseline on aarch64 so it needs no extra feature flag.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=cortex-a72"]
