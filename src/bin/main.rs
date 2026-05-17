@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock, atomic::AtomicBool};
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use log::info;
@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use ginger_rs::{
     api::{Command, SensorSnapshot},
     camera::Camera,
-    robot::{map::Map, supervisor},
+    robot::supervisor,
     server::{self, AppState},
 };
 
@@ -20,12 +20,10 @@ async fn main() {
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
     let sensors = Arc::new(RwLock::new(SensorSnapshot::initial()));
-    let map = Arc::new(RwLock::new(Map::new()));
-    let explore_stop = Arc::new(AtomicBool::new(false));
 
     {
-        let (sensors, map, explore_stop) = (sensors.clone(), map.clone(), explore_stop.clone());
-        thread::spawn(move || supervisor::run(cmd_rx, sensors, map, explore_stop));
+        let sensors = sensors.clone();
+        thread::spawn(move || supervisor::run(cmd_rx, sensors));
     }
 
     println!("Initialising camera…");
@@ -36,8 +34,6 @@ async fn main() {
         cmd_tx,
         sensors,
         camera,
-        map,
-        explore_stop,
     })
     .await;
 }

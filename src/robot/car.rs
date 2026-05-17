@@ -58,7 +58,10 @@ impl Car {
     }
 
     pub fn pan_tilt(&mut self) -> PanTilt<'_> {
-        PanTilt::new(&mut self.pwm, 0.0, 0.0)
+        // Same trim as the startup center, so a runtime set_pan(90°)
+        // also points straight ahead (otherwise the bracket parks ~6.5°
+        // off-center — visible now that the joystick springs back to 90).
+        PanTilt::new(&mut self.pwm, PAN_TRIM_US, 0.0)
     }
 
     pub fn us(&mut self) -> &mut Ultrasonic {
