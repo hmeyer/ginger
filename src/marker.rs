@@ -124,15 +124,13 @@ fn cells_to_id(cells: &[bool; N_CELLS]) -> Option<u64> {
 
 // ── Public codec ──────────────────────────────────────────────────────────────
 
-/// Burn the `frame_id` marker into the bottom-right of a **packed**
-/// luma plane (`y_plane[y*stride + x]`). Paints the quiet zone + border
-/// black and the data cells black/white.
-pub fn encode_marker(
-    y_plane: &mut [u8],
-    stride: usize,
+/// Paint the marker by calling `put(x, y, luma)` for every pixel in the
+/// bottom-right ROI (quiet zone + border black, data cells black/white).
+fn paint_marker(
     frame_w: usize,
     frame_h: usize,
     frame_id: u64,
+    mut put: impl FnMut(usize, usize, u8),
 ) {
     if frame_w < ROI_W || frame_h < ROI_H {
         return;
@@ -140,7 +138,7 @@ pub fn encode_marker(
     let (rx, ry, _, _) = roi_rect(frame_w, frame_h);
     for y in ry..ry + ROI_H {
         for x in rx..rx + ROI_W {
-            y_plane[y * stride + x] = BLACK;
+            put(x, y, BLACK);
         }
     }
     let (gx, gy, _, _) = data_grid_rect(frame_w, frame_h);
@@ -151,12 +149,39 @@ pub fn encode_marker(
         }
         let (col, row) = (c % COLS, c / COLS);
         for dy in 0..CELL {
-            let base = (gy + row * CELL + dy) * stride + gx + col * CELL;
             for dx in 0..CELL {
-                y_plane[base + dx] = WHITE;
+                put(gx + col * CELL + dx, gy + row * CELL + dy, WHITE);
             }
         }
     }
+}
+
+/// Burn the `frame_id` marker into a **packed** luma plane
+/// (`y_plane[y*stride + x]`).
+pub fn encode_marker(
+    y_plane: &mut [u8],
+    stride: usize,
+    frame_w: usize,
+    frame_h: usize,
+    frame_id: u64,
+) {
+    paint_marker(frame_w, frame_h, frame_id, |x, y, v| {
+        y_plane[y * stride + x] = v;
+    });
+}
+
+/// Burn the `frame_id` marker into a **YUYV** buffer in place (luma is
+/// every even byte; row stride = `frame_w * 2`). This is what rides
+/// through the H.264/WebRTC path — the same buffer the SLAM thread sees,
+/// so no extra copy and a guaranteed-shared id.
+pub fn encode_marker_yuyv(yuyv: &mut [u8], frame_w: usize, frame_h: usize, frame_id: u64) {
+    let len = yuyv.len();
+    paint_marker(frame_w, frame_h, frame_id, |x, y, v| {
+        let idx = (y * frame_w + x) * 2;
+        if idx < len {
+            yuyv[idx] = v;
+        }
+    });
 }
 
 /// Decode the 8-bit frame id from an RGBA buffer that spans **exactly
