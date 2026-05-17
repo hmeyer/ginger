@@ -51,8 +51,7 @@ pub async fn serve(state: AppState) {
         .route("/api/stop", post(stop_car))
         .route("/api/pan", post(pan))
         .route("/api/tilt", post(tilt))
-        .route("/api/led", post(led))
-        .route("/api/buzzer", post(buzzer))
+        .route("/api/express", post(express))
         .route("/api/sensors/config", post(sensor_config))
         .with_state(state);
 
@@ -136,13 +135,8 @@ async fn tilt(State(st): State<AppState>, Json(b): Json<AngleBody>) -> StatusCod
     StatusCode::OK
 }
 
-async fn led(State(st): State<AppState>) -> StatusCode {
-    st.cmd_tx.send(Command::LedShow).await.ok();
-    StatusCode::OK
-}
-
-async fn buzzer(State(st): State<AppState>) -> StatusCode {
-    st.cmd_tx.send(Command::BuzzerTune).await.ok();
+async fn express(State(st): State<AppState>) -> StatusCode {
+    st.cmd_tx.send(Command::Express).await.ok();
     StatusCode::OK
 }
 

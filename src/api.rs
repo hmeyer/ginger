@@ -86,10 +86,8 @@ pub enum Command {
     Stop,
     SetPan(f32),
     SetTilt(f32),
-    /// Play a short randomized per-pixel LED animation.
-    LedShow,
-    /// Play a short randomized R2D2-ish warble on the buzzer.
-    BuzzerTune,
+    /// Play a short randomized synchronized LED + buzzer "expression".
+    Express,
     SetSensors(SensorConfig),
 }
 

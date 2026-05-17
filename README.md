@@ -113,8 +113,7 @@ Features:
 - **Spring-back camera bracket** — releasing the camera joystick re-centers pan/tilt so the ultrasonic sensor faces forward (replaces the old brittle distance-estimated auto-center)
 - **Pan trim** — physical straight-ahead baked in as a servo pulse offset; `set_pan(90°)` always points the sensor forward
 - **Pan / tilt joystick** — 0–180° range, spring-back to forward
-- **Dazzle** — one-tap per-pixel LED show: random motion (comet / loopy snake / sparkle / brightness wave / theatre chase) × random palette (rainbow / single-hue / analogous / complementary / warm / cool) with randomized speed, brightness, length and mid-show pauses; ends off
-- **Bleep** — one-tap R2D2-ish buzzer warble with a random *mood* (excited / curious / grumpy / alarmed / chatty) that biases pitch band, tempo and rise/fall contour; bit-banged square wave
+- **Express** — one-tap synchronized LED + buzzer "expression": a random *mood* (excited / curious / grumpy / alarmed / chatty) fixes the pitch band, tempo, rise/fall contour and a matching colour palette; a random *viz* (scanner / VU meter / flood) makes the lights track pitch in lock-step with the bit-banged buzzer warble
 - **Sensor toggles** — enable/disable light, IR, and ultrasonic per sensor
 
 The UI is mobile-first: on phones it stacks camera → scrollable sensor strip → footer controls. On screens ≥ 700 px it switches to a camera + sidebar layout.

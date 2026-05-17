@@ -259,8 +259,7 @@ footer{
 
   <div class="right-controls">
     <div class="btn-row">
-      <button class="btn" id="b-dazzle">✨ Dazzle</button>
-      <button class="btn warn" id="b-bleep">🤖 Bleep</button>
+      <button class="btn" id="b-express">🤖✨ Express</button>
     </div>
   </div>
 </footer>
@@ -502,21 +501,20 @@ function camSync(p, t) {
   camShow(rp, rt);
 }
 
-// ── Dazzle / Bleep ────────────────────────────────────────────────────────────
-// Per-pixel LED animations and the variable-pitch buzzer warble need tight
-// timing, so they run server-side (see supervisor.rs). Each button just
-// triggers a random one-shot and self-disables while it plays.
-function oneShot(id, url, busyMs) {
-  const btn = document.getElementById(id);
+// ── Express ───────────────────────────────────────────────────────────────────
+// One unified, randomized "expression": LEDs and buzzer play together
+// (lights track pitch and vice-versa). It needs tight timing so it runs
+// server-side (see supervisor.rs); the button just triggers it and
+// self-disables while it plays.
+(() => {
+  const btn = document.getElementById('b-express');
   btn.addEventListener('click', () => {
     if (btn.disabled) return;
     btn.disabled = true;
-    post(url);
-    setTimeout(() => { btn.disabled = false; }, busyMs);
+    post('/api/express');
+    setTimeout(() => { btn.disabled = false; }, 3600);
   });
-}
-oneShot('b-dazzle', '/api/led',    3200);   // random LED animation
-oneShot('b-bleep',  '/api/buzzer', 1700);   // random R2D2-ish warble
+})();
 
 // ── Sensor config ─────────────────────────────────────────────────────────────
 function sendConfig() {
