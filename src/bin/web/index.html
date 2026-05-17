@@ -89,7 +89,7 @@ footer{
 
 /* Right-side controls */
 .right-controls{display:flex;flex-direction:column;gap:8px;flex:1;min-width:0;justify-content:center}
-.btn-row{display:flex;gap:8px}
+.btn-row{display:flex;gap:8px;justify-content:center}
 .btn{
   background:#252535;border:1px solid #3a3a5a;border-radius:6px;
   color:#ccc;padding:6px 10px;cursor:pointer;font-size:.78rem;
@@ -98,6 +98,8 @@ footer{
 .btn:active,.btn:hover{background:#30305a}
 .btn.warn{border-color:var(--warn)}
 .btn.warn:active{background:var(--warn);color:#000}
+/* Express: a compact, content-sized button (don't stretch) */
+#b-express{flex:0 0 auto;font-size:1.5rem;line-height:1;padding:10px 18px}
 
 /* ── DESKTOP (≥ 700 px) ───────────────────────────────────────────────────── */
 @media (min-width: 700px) {
@@ -259,7 +261,7 @@ footer{
 
   <div class="right-controls">
     <div class="btn-row">
-      <button class="btn" id="b-express">🤖✨ Express</button>
+      <button class="btn" id="b-express">🤖✨</button>
     </div>
   </div>
 </footer>
