@@ -29,39 +29,10 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.05em}
 #conn{font-size:.72rem;color:var(--dim);margin-left:auto;padding:3px 8px;border-radius:10px;background:#222}
 #conn.ok{color:var(--ok);background:#143}
 #conn.err{color:var(--err);background:#311}
-#explore-badge{
-  font-size:.7rem;padding:3px 8px;border-radius:10px;background:#222;color:var(--dim);
-  display:none
-}
-#explore-badge.scanning{display:inline;color:#4af;background:#102030}
-#explore-badge.moving  {display:inline;color:#4f4;background:#102010}
-#explore-badge.turning {display:inline;color:#f90;background:#201500}
-#explore-badge.stuck   {display:inline;color:#f44;background:#200808}
-#explore-badge.complete{display:inline;color:#4f4;background:#102010}
 
 /* Camera */
 #cam-wrap{flex:1;min-height:0;background:#000;overflow:hidden;position:relative}
 #cam{width:100%;height:100%;object-fit:contain;display:block;background:#000}
-
-/* Minimap overlay */
-#minimap-wrap{
-  position:absolute;bottom:8px;right:8px;
-  width:160px;height:160px;
-  border:1px solid rgba(255,255,255,.2);border-radius:6px;
-  overflow:hidden;background:#0e0e1c;
-  box-shadow:0 2px 8px rgba(0,0,0,.6);
-  cursor:pointer;
-  transition:opacity .2s
-}
-#minimap-wrap.hidden{opacity:0;pointer-events:none}
-#minimap{width:160px;height:160px;image-rendering:pixelated}
-#minimap-toggle{
-  position:absolute;bottom:8px;right:176px;
-  background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.2);
-  border-radius:6px;color:#aaa;font-size:.7rem;padding:3px 7px;
-  cursor:pointer;white-space:nowrap
-}
-#minimap-toggle:hover{color:#fff}
 
 /* Sensor strip — mobile only */
 #sensor-strip{
@@ -117,11 +88,8 @@ footer{
 .joy-label{font-size:.62rem;color:var(--dim);text-align:center;white-space:nowrap;letter-spacing:.03em}
 
 /* Right-side controls */
-.right-controls{display:flex;flex-direction:column;gap:8px;flex:1;min-width:0}
-.leds{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.leds>.lbl{font-size:.68rem;color:var(--dim)}
-input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px;cursor:pointer;background:none;padding:2px;flex-shrink:0}
-.btn-row{display:flex;gap:6px;flex:1}
+.right-controls{display:flex;flex-direction:column;gap:8px;flex:1;min-width:0;justify-content:center}
+.btn-row{display:flex;gap:8px;justify-content:center}
 .btn{
   background:#252535;border:1px solid #3a3a5a;border-radius:6px;
   color:#ccc;padding:6px 10px;cursor:pointer;font-size:.78rem;
@@ -130,6 +98,8 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 .btn:active,.btn:hover{background:#30305a}
 .btn.warn{border-color:var(--warn)}
 .btn.warn:active{background:var(--warn);color:#000}
+/* Express: a compact, content-sized button (don't stretch) */
+#b-express{flex:0 0 auto;font-size:1.5rem;line-height:1;padding:10px 18px}
 
 /* ── DESKTOP (≥ 700 px) ───────────────────────────────────────────────────── */
 @media (min-width: 700px) {
@@ -168,18 +138,13 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 
 <header>
   <h1>🤖 Ginger</h1>
-  <span style="font-size:.65rem;color:#777;margin-left:2px">build: {{BUILD_TIME}}</span>
-  <span id="explore-badge"></span>
+  <span id="build-time" data-iso="{{BUILD_TIME}}" style="font-size:.65rem;color:#777;margin-left:2px">build: {{BUILD_TIME}}</span>
   <span id="conn">connecting…</span>
 </header>
 
 <!-- Camera takes available height; on desktop becomes a grid container -->
 <div id="cam-wrap">
   <video id="cam" autoplay muted playsinline></video>
-  <button id="minimap-toggle" title="Toggle map">🗺 map</button>
-  <div id="minimap-wrap">
-    <canvas id="minimap" width="160" height="160"></canvas>
-  </div>
 
   <!-- Sidebar (inside cam-wrap so it sits beside camera on desktop) -->
   <aside>
@@ -288,41 +253,56 @@ input[type=color]{width:30px;height:30px;border:1px solid #444;border-radius:6px
 
   <div class="joy-block">
     <div class="joy" id="cam-joy" role="application"
-         aria-label="Camera bracket joystick — drag to pan/tilt, double-tap to center">
+         aria-label="Camera bracket joystick — drag to pan/tilt; releases back to forward">
       <div class="joy-knob"></div>
     </div>
     <div class="joy-label">Pan <span id="pan-v">90</span>° · Tilt <span id="tilt-v">90</span>°</div>
   </div>
 
   <div class="right-controls">
-    <div class="leds">
-      <span class="lbl">LED</span>
-      <input type="color" id="led-color" value="#00aaff">
-      <div class="btn-row">
-        <button class="btn" id="b-led-set">Set</button>
-        <button class="btn" id="b-led-off">Off</button>
-        <button class="btn warn" id="b-buzz">🔊 Beep</button>
-      </div>
-      <div class="btn-row">
-        <button class="btn" id="b-scan">Scan</button>
-        <button class="btn" id="b-explore" style="border-color:#4f4;color:#4f4">Explore</button>
-      </div>
+    <div class="btn-row">
+      <button class="btn" id="b-express">🤖✨</button>
     </div>
   </div>
 </footer>
 
 <script>
 const DUTY = 2000;
+// Joystick response curve. The motors are very non-linear (almost no
+// motion at low duty, then a sharp ramp), so a linear stick feels
+// near-binary. `curve` cubically softens the low/mid range — most of the
+// throw gives gentle output, full only near the rim. k: 0 = linear, 1 = max.
+const curve = (v, k) => {
+  const s = Math.sign(v), a = Math.abs(v);
+  return s * (k * a * a * a + (1 - k) * a);
+};
+const DRIVE_EXPO = 0.7;   // forward/back softening
+// Steering needs a stronger curve *and* a lower ceiling: at full duty a
+// small turn input swings the wheels hard enough to feel on/off, and
+// in-place spin is too fast. TURN_GAIN caps yaw authority.
+const TURN_EXPO  = 0.85;
+const TURN_GAIN  = 0.55;
 let driveTimer = null;
 
 function post(url, body) {
   return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined});
 }
 
+// ── Build time → viewer's local timezone ──────────────────────────────────────
+// build.rs stamps an ISO-8601 UTC instant; render it in local time.
+(() => {
+  const el = document.getElementById('build-time');
+  const d = new Date(el.dataset.iso);
+  if (!isNaN(d)) el.textContent = 'build: ' + d.toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+  });
+})();
+
 // ── Virtual joystick ──────────────────────────────────────────────────────────
-// Pointer-driven analog stick. `sticky` keeps the knob where it was left
-// (camera bracket); otherwise it springs back to center on release (drive).
-function makeJoystick(el, { sticky = false, onMove, onEnd }) {
+// Pointer-driven analog stick. Always springs back to center on release
+// (drive: stop; camera bracket: face forward); `onEnd` fires on release.
+function makeJoystick(el, { onMove, onEnd }) {
   const knob = el.querySelector('.joy-knob');
   let dragging = false, pid = null, raf = 0, pending = null;
 
@@ -338,7 +318,10 @@ function makeJoystick(el, { sticky = false, onMove, onEnd }) {
     pending = [nx, ny];
     if (!raf) raf = requestAnimationFrame(() => {
       raf = 0;
-      if (pending && onMove) onMove(pending[0], pending[1]);
+      // Mobile coalesces/defers rAF: this can fire after release. Only
+      // emit while still dragging, or a stale frame re-arms the drive
+      // heartbeat with no finger down (the "sticky on mobile" bug).
+      if (dragging && pending && onMove) onMove(pending[0], pending[1]);
     });
   }
   function vec(e) {
@@ -357,20 +340,30 @@ function makeJoystick(el, { sticky = false, onMove, onEnd }) {
     el.classList.add('dragging');
     const [nx, ny] = vec(e); place(nx, ny); emit(nx, ny);
   });
-  el.addEventListener('pointermove', e => {
+  // Track move/up on `window`, not the element: on mobile Safari the
+  // element's pointerup is occasionally dropped when pointer capture is
+  // lost mid-drag, which left the drive joystick stuck "on" after the
+  // finger lifted. window always sees the up/cancel for our pointer.
+  function onMoveWin(e) {
     if (!dragging || e.pointerId !== pid) return;
     const [nx, ny] = vec(e); place(nx, ny); emit(nx, ny);
-  });
+  }
   function release(e) {
-    if (!dragging || (e && e.pointerId !== pid)) return;
+    if (!dragging || (e && e.pointerId != null && e.pointerId !== pid)) return;
     dragging = false;
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    pending = null;
     try { el.releasePointerCapture(pid); } catch (_) {}
     el.classList.remove('dragging');
-    if (!sticky) center();
+    center();
     if (onEnd) onEnd();
   }
-  el.addEventListener('pointerup', release);
-  el.addEventListener('pointercancel', release);
+  window.addEventListener('pointermove', onMoveWin);
+  window.addEventListener('pointerup', release);
+  window.addEventListener('pointercancel', release);
+  // OS/browser yanks capture (app switch, gesture) without a pointerup:
+  // force a release so the car can't keep driving on its own.
+  el.addEventListener('lostpointercapture', release);
 
   return {
     isDragging: () => dragging,
@@ -387,10 +380,12 @@ const driveHint = document.getElementById('drive-hint');
 let driveCmd = null;                       // last {left,right} dispatched
 
 function driveMix(nx, ny) {
-  // Arcade mixing. Up = forward (ny < 0); x = turn. Preserves the old
-  // D-pad semantics: full-left → {+DUTY,-DUTY}, full-fwd → {+DUTY,+DUTY}.
-  let throttle = -ny, turn = nx;
-  if (Math.hypot(nx, ny) < 0.10) { throttle = 0; turn = 0; }   // center deadzone
+  // Arcade mixing. Up = forward (ny < 0); x = turn. Full-rim deflection
+  // still reaches DUTY (full-left → {+DUTY,-DUTY}, full-fwd → {+DUTY,+DUTY}),
+  // but `expo` makes the approach to it gradual instead of near-binary.
+  if (Math.hypot(nx, ny) < 0.10) return { left: 0, right: 0 };   // center deadzone
+  let throttle = curve(-ny, DRIVE_EXPO);
+  let turn     = curve(nx, TURN_EXPO) * TURN_GAIN;
   let l = throttle - turn, r = throttle + turn;
   const m = Math.max(1, Math.abs(l), Math.abs(r));
   return { left: Math.round(l / m * DUTY), right: Math.round(r / m * DUTY) };
@@ -409,7 +404,7 @@ function driveStop() {
   clearInterval(driveTimer); driveTimer = null;
   post('/api/stop');
 }
-const driveJoy = makeJoystick(driveEl, { sticky: false, onMove: driveSend, onEnd: driveStop });
+const driveJoy = makeJoystick(driveEl, { onMove: driveSend, onEnd: driveStop });
 
 // Keyboard control is intentionally scoped to the joystick element: arrow
 // keys only steer the car while this joystick is focused (click/tab to it).
@@ -457,7 +452,18 @@ driveEl.addEventListener('blur', () => {
   if (kbActive || held.size) { held.clear(); kbActive = false; driveJoy.center(); driveStop(); }
 });
 
-// ── Camera/US-bracket joystick — sticky; sends degrees; telemetry-synced ──────
+// Backgrounding the app / hiding the tab mid-drive can withhold the
+// pointerup on mobile. Force the car to stop the moment we lose the page.
+function driveKill() {
+  if (!driveCmd && !held.size && !driveJoy.isDragging()) return;
+  held.clear(); kbActive = false; driveJoy.center(); driveStop();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') driveKill();
+});
+window.addEventListener('pagehide', driveKill);
+
+// ── Camera/US-bracket joystick — spring-back; sends degrees; telemetry-synced ─
 const camJoyEl = document.getElementById('cam-joy');
 const panSpan  = document.getElementById('pan-v');
 const tiltSpan = document.getElementById('tilt-v');
@@ -472,20 +478,21 @@ function camSend(nx, ny) {
   if (t !== camTilt) { camTilt = t; post('/api/tilt', { angle: t }); }
   camShow(camPan, camTilt);
 }
-const camJoy = makeJoystick(camJoyEl, { sticky: true, onMove: camSend });
-camJoyEl.addEventListener('pointerup', () => { camTouchedAt = performance.now(); });
-camJoyEl.addEventListener('dblclick', () => {
-  camJoy.center();
-  camPan = 90; camTilt = 90; camShow(90, 90);
-  post('/api/pan',  { angle: 90 });
-  post('/api/tilt', { angle: 90 });
+// Spring-back: releasing the bracket joystick re-centers pan/tilt so the
+// ultrasonic sensor faces forward again. Replaces the supervisor's old
+// brittle distance-estimated auto-center after forward driving.
+function camRecenter() {
   camTouchedAt = performance.now();
-});
+  if (camPan  !== 90) { camPan  = 90; post('/api/pan',  { angle: 90 }); }
+  if (camTilt !== 90) { camTilt = 90; post('/api/tilt', { angle: 90 }); }
+  camShow(90, 90);
+}
+const camJoy = makeJoystick(camJoyEl, { onMove: camSend, onEnd: camRecenter });
 
 // Mirror the bracket's real angle reported by telemetry so the knob
-// follows server-side moves — in particular the supervisor's auto-center
-// after sustained forward driving. Suppressed while the user is (or just
-// was) interacting so we never fight live input.
+// reflects the actual servo position on page load / reconnect.
+// Suppressed while the user is (or just was) interacting so we never
+// fight live input.
 function camSync(p, t) {
   if (p == null || t == null || camJoy.isDragging()) return;
   if (performance.now() - camTouchedAt < 700) return;
@@ -496,20 +503,20 @@ function camSync(p, t) {
   camShow(rp, rt);
 }
 
-// ── LED ───────────────────────────────────────────────────────────────────────
-document.getElementById('b-led-set').addEventListener('click', () => {
-  const h = document.getElementById('led-color').value;
-  post('/api/led', {r:parseInt(h.slice(1,3),16), g:parseInt(h.slice(3,5),16), b:parseInt(h.slice(5,7),16)});
-});
-document.getElementById('b-led-off').addEventListener('click', () => post('/api/led/off'));
-
-// ── Buzzer ───────────────────────────────────────────────────────────────────
-const bz = document.getElementById('b-buzz');
-const bzOn  = e => { e.preventDefault(); post('/api/buzzer', {on:true}); };
-const bzOff = () => post('/api/buzzer', {on:false});
-bz.addEventListener('mousedown',  bzOn);
-bz.addEventListener('touchstart', bzOn, {passive:false});
-['mouseup','touchend','mouseleave','touchcancel'].forEach(ev => bz.addEventListener(ev, bzOff));
+// ── Express ───────────────────────────────────────────────────────────────────
+// One unified, randomized "expression": LEDs and buzzer play together
+// (lights track pitch and vice-versa). It needs tight timing so it runs
+// server-side (see supervisor.rs); the button just triggers it and
+// self-disables while it plays.
+(() => {
+  const btn = document.getElementById('b-express');
+  btn.addEventListener('click', () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    post('/api/express');
+    setTimeout(() => { btn.disabled = false; }, 3600);
+  });
+})();
 
 // ── Sensor config ─────────────────────────────────────────────────────────────
 function sendConfig() {
@@ -540,19 +547,8 @@ sse.onmessage = e => {
   const d = JSON.parse(e.data);
   const fmt = (v, n) => v != null ? v.toFixed(n) : '—';
 
-  // Keep the camera joystick in sync with the bracket's real angle
-  // (notably the supervisor's forward-drive auto-center).
+  // Keep the camera joystick in sync with the bracket's real angle.
   camSync(d.pan, d.tilt);
-
-  // Explore state badge
-  const es = d.explore_state || 'idle';
-  exploreBadge.textContent = es;
-  exploreBadge.className   = es;
-  if (es === 'idle' || es === 'complete') {
-    setExploring(false);
-  } else {
-    setExploring(true);
-  }
 
   // Onboard camera FPS (from SSE)
   const ofps = d.camera_fps != null ? d.camera_fps.toFixed(1) : '—';
@@ -603,101 +599,6 @@ sse.onmessage = e => {
     ['ir-l-m','ir-c-m','ir-r-m'].forEach(id => document.getElementById(id).className = 'dot');
   }
 };
-
-// ── Scan button ───────────────────────────────────────────────────────────────
-const scanBtn = document.getElementById('b-scan');
-scanBtn.addEventListener('click', () => {
-  scanBtn.disabled = true;
-  scanBtn.textContent = 'Scanning…';
-  post('/api/scan').then(() => {
-    setTimeout(() => { scanBtn.disabled = false; scanBtn.textContent = 'Scan'; }, 3000);
-    setTimeout(updateMinimap, 3200);
-  });
-});
-
-// ── Explore button ────────────────────────────────────────────────────────────
-const exploreBtn   = document.getElementById('b-explore');
-const exploreBadge = document.getElementById('explore-badge');
-let exploring = false;
-
-exploreBtn.addEventListener('click', () => {
-  if (exploring) {
-    post('/api/explore/stop');
-    setExploring(false);
-  } else {
-    post('/api/explore/start');
-    setExploring(true);
-  }
-});
-
-function setExploring(active) {
-  exploring = active;
-  exploreBtn.textContent     = active ? 'Stop' : 'Explore';
-  exploreBtn.style.color     = active ? 'var(--err)' : 'var(--ok)';
-  exploreBtn.style.borderColor = active ? 'var(--err)' : 'var(--ok)';
-  minimapPollMs = active ? 1000 : 2000;
-}
-
-// ── Minimap ───────────────────────────────────────────────────────────────────
-const minimapCanvas = document.getElementById('minimap');
-const minimapCtx    = minimapCanvas.getContext('2d');
-const minimapWrap   = document.getElementById('minimap-wrap');
-const minimapToggle = document.getElementById('minimap-toggle');
-let mapMeta = null;
-let minimapVisible = true;
-
-minimapToggle.addEventListener('click', () => {
-  minimapVisible = !minimapVisible;
-  minimapWrap.classList.toggle('hidden', !minimapVisible);
-  minimapToggle.textContent = minimapVisible ? '🗺 map' : '🗺 map';
-});
-
-function renderMinimap(mapImg, meta) {
-  const SIZE = 160;
-  const VIEW = 80; // cells to show (8 m × 8 m)
-  minimapCtx.clearRect(0, 0, SIZE, SIZE);
-
-  // Crop map image around robot, scaled to canvas
-  const sx = meta.robot_gx - VIEW / 2;
-  const sy = meta.robot_gy - VIEW / 2;
-  minimapCtx.drawImage(mapImg, sx, sy, VIEW, VIEW, 0, 0, SIZE, SIZE);
-
-  // Robot arrow centred in canvas
-  const scale = SIZE / VIEW;
-  minimapCtx.save();
-  minimapCtx.translate(SIZE / 2, SIZE / 2);
-  // heading: 0=north=up, clockwise → subtract 90° for canvas rotation
-  minimapCtx.rotate((meta.robot_heading - 90) * Math.PI / 180);
-  minimapCtx.fillStyle = '#4af';
-  minimapCtx.beginPath();
-  minimapCtx.moveTo(0, -8 * scale / 4);
-  minimapCtx.lineTo( 5 * scale / 4,  6 * scale / 4);
-  minimapCtx.lineTo(-5 * scale / 4,  6 * scale / 4);
-  minimapCtx.closePath();
-  minimapCtx.fill();
-  minimapCtx.restore();
-}
-
-async function updateMinimap() {
-  try {
-    const [metaResp] = await Promise.all([fetch('/api/map')]);
-    mapMeta = await metaResp.json();
-
-    const mapImg = new Image();
-    mapImg.onload = () => renderMinimap(mapImg, mapMeta);
-    mapImg.src = '/api/map/png?' + Date.now();
-  } catch (_) {}
-}
-
-// Adaptive polling: 2 s idle, 1 s while exploring
-let minimapPollMs = 2000;
-let minimapTimer  = null;
-function scheduleMinimap() {
-  clearTimeout(minimapTimer);
-  minimapTimer = setTimeout(async () => { await updateMinimap(); scheduleMinimap(); }, minimapPollMs);
-}
-updateMinimap();
-scheduleMinimap();
 
 // ── Camera H.264 stream via WebRTC ────────────────────────────────────────────
 //

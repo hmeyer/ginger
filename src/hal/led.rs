@@ -7,7 +7,7 @@ use rppal::spi::{Bus, Mode, SlaveSelect, Spi};
 
 use crate::Result;
 
-const LED_COUNT: usize = 8;
+pub const LED_COUNT: usize = 8;
 const SPI_HZ: u32 = 6_400_000; // 8 bits / 1.25 µs ≈ 6.4 MHz
 
 pub struct LedStrip {

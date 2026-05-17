@@ -1,6 +1,4 @@
-//! Robot domain: the `Car` aggregate, occupancy map, and autonomy.
+//! Robot domain: the `Car` aggregate and the teleop supervisor.
 
 pub mod car;
-pub mod explore;
-pub mod map;
 pub mod supervisor;

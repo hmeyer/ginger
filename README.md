@@ -13,7 +13,7 @@ Rust driver library and web control interface for the [Freenove 4WD Smart Car Ki
 | Pan/tilt servos | PCA9685 → I2C 0x40 | Channels 8 (pan) and 9 (tilt) |
 | ADC / battery / light | ADS7830 → I2C 0x48 | Ch 0 = light L, Ch 1 = light R, Ch 2 = battery |
 | LED strip | 8× WS2812B → SPI0 | Bit-banged at 6.4 MHz, GRB order |
-| Buzzer | Active → GPIO 17 | HIGH = on |
+| Buzzer | GPIO 17 | HIGH = on; bit-banged square wave for pitch |
 | Ultrasonic | HC-SR04 → GPIO 27/22 | Trigger / Echo |
 | IR line sensors | 3× → GPIO 14/15/23 | Active-high: HIGH = line detected |
 | Camera | OV5647 → CSI | Via libcamera, 800×600 YUYV |
@@ -32,7 +32,7 @@ src/
     pca9685.rs    — I2C PWM driver (PCA9685)
     adc.rs        — ADS7830 battery/voltage/light ADC
     led.rs        — WS2812B strip over SPI
-    buzzer.rs     — Active buzzer
+    buzzer.rs     — Buzzer (on/off + bit-banged variable-pitch tone)
     ultrasonic.rs — HC-SR04 distance sensor
     infrared.rs   — 3-sensor line tracker
   devices/        — actuators on the HAL
@@ -46,10 +46,7 @@ src/
     webrtc.rs     — WHEP signalling + adaptive bitrate
   robot/          — domain
     car.rs        — Top-level Car struct with obstacle-avoidance safety
-    map.rs        — Occupancy grid map (320×320, 10 cm/cell)
-    map/render.rs — PNG / ASCII rendering (isolates the image crate)
-    explore.rs    — Frontier-based autonomous exploration
-    supervisor.rs — Teleop control loop: collision lock, TTC, auto-center
+    supervisor.rs — Teleop control loop: collision lock, TTC, dead-man stop
   server.rs       — axum router + route handlers
   bin/
     main.rs       — Composition root: wire up state, spawn supervisor, serve
@@ -111,16 +108,13 @@ Features:
 - **Camera stream** — adaptive JPEG, targeting 30 fps; quality and resolution scale down automatically to stay within budget
 - **Onboard FPS** (camera capture rate) and **web FPS** (browser delivery rate) displayed live
 - **Software auto-exposure** — single brightness-axis controller (gain-first ramp: gain 1→16× before exposure 0.5→100 ms) with a Smith Predictor that uses each frame's metadata to compensate for libcamera's pipeline delay. Live readback of luma, brightness (EV stops), exposure, and gain — no knobs
-- **Drive controls** — D-pad (tap or hold), keyboard arrow keys, space to stop; server safety-stops motors after 500 ms of silence
+- **Drive controls** — spring-back virtual joystick (expo response curve so it isn't near-binary) or keyboard arrow keys, space to stop; server safety-stops motors after 500 ms of silence
 - **Forward collision avoidance** — hard stop at 30 cm with hysteresis to 38 cm, obstacle lock prevents the browser's drive-command heartbeat from re-overriding; time-to-collision displayed with colour coding (red < 1 s, orange < 2 s, green)
-- **Pan/tilt auto-center** — after ~10 cm of sustained forward motion the pan/tilt automatically returns to center so the ultrasonic sensor faces forward
+- **Spring-back camera bracket** — releasing the camera joystick re-centers pan/tilt so the ultrasonic sensor faces forward (replaces the old brittle distance-estimated auto-center)
 - **Pan trim** — physical straight-ahead baked in as a servo pulse offset; `set_pan(90°)` always points the sensor forward
-- **Pan / tilt sliders** — 0–180° range
-- **LED** — colour picker + off button
-- **Buzzer** — hold to beep
+- **Pan / tilt joystick** — 0–180° range, spring-back to forward
+- **Express** — one-tap synchronized LED + buzzer "expression": a random *mood* (excited / curious / grumpy / alarmed / chatty) fixes the pitch band, tempo, rise/fall contour and a matching colour palette; a random *viz* (scanner / VU meter / flood) makes the lights track pitch in lock-step with the bit-banged buzzer warble
 - **Sensor toggles** — enable/disable light, IR, and ultrasonic per sensor
-- **Minimap** — live occupancy-grid overlay, updated during exploration
-- **Autonomous exploration** — frontier-based; scan → move → repeat
 
 The UI is mobile-first: on phones it stacks camera → scrollable sensor strip → footer controls. On screens ≥ 700 px it switches to a camera + sidebar layout.
 

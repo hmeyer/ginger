@@ -1,41 +1,29 @@
 //! Robot supervisor: the control loop that owns [`Car`] and mediates
 //! between the web layer and the hardware.
 //!
-//! It drains a [`Command`] channel, runs autonomous exploration when
-//! asked, polls sensors into a shared [`SensorSnapshot`], and enforces
-//! the teleop safety behaviours (forward-collision lock with hysteresis,
-//! time-to-collision estimate, pan/tilt auto-center, dead-man stop).
+//! It drains a [`Command`] channel, polls sensors into a shared
+//! [`SensorSnapshot`], and enforces the teleop safety behaviours
+//! (forward-collision lock with hysteresis, time-to-collision estimate,
+//! dead-man stop).
 //!
 //! The safety math is factored into pure helpers so it can be unit-tested
 //! without any hardware.
 
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use log::{info, warn};
 use tokio::sync::mpsc;
 
 use crate::api::{Command, SensorConfig, SensorSnapshot, battery_pct};
-use crate::robot::{car::Car, explore, map::Map};
+use crate::robot::car::Car;
 
 // Stop and lock out forward commands when closer than this.
 const COLLISION_STOP_CM: f32 = 30.0;
 // Hysteresis: unlock only after obstacle retreats past this.
 const COLLISION_CLEAR_CM: f32 = 38.0;
-// Auto-center pan/tilt after this much sustained forward travel.
-// Both wheels must exceed this duty (of 4095) to count as "driving
-// forward". Kept below the teleop forward duty (DUTY = 2000 in the web
-// UI) so ordinary forward driving actually accumulates travel — at the
-// old value of 2000 the strict `>` made the common case never trigger.
-const AUTOCENTER_MIN_DUTY: i32 = 1500;
-const AUTOCENTER_TRAVEL_CM: f32 = 10.0;
-const MAX_SPEED_CMS: f32 = 60.0;
 const POLL_PERIOD: Duration = Duration::from_millis(80);
-const POLL_DT_S: f32 = 0.080;
 const DEAD_MAN_TIMEOUT: Duration = Duration::from_millis(500);
 
 // ── Pure safety helpers ───────────────────────────────────────────────────────
@@ -78,32 +66,291 @@ fn collision_step(going_forward: bool, us_cm: Option<f32>, lock: bool) -> Collis
     CollisionDecision { stop, lock }
 }
 
-/// Estimated forward travel (cm) accrued in one poll period for the given
-/// motor command, or `None` when not driving forward hard enough to count
-/// (which also resets the auto-center accumulator).
-fn fwd_travel_step(motor_left: i32, motor_right: i32) -> Option<f32> {
-    if motor_left > AUTOCENTER_MIN_DUTY && motor_right > AUTOCENTER_MIN_DUTY {
-        let avg_fraction = (motor_left + motor_right) as f32 / 2.0 / 4095.0;
-        Some(avg_fraction * MAX_SPEED_CMS * POLL_DT_S)
-    } else {
-        None
+// ── Buzzer & LED "personality" ────────────────────────────────────────────────
+
+/// Tiny dependency-free xorshift PRNG, seeded from the wall clock. Good
+/// enough to make the buzzer/LED show feel different every press.
+struct Rng(u64);
+impl Rng {
+    fn new() -> Self {
+        let seed = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        Rng(seed | 1)
     }
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    /// Uniform in `[lo, hi]`.
+    fn range(&mut self, lo: u64, hi: u64) -> u64 {
+        lo + self.next() % (hi - lo + 1)
+    }
+    /// Uniform float in `[0, 1)`.
+    fn unit(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+/// HSV → RGB. `h` in degrees, `s`/`v` in `[0, 1]`.
+fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h = h.rem_euclid(360.0) / 60.0;
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let q = |f: f32| ((f + m) * 255.0).round() as u8;
+    (q(r), q(g), q(b))
+}
+
+/// A pitch near the phrase's (drifting) centre, jittered within the band.
+fn band_freq(rng: &mut Rng, centre: f32, lo: i32, hi: i32) -> i32 {
+    let j = (rng.unit() - 0.5) * (hi - lo) as f32 * 0.6;
+    (centre + j).clamp(lo as f32, hi as f32) as i32
+}
+
+/// A colour palette: `at(t, v)` maps a normalized pitch `t` to an RGB at
+/// brightness `v`. Each mood carries its own so the lights match the
+/// sound's vibe (warm & bright vs cool & dim, etc.).
+#[derive(Clone, Copy)]
+struct Pal {
+    h0: f32,
+    span: f32,
+    sat: f32,
+}
+impl Pal {
+    fn at(&self, t: f32, v: f32) -> (u8, u8, u8) {
+        hsv(self.h0 + t * self.span, self.sat, v.clamp(0.0, 1.0))
+    }
+}
+
+/// A buzzer/LED personality. `kinds` lists the segment types this mood
+/// favours (0 gliss · 1 warble · 2 sustained · 3 blips · 4 tight trill).
+#[derive(Clone, Copy)]
+struct Mood {
+    lo: i32,
+    hi: i32,
+    tempo: u64,
+    contour: i32,
+    kinds: &'static [u8],
+    pal: Pal,
+    base_v: f32,
+}
+
+/// Paint the strip for a beat: the lights track pitch. `t` is the
+/// normalized pitch (0 = band low, 1 = band high); `viz` selects the
+/// look. Always followed immediately by the matching `buzzer.tone`, so
+/// audio and light stay in lock-step.
+fn light(car: &mut Car, pal: &Pal, viz: u64, t: f32, v: f32) {
+    use crate::hal::led::LED_COUNT as N;
+    let t = t.clamp(0.0, 1.0);
+    car.leds.set_all(0, 0, 0);
+    match viz {
+        // Scanner: a dot whose position *and* colour ride the pitch.
+        0 => {
+            let pos = (t * (N as f32 - 1.0)).round() as usize;
+            let (r, g, b) = pal.at(t, v);
+            car.leds.set(pos, r, g, b);
+            let (r2, g2, b2) = pal.at(t, v * 0.25);
+            if pos > 0 {
+                car.leds.set(pos - 1, r2, g2, b2);
+            }
+            if pos + 1 < N {
+                car.leds.set(pos + 1, r2, g2, b2);
+            }
+        }
+        // VU meter: higher pitch fills more of the ring.
+        1 => {
+            let lvl = ((t * N as f32).ceil() as usize).clamp(1, N);
+            for i in 0..lvl {
+                let (r, g, b) = pal.at(i as f32 / N as f32, v);
+                car.leds.set(i, r, g, b);
+            }
+        }
+        // Flood: whole strip, colour from pitch.
+        _ => {
+            let (r, g, b) = pal.at(t, v);
+            car.leds.set_all(r, g, b);
+        }
+    }
+    car.leds.show().ok();
+}
+
+/// One unified, randomized "expression": LEDs and buzzer play together.
+/// A random *mood* fixes the pitch band, tempo, rise/fall contour and a
+/// matching colour palette; a random *viz* fixes how the lights track
+/// the pitch. Every tone is preceded by the matching `light()` frame, so
+/// the show is synchronized by construction. Blocks the supervisor loop
+/// briefly (< ~2.5 s), like the old scan did.
+fn play_expression(car: &mut Car) {
+    let mut rng = Rng::new();
+
+    let p = |h0: f32, span: f32, sat: f32| Pal { h0, span, sat };
+    let moods: [Mood; 5] = [
+        // excited: high, fast, rising — warm→bright rainbow
+        Mood {
+            lo: 900,
+            hi: 3000,
+            tempo: 75,
+            contour: 1,
+            kinds: &[3, 3, 0, 4],
+            pal: p(30.0, 300.0, 1.0),
+            base_v: 1.0,
+        },
+        // curious: mid, questioning — teal/green
+        Mood {
+            lo: 450,
+            hi: 1800,
+            tempo: 115,
+            contour: 1,
+            kinds: &[3, 2, 0],
+            pal: p(160.0, 90.0, 1.0),
+            base_v: 1.0,
+        },
+        // grumpy: low, slow, falling — deep blue/purple, dim
+        Mood {
+            lo: 150,
+            hi: 850,
+            tempo: 155,
+            contour: -1,
+            kinds: &[2, 0, 3],
+            pal: p(225.0, 60.0, 0.9),
+            base_v: 0.55,
+        },
+        // alarmed: harsh fast trills — red/orange
+        Mood {
+            lo: 700,
+            hi: 2400,
+            tempo: 60,
+            contour: 0,
+            kinds: &[4, 4, 3],
+            pal: p(0.0, 32.0, 1.0),
+            base_v: 1.0,
+        },
+        // chatty: wide, mixed — full rainbow
+        Mood {
+            lo: 250,
+            hi: 2600,
+            tempo: 100,
+            contour: 0,
+            kinds: &[0, 1, 2, 3],
+            pal: p(0.0, 360.0, 1.0),
+            base_v: 1.0,
+        },
+    ];
+    let Mood {
+        lo,
+        hi,
+        tempo,
+        contour,
+        kinds,
+        pal,
+        base_v,
+    } = moods[rng.range(0, 4) as usize];
+    let viz = rng.range(0, 2); // 0 scanner · 1 VU · 2 flood
+    let span = (hi - lo) as f32;
+    let norm = |f: i32| ((f - lo) as f32 / span).clamp(0.0, 1.0);
+
+    let segments = rng.range(4, 7);
+    let mut centre = match contour {
+        c if c > 0 => lo as f32,
+        c if c < 0 => hi as f32,
+        _ => (lo + hi) as f32 / 2.0,
+    };
+    let drift = contour as f32 * span / segments as f32;
+    let dur = |rng: &mut Rng, a: u64, b: u64| (rng.range(a, b) * tempo / 100).max(6);
+
+    for _ in 0..segments {
+        match kinds[rng.range(0, kinds.len() as u64 - 1) as usize] {
+            // gliss: a pitch sweep — the scanner dot slides with it
+            0 => {
+                let (f0, f1) = (
+                    band_freq(&mut rng, centre, lo, hi),
+                    band_freq(&mut rng, centre, lo, hi),
+                );
+                let steps = 14;
+                let total = dur(&mut rng, 110, 240);
+                for s in 0..steps {
+                    let fr = f0 + (f1 - f0) * s as i32 / steps as i32;
+                    light(car, &pal, viz, norm(fr), base_v);
+                    car.buzzer.tone(fr.max(60) as u32, (total / steps).max(4));
+                }
+            }
+            // warble: alternate two pitches, lights jump with them
+            1 => {
+                let (a, b) = (
+                    band_freq(&mut rng, centre, lo, hi),
+                    band_freq(&mut rng, centre, lo, hi),
+                );
+                for i in 0..rng.range(4, 8) {
+                    let fr = if i.is_multiple_of(2) { a } else { b }.max(60);
+                    light(car, &pal, viz, norm(fr), base_v);
+                    car.buzzer.tone(fr as u32, dur(&mut rng, 16, 32));
+                }
+            }
+            // sustained chirp with a gentle brightness "breath"
+            2 => {
+                let fr = band_freq(&mut rng, centre, lo, hi).max(60);
+                let total = dur(&mut rng, 110, 220);
+                let steps = 8;
+                for s in 0..steps {
+                    let glow = 0.55 + 0.45 * (s as f32 / steps as f32 * std::f32::consts::PI).sin();
+                    light(car, &pal, viz, norm(fr), base_v * glow);
+                    car.buzzer.tone(fr as u32, (total / steps).max(4));
+                }
+            }
+            // tight trill on two close pitches — strobes
+            4 => {
+                let a = band_freq(&mut rng, centre, lo, hi);
+                let b = a + rng.range(120, 380) as i32;
+                for i in 0..rng.range(6, 12) {
+                    let fr = if i.is_multiple_of(2) { a } else { b }.max(60);
+                    light(car, &pal, viz, norm(fr), base_v);
+                    car.buzzer.tone(fr as u32, dur(&mut rng, 9, 18));
+                }
+            }
+            // short blips with little dark gaps
+            _ => {
+                for _ in 0..rng.range(1, 3) {
+                    let fr = band_freq(&mut rng, centre, lo, hi).max(60);
+                    light(car, &pal, viz, norm(fr), base_v);
+                    car.buzzer.tone(fr as u32, dur(&mut rng, 22, 75));
+                    car.leds.set_all(0, 0, 0);
+                    car.leds.show().ok();
+                    car.buzzer.tone(0, dur(&mut rng, 15, 40));
+                }
+            }
+        }
+        centre = (centre + drift).clamp(lo as f32, hi as f32);
+        // A short dark pause between most segments.
+        if rng.range(0, 2) != 0 {
+            car.leds.set_all(0, 0, 0);
+            car.leds.show().ok();
+            car.buzzer.tone(0, dur(&mut rng, 25, 110));
+        }
+    }
+    car.buzzer.off();
+    car.leds.clear().ok();
 }
 
 // ── Control loop ──────────────────────────────────────────────────────────────
 
 /// Run the supervisor loop forever. Intended to own a dedicated thread.
-pub fn run(
-    mut cmd_rx: mpsc::Receiver<Command>,
-    sensors: Arc<RwLock<SensorSnapshot>>,
-    map: Arc<RwLock<Map>>,
-    explore_stop: Arc<AtomicBool>,
-) {
+pub fn run(mut cmd_rx: mpsc::Receiver<Command>, sensors: Arc<RwLock<SensorSnapshot>>) {
     let mut car = Car::new().expect("Car init failed");
     let mut config = SensorConfig::default();
     let mut last_drive = Instant::now();
     let mut is_driving = false;
-    let mut explore_active = false;
     // Motor state for direction detection
     let mut motor_left: i32 = 0;
     let mut motor_right: i32 = 0;
@@ -111,12 +358,8 @@ pub fn run(
     let mut obstacle_lock = false;
     // Previous US reading for TTC estimation
     let mut prev_us: Option<(f32, Instant)> = None;
-    // Pan/tilt auto-center state
-    let mut fwd_travel_est: f32 = 0.0;
-    let mut pan_auto_centered = false;
     // Last commanded bracket angles, mirrored into the snapshot so the
-    // web UI can keep its camera joystick in sync (esp. when we
-    // auto-center after forward driving).
+    // web UI can keep its camera joystick in sync.
     let mut cur_pan: f32 = 90.0;
     let mut cur_tilt: f32 = 90.0;
 
@@ -124,16 +367,8 @@ pub fn run(
         // ── Command queue ──────────────────────────────────────────────────────
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                Command::ExploreStart => {
-                    info!("hw: exploration started");
-                    explore_stop.store(false, Ordering::Relaxed);
-                    explore_active = true;
-                    is_driving = false;
-                }
                 Command::Stop => {
-                    info!("hw: stop command — cancelling exploration");
-                    explore_active = false;
-                    explore_stop.store(true, Ordering::Relaxed);
+                    info!("hw: stop command");
                     obstacle_lock = false; // explicit stop always clears lock
                     motor_left = 0;
                     motor_right = 0;
@@ -143,11 +378,6 @@ pub fn run(
                     is_driving = false;
                 }
                 Command::SetMotors { left, right } => {
-                    if explore_active {
-                        info!("hw: manual drive — cancelling exploration");
-                    }
-                    explore_active = false;
-                    explore_stop.store(true, Ordering::Relaxed);
                     // Any backward component unlocks the obstacle stop
                     if left < 0 || right < 0 {
                         obstacle_lock = false;
@@ -170,58 +400,18 @@ pub fn run(
                 Command::SetPan(a) => {
                     car.pan_tilt().set_pan(a).ok();
                     cur_pan = a;
-                    pan_auto_centered = false;
-                    fwd_travel_est = 0.0;
                 }
                 Command::SetTilt(a) => {
                     car.pan_tilt().set_tilt(a).ok();
                     cur_tilt = a;
-                    pan_auto_centered = false;
-                    fwd_travel_est = 0.0;
                 }
-                Command::SetLed { r, g, b } => {
-                    car.leds.set_all(r, g, b);
-                    car.leds.show().ok();
-                }
-                Command::LedOff => {
-                    car.leds.clear().ok();
-                }
-                Command::Buzzer(on) => {
-                    if on {
-                        car.buzzer.on()
-                    } else {
-                        car.buzzer.off()
-                    }
+                Command::Express => {
+                    play_expression(&mut car);
                 }
                 Command::SetSensors(cfg) => {
                     config = cfg;
                 }
-                Command::Scan => {
-                    let noop = AtomicBool::new(false);
-                    let rays = explore::do_scan(&mut car, &noop);
-                    map.write().unwrap().integrate_scan(&rays);
-                }
             }
-        }
-
-        // ── Exploration loop ───────────────────────────────────────────────────
-        if explore_active {
-            sensors.write().unwrap().explore_state = "scanning".into();
-            let status = explore::tick(&mut car, &map, &explore_stop);
-            info!("explore: tick → {status}");
-            {
-                let mut snap = sensors.write().unwrap();
-                snap.explore_state = status.to_string();
-                let v = car.battery_v().unwrap_or(snap.battery_v);
-                snap.battery_v = v;
-                snap.battery_pct = battery_pct(v);
-            }
-            if status == explore::Status::Complete || explore_stop.load(Ordering::Relaxed) {
-                info!("explore: stopped (status={status})");
-                explore_active = false;
-                explore_stop.store(false, Ordering::Relaxed);
-            }
-            continue; // skip normal sensor poll + sleep
         }
 
         // ── Normal sensor poll ────────────────────────────────────────────────
@@ -271,26 +461,9 @@ pub fn run(
         }
         obstacle_lock = decision.lock;
 
-        // Auto-center pan when sustained forward motion detected.
-        // Ensures US sensor faces forward for collision detection.
-        if let Some(inc) = fwd_travel_step(motor_left, motor_right) {
-            fwd_travel_est += inc;
-            if fwd_travel_est > AUTOCENTER_TRAVEL_CM && !pan_auto_centered {
-                let mut pt = car.pan_tilt();
-                pt.set_pan(90.0).ok();
-                pt.set_tilt(90.0).ok();
-                cur_pan = 90.0;
-                cur_tilt = 90.0;
-                pan_auto_centered = true;
-                info!(
-                    "hw: auto-centered pan+tilt after ~{:.0}cm forward travel",
-                    fwd_travel_est
-                );
-            }
-        } else {
-            fwd_travel_est = 0.0;
-            pan_auto_centered = false;
-        }
+        // The bracket is kept forward by the web UI's spring-back camera
+        // joystick (re-centers pan/tilt on release), so the supervisor no
+        // longer estimates forward travel to auto-center it here.
 
         let battery_pct = battery_pct(battery_v);
         info!("bat: {battery_v:.3} V  {battery_pct}%");
@@ -304,7 +477,6 @@ pub fn run(
             ttc_s,
             pan: cur_pan,
             tilt: cur_tilt,
-            explore_state: "idle".into(),
             camera_fps: 0.0, // filled by SSE handler
             exposure_us: 0,  // filled by SSE handler
             gain: 0.0,       // filled by SSE handler
@@ -370,17 +542,5 @@ mod tests {
     fn collision_lock_persists_when_distance_unknown() {
         let d = collision_step(false, None, true);
         assert!(d.lock);
-    }
-
-    #[test]
-    fn fwd_travel_only_counts_strong_forward() {
-        assert!(fwd_travel_step(0, 0).is_none());
-        assert!(fwd_travel_step(1000, 1000).is_none()); // below threshold
-        assert!(fwd_travel_step(3000, 1000).is_none()); // one wheel too slow
-        // The web UI drives forward at exactly DUTY = 2000; that must
-        // accumulate travel (regression guard for the auto-center bug).
-        assert!(fwd_travel_step(2000, 2000).is_some());
-        let inc = fwd_travel_step(4095, 4095).unwrap();
-        assert!((inc - MAX_SPEED_CMS * POLL_DT_S).abs() < 1e-3);
     }
 }

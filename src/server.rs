@@ -1,11 +1,11 @@
 //! HTTP server: axum router, shared state, and route handlers.
 //!
 //! Pure transport — every request is translated into a [`Command`] for
-//! the supervisor or a read of shared telemetry/map state.
+//! the supervisor or a read of shared telemetry.
 
 use std::{
     convert::Infallible,
-    sync::{Arc, RwLock, atomic::AtomicBool, atomic::Ordering},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -25,9 +25,8 @@ use log::warn;
 use tokio::sync::mpsc;
 
 use crate::{
-    api::{AngleBody, BuzzerBody, Command, DriveBody, LedBody, SensorConfig, SensorSnapshot},
+    api::{AngleBody, Command, DriveBody, SensorConfig, SensorSnapshot},
     camera::Camera,
-    robot::map::Map,
     video::webrtc,
 };
 
@@ -40,8 +39,6 @@ pub struct AppState {
     pub cmd_tx: mpsc::Sender<Command>,
     pub sensors: Arc<RwLock<SensorSnapshot>>,
     pub camera: Arc<Camera>,
-    pub map: Arc<RwLock<Map>>,
-    pub explore_stop: Arc<AtomicBool>,
 }
 
 /// Build the router and serve forever on `0.0.0.0:8080`.
@@ -54,16 +51,8 @@ pub async fn serve(state: AppState) {
         .route("/api/stop", post(stop_car))
         .route("/api/pan", post(pan))
         .route("/api/tilt", post(tilt))
-        .route("/api/led", post(led))
-        .route("/api/led/off", post(led_off))
-        .route("/api/buzzer", post(buzzer))
+        .route("/api/express", post(express))
         .route("/api/sensors/config", post(sensor_config))
-        .route("/api/scan", post(trigger_scan))
-        .route("/api/explore/start", post(explore_start))
-        .route("/api/explore/stop", post(explore_stop_handler))
-        .route("/api/map", get(map_meta))
-        .route("/api/map/png", get(map_png))
-        .route("/api/map/ascii", get(map_ascii))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -146,74 +135,12 @@ async fn tilt(State(st): State<AppState>, Json(b): Json<AngleBody>) -> StatusCod
     StatusCode::OK
 }
 
-async fn led(State(st): State<AppState>, Json(b): Json<LedBody>) -> StatusCode {
-    st.cmd_tx
-        .send(Command::SetLed {
-            r: b.r,
-            g: b.g,
-            b: b.b,
-        })
-        .await
-        .ok();
-    StatusCode::OK
-}
-
-async fn led_off(State(st): State<AppState>) -> StatusCode {
-    st.cmd_tx.send(Command::LedOff).await.ok();
-    StatusCode::OK
-}
-
-async fn buzzer(State(st): State<AppState>, Json(b): Json<BuzzerBody>) -> StatusCode {
-    st.cmd_tx.send(Command::Buzzer(b.on)).await.ok();
+async fn express(State(st): State<AppState>) -> StatusCode {
+    st.cmd_tx.send(Command::Express).await.ok();
     StatusCode::OK
 }
 
 async fn sensor_config(State(st): State<AppState>, Json(b): Json<SensorConfig>) -> StatusCode {
     st.cmd_tx.send(Command::SetSensors(b)).await.ok();
     StatusCode::OK
-}
-
-// ── Scan & exploration endpoints ──────────────────────────────────────────────
-
-async fn trigger_scan(State(st): State<AppState>) -> StatusCode {
-    st.cmd_tx.send(Command::Scan).await.ok();
-    StatusCode::OK
-}
-
-async fn explore_start(State(st): State<AppState>) -> StatusCode {
-    st.explore_stop.store(false, Ordering::Relaxed);
-    st.cmd_tx.send(Command::ExploreStart).await.ok();
-    StatusCode::OK
-}
-
-async fn explore_stop_handler(State(st): State<AppState>) -> StatusCode {
-    st.explore_stop.store(true, Ordering::Relaxed);
-    // Also queue Stop so motors are halted immediately after the current tick exits
-    st.cmd_tx.send(Command::Stop).await.ok();
-    StatusCode::OK
-}
-
-// ── Map endpoints ─────────────────────────────────────────────────────────────
-
-async fn map_meta(State(st): State<AppState>) -> impl IntoResponse {
-    Json(st.map.read().unwrap().meta())
-}
-
-async fn map_png(State(st): State<AppState>) -> Response {
-    let png = tokio::task::spawn_blocking(move || st.map.read().unwrap().render_png())
-        .await
-        .unwrap();
-    (
-        [
-            (header::CONTENT_TYPE, "image/png"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        png,
-    )
-        .into_response()
-}
-
-async fn map_ascii(State(st): State<AppState>) -> impl IntoResponse {
-    let ascii = st.map.read().unwrap().to_ascii();
-    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], ascii)
 }

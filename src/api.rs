@@ -28,7 +28,6 @@ pub struct SensorSnapshot {
     pub ttc_s: Option<f32>, // estimated seconds to collision (None = not closing)
     pub pan: f32,           // current pan-bracket angle, degrees (UI joystick sync)
     pub tilt: f32,          // current tilt-bracket angle, degrees
-    pub explore_state: String,
     pub camera_fps: f32,
     pub exposure_us: i32,
     pub gain: f32,
@@ -50,7 +49,6 @@ impl SensorSnapshot {
             ttc_s: None,
             pan: 90.0,
             tilt: 90.0,
-            explore_state: "idle".into(),
             camera_fps: 0.0,
             exposure_us: 8_000,
             gain: 8.0,
@@ -81,16 +79,16 @@ impl Default for SensorConfig {
 
 /// A request from the web layer to the robot supervisor (hardware thread).
 pub enum Command {
-    SetMotors { left: i32, right: i32 },
+    SetMotors {
+        left: i32,
+        right: i32,
+    },
     Stop,
     SetPan(f32),
     SetTilt(f32),
-    SetLed { r: u8, g: u8, b: u8 },
-    LedOff,
-    Buzzer(bool),
+    /// Play a short randomized synchronized LED + buzzer "expression".
+    Express,
     SetSensors(SensorConfig),
-    Scan,
-    ExploreStart,
 }
 
 // ── Request bodies ────────────────────────────────────────────────────────────
@@ -104,16 +102,4 @@ pub struct DriveBody {
 #[derive(Deserialize)]
 pub struct AngleBody {
     pub angle: f32,
-}
-
-#[derive(Deserialize)]
-pub struct LedBody {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-}
-
-#[derive(Deserialize)]
-pub struct BuzzerBody {
-    pub on: bool,
 }
