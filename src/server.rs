@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use crate::{
     api::{AngleBody, Command, DriveBody, SensorConfig, SensorSnapshot},
     camera::Camera,
-    slam::SlamSnapshot,
+    slam::{MapSnapshot, SlamSnapshot},
     video::webrtc,
 };
 
@@ -41,6 +41,7 @@ pub struct AppState {
     pub sensors: Arc<RwLock<SensorSnapshot>>,
     pub camera: Arc<Camera>,
     pub slam: Arc<RwLock<SlamSnapshot>>,
+    pub map: Arc<RwLock<MapSnapshot>>,
 }
 
 /// Build the router and serve forever on `0.0.0.0:8080`.
@@ -120,10 +121,11 @@ async fn slam_stream(
 }
 
 /// Top-down map (poses + points) for the WebUI canvas. **M2 stub:**
-/// returns an empty map so the transport + canvas exist now; M3's
-/// two-view init is the first thing that fills it.
-async fn slam_map() -> impl IntoResponse {
-    Json(serde_json::json!({ "poses": [], "points": [] }))
+/// Top-down map (two-view bootstrap) for the WebUI canvas: triangulated
+/// points + the two camera centres, or an init-status string while
+/// parallax accumulates.
+async fn slam_map(State(st): State<AppState>) -> impl IntoResponse {
+    Json(st.map.read().unwrap().clone())
 }
 
 // ── WebRTC signalling ─────────────────────────────────────────────────────────

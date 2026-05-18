@@ -9,7 +9,7 @@ use ginger_rs::{
     camera::Camera,
     robot::supervisor,
     server::{self, AppState},
-    slam::{self, SlamSnapshot},
+    slam::{self, MapSnapshot, SlamSnapshot},
 };
 
 #[tokio::main]
@@ -32,11 +32,12 @@ async fn main() {
     println!("Camera ready.");
 
     let slam = Arc::new(RwLock::new(SlamSnapshot::initial()));
+    let map = Arc::new(RwLock::new(MapSnapshot::initial()));
     {
-        let (camera, slam) = (camera.clone(), slam.clone());
+        let (camera, slam, map) = (camera.clone(), slam.clone(), map.clone());
         thread::Builder::new()
             .name("slam".into())
-            .spawn(move || slam::run(camera, slam))
+            .spawn(move || slam::run(camera, slam, map))
             .expect("spawn slam thread");
     }
 
@@ -45,6 +46,7 @@ async fn main() {
         sensors,
         camera,
         slam,
+        map,
     })
     .await;
 }

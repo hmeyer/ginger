@@ -1,13 +1,16 @@
 //! Visual SLAM frontend (ORB-SLAM-style), built up in milestones.
 //!
-//! **M1 (current): FAST + oriented BRIEF.** A dedicated thread consumes
-//! the camera independently of the H.264/WebRTC path, builds a grayscale
-//! scale pyramid, runs FAST-9 per level with non-maximal suppression and
-//! a grid-spread cap, computes an intensity-centroid orientation and a
-//! steered 256-bit BRIEF descriptor per keypoint, brute-force matches
-//! against the previous frame, and publishes a compact [`SlamSnapshot`]
-//! (points + match lines) for the WebUI to draw live. Later milestones
-//! add two-view init, local-map tracking, local BA and loop closing.
+//! **M3 (current): two-view monocular initialization.** A dedicated
+//! thread consumes the camera independently of the H.264/WebRTC path,
+//! builds a grayscale scale pyramid, runs FAST-9 per level (NMS +
+//! grid-spread cap), computes intensity-centroid orientation + a steered
+//! 256-bit BRIEF descriptor, and matches frames. Against an anchor
+//! frame it accumulates parallax and, once well-conditioned, runs the
+//! calibrated [`ginger_slam_core::twoview`] initializer (essential /
+//! homography → relative pose + triangulated points), publishing a
+//! [`SlamSnapshot`] (live overlay) and a [`MapSnapshot`] (top-down map).
+//! Later milestones add local-map tracking (M4), local BA + keyframes
+//! (M5) and loop closing (M6).
 
 pub mod brief;
 pub mod fast;
@@ -20,8 +23,20 @@ use ginger_slam_core::intrinsics::Intrinsics;
 use log::{info, warn};
 use serde::Serialize;
 
+use ginger_slam_core::camera::CameraModel;
+use ginger_slam_core::twoview::{self, InitOptions};
+use nalgebra::Vector2;
+
 use crate::camera::Camera;
 use image::{GrayImage, build_pyramid, gray_from_yuyv};
+
+// Two-view initialization gates: enough matches against the anchor
+// frame, and enough median pixel parallax (fraction of image width) so
+// the geometry is well-conditioned. Below the floor the anchor is stale
+// (scene changed) and is reset to the current frame.
+const INIT_MIN_MATCHES: usize = 80;
+const INIT_MIN_DISP_FRAC: f32 = 0.04;
+const ANCHOR_RESET_MATCHES: usize = 25;
 
 /// Where an operator-supplied calibration is read from, if present.
 /// Absent → the rev 1.3 FOV-derived prior (`verified = false`).
@@ -332,17 +347,65 @@ pub fn detect_features(
     (points, descs, n_total, st)
 }
 
+// ── Initial map (two-view) ────────────────────────────────────────────────────
+
+/// The monocular bootstrap result, polled by `GET /api/slam/map` and
+/// drawn as a top-down (x, z) plot. Scale is arbitrary (monocular), so
+/// the WebUI auto-fits the bounding box.
+#[derive(Clone, Serialize)]
+pub struct MapSnapshot {
+    /// Human-readable init state for the WebUI.
+    pub status: String,
+    /// `"essential"`, `"homography"`, or empty before init.
+    pub model: String,
+    /// Triangulated points, top-down `(x, z)`, view-1 frame.
+    pub points: Vec<[f32; 2]>,
+    /// Camera centres, top-down `(x, z)`: `[cam1, cam2]`.
+    pub cameras: Vec<[f32; 2]>,
+    pub n_points: u32,
+    /// Homography-vs-essential selection ratio of the solved model.
+    pub r_h: f32,
+}
+
+impl MapSnapshot {
+    pub fn initial() -> Self {
+        Self {
+            status: "waiting for an anchor frame".into(),
+            model: String::new(),
+            points: Vec::new(),
+            cameras: Vec::new(),
+            n_points: 0,
+            r_h: 0.0,
+        }
+    }
+}
+
+/// Pixel → calibrated/normalized image point (undistort, then `K⁻¹`).
+fn calib_norm(cam: &CameraModel, x: u16, y: u16) -> Vector2<f64> {
+    let ud = cam.undistort_point(&Vector2::new(x as f64, y as f64));
+    Vector2::new((ud.x - cam.cx) / cam.fx, (ud.y - cam.cy) / cam.fy)
+}
+
 // ── Frontend thread ───────────────────────────────────────────────────────────
 
 /// Own a dedicated thread: pull frames (independently of the video
 /// encoder), detect features, and publish into `snapshot`.
-pub fn run(camera: Arc<Camera>, snapshot: Arc<RwLock<SlamSnapshot>>) {
+pub fn run(
+    camera: Arc<Camera>,
+    snapshot: Arc<RwLock<SlamSnapshot>>,
+    map: Arc<RwLock<MapSnapshot>>,
+) {
     let mut detect_ms = 0.0f32;
     let mut fps = 0.0f32;
     let mut stages = StageMs::default();
     let mut frame_n: u64 = 0;
     let mut last = Instant::now();
     let mut prev: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)> = None;
+    // Two-view bootstrap: an anchor frame to accumulate parallax
+    // against; one-shot for M3 (M4 takes over tracking once a map
+    // exists).
+    let mut anchor: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)> = None;
+    let mut initialized = false;
     // Resolved once from the first frame's resolution (the libcamera
     // ViewFinder mode is full-FOV, so the FOV-derived prior is
     // resolution-agnostic — no need to query libcamera properties).
@@ -400,6 +463,87 @@ pub fn run(camera: Arc<Camera>, snapshot: Arc<RwLock<SlamSnapshot>>) {
             None => Vec::new(),
         };
         stage.matching = ms(tm.elapsed());
+
+        // Two-view bootstrap (one-shot): accumulate parallax against an
+        // anchor frame, then run the calibrated initializer.
+        if !initialized && let Some(intr) = intrinsics.as_ref() {
+            let mut want_anchor = false;
+            if let Some((apts, adesc)) = anchor.as_ref() {
+                let mm = brief::match_descriptors(adesc, &descs);
+                if mm.len() >= INIT_MIN_MATCHES {
+                    let mut disp: Vec<f32> = mm
+                        .iter()
+                        .map(|&(ia, ib)| {
+                            let a = apts[ia as usize];
+                            let b = points[ib as usize];
+                            let dx = a.x as f32 - b.x as f32;
+                            let dy = a.y as f32 - b.y as f32;
+                            (dx * dx + dy * dy).sqrt()
+                        })
+                        .collect();
+                    disp.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                    let med = disp[disp.len() / 2];
+                    let min_disp = gray.width as f32 * INIT_MIN_DISP_FRAC;
+                    if med >= min_disp {
+                        let cam = intr.to_camera_model();
+                        let corrs: Vec<twoview::Corr> = mm
+                            .iter()
+                            .map(|&(ia, ib)| {
+                                let a = apts[ia as usize];
+                                let b = points[ib as usize];
+                                (calib_norm(&cam, a.x, a.y), calib_norm(&cam, b.x, b.y))
+                            })
+                            .collect();
+                        if let Some(tv) = twoview::initialize(&corrs, InitOptions::default()) {
+                            // cam1 at the origin; cam2 centre = -Rᵀt.
+                            let c2 = -(tv.r.transpose() * tv.t);
+                            let pts2d: Vec<[f32; 2]> = tv
+                                .points
+                                .iter()
+                                .filter(|p| p.z > 0.0 && p.z.is_finite())
+                                .map(|p| [p.x as f32, p.z as f32])
+                                .collect();
+                            let model = match tv.model {
+                                twoview::Model::Essential => "essential",
+                                twoview::Model::Homography => "homography",
+                            };
+                            let n = pts2d.len() as u32;
+                            if let Ok(mut m) = map.write() {
+                                *m = MapSnapshot {
+                                    status: format!("initialized: {n} pts via {model}"),
+                                    model: model.into(),
+                                    points: pts2d,
+                                    cameras: vec![[0.0, 0.0], [c2.x as f32, c2.z as f32]],
+                                    n_points: n,
+                                    r_h: tv.r_h as f32,
+                                };
+                            }
+                            info!(
+                                "slam: two-view init OK — {n} pts, model={model}, \
+                                 R_H={:.2}, matches={}",
+                                tv.r_h,
+                                mm.len()
+                            );
+                            initialized = true;
+                        }
+                    } else if let Ok(mut m) = map.write() {
+                        m.status =
+                            format!("parallax {med:.0}/{min_disp:.0}px · {} matches", mm.len());
+                    }
+                } else if mm.len() < ANCHOR_RESET_MATCHES {
+                    want_anchor = true;
+                }
+            } else {
+                want_anchor = true;
+            }
+            if want_anchor && !initialized {
+                anchor = Some((points.clone(), descs.clone()));
+                if let Ok(mut m) = map.write() {
+                    m.status = "anchor set — translate sideways for parallax".into();
+                }
+            }
+        }
+
         prev = Some((points.clone(), descs));
 
         let elapsed = t0.elapsed().as_secs_f32() * 1000.0;
