@@ -135,8 +135,11 @@ slam-core retrieval primitive started; the rest is built on it.
   elimination + companion-matrix roots) + RANSAC, polished by the
   tested motion-only BA; reuses `tracking::Observation`. The recovery
   solver for relocalization / loop verification.
-- **M6-1c ⏭** Sim3 `lie` exp/log + Sim3 alignment + Essential-graph
-  pose-graph optimization (monocular scale drift); optional global BA.
+- **M6-1c ✅** `sim3`: Sim(3) group (`exp`/`log` Strasdat closed form,
+  inverse/compose/action), `sim3_align` (closed-form Umeyama similarity
+  with scale), and `optimize_pose_graph` (LM over relative-Sim3
+  residuals, gauge-fixed) — closes a detected loop + absorbs monocular
+  scale drift.
 - **M6-2 ⏭** frontend wiring: relocalize on track loss (BoW candidates
   → guided match → PnP-RANSAC); per-keyframe BoW added on insertion;
   loop detection (query DB minus covisible/recent) → Sim3 verify →
@@ -154,7 +157,8 @@ markers (orange squares).
 ## Sequencing & risks
 
 - **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
-  **M6 (in progress: M6-1a BoW ✅, M6-1b PnP ✅)**.
+  **M6 (in progress: M6-1a BoW ✅, M6-1b PnP ✅, M6-1c Sim3 ✅;
+  M6-2 wiring next)**.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing
