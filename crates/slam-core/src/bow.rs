@@ -108,7 +108,7 @@ fn kmeans_pp(descs: &[Descriptor], k: usize, rng: &mut Rng) -> Vec<Descriptor> {
 /// One vocabulary-tree node. Internal nodes route by nearest `centre`;
 /// leaves are *visual words* carrying a stable `word` id and its IDF
 /// `weight` (set after the tree is built, from the training corpus).
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Node {
     centre: Descriptor,
     children: Vec<u32>,
@@ -119,11 +119,16 @@ struct Node {
 /// A trained visual vocabulary (the offline asset). Maps any descriptor
 /// to a word in `O(depth)` Hamming compares (tree descent) and an image
 /// to a TF-IDF [`BowVector`].
+#[derive(PartialEq)]
 pub struct Vocabulary {
     nodes: Vec<Node>,
     /// Leaf node index per word id.
     words: Vec<u32>,
 }
+
+/// `to_bytes`/`from_bytes` container tag (`"GBOW"` + format version).
+const VOCAB_MAGIC: [u8; 4] = *b"GBOW";
+const VOCAB_VERSION: u8 = 1;
 
 /// Lloyd refinement cap (binary k-means converges in a handful of passes;
 /// the bound also guarantees termination on pathological data).
@@ -306,14 +311,28 @@ impl Vocabulary {
     /// TF-IDF, L1-normalized [`BowVector`] for one image's descriptors
     /// (sorted by word id; empty for an empty image or empty vocab).
     pub fn transform(&self, image: &[Descriptor]) -> BowVector {
+        self.transform_indexed(image).0
+    }
+
+    /// Like [`transform`](Self::transform) but also returns the **direct
+    /// index**: the leaf word each input feature fell into (`None` if
+    /// the vocab is empty), in input order. Grouping the two images'
+    /// features by shared word turns cross-image descriptor matching
+    /// from brute force into a per-word guided match — what
+    /// relocalization / loop verification use after a BoW hit. One tree
+    /// descent per feature (no extra cost over `transform`).
+    pub fn transform_indexed(&self, image: &[Descriptor]) -> (BowVector, Vec<Option<u32>>) {
         if image.is_empty() || self.is_empty() {
-            return BowVector(Vec::new());
+            return (BowVector(Vec::new()), vec![None; image.len()]);
         }
+        let mut per_feat = Vec::with_capacity(image.len());
         let mut tf: HashMap<u32, f64> = HashMap::new();
         for d in image {
-            if let Some(w) = self.word_of(d) {
+            let w = self.word_of(d);
+            if let Some(w) = w {
                 *tf.entry(w).or_insert(0.0) += 1.0;
             }
+            per_feat.push(w);
         }
         let total = image.len() as f64;
         let mut v: Vec<(u32, f64)> = tf
@@ -331,7 +350,89 @@ impl Vocabulary {
             }
         }
         v.sort_by_key(|&(w, _)| w);
-        BowVector(v)
+        (BowVector(v), per_feat)
+    }
+
+    /// Serialize to a compact, self-describing binary blob (magic +
+    /// version + the tree) so a vocabulary trained offline can be
+    /// shipped/loaded as a static asset. No external deps.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&VOCAB_MAGIC);
+        b.push(VOCAB_VERSION);
+        b.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
+        for n in &self.nodes {
+            b.extend_from_slice(&n.centre);
+            b.extend_from_slice(&n.weight.to_le_bytes());
+            match n.word {
+                Some(w) => {
+                    b.push(1);
+                    b.extend_from_slice(&w.to_le_bytes());
+                }
+                None => b.push(0),
+            }
+            b.extend_from_slice(&(n.children.len() as u32).to_le_bytes());
+            for &c in &n.children {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        b.extend_from_slice(&(self.words.len() as u32).to_le_bytes());
+        for &w in &self.words {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        b
+    }
+
+    /// Inverse of [`to_bytes`](Self::to_bytes); `None` on a bad magic /
+    /// version / truncated or inconsistent blob.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        let mut p = 0usize;
+        let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
+            let s = data.get(*p..*p + n)?;
+            *p += n;
+            Some(s)
+        };
+        let u32_at = |p: &mut usize| -> Option<u32> {
+            Some(u32::from_le_bytes(take(p, 4)?.try_into().ok()?))
+        };
+        if take(&mut p, 4)? != VOCAB_MAGIC || take(&mut p, 1)?[0] != VOCAB_VERSION {
+            return None;
+        }
+        let n_nodes = u32_at(&mut p)? as usize;
+        let mut nodes = Vec::with_capacity(n_nodes);
+        for _ in 0..n_nodes {
+            let centre: Descriptor = take(&mut p, 32)?.try_into().ok()?;
+            let weight = f64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
+            let word = match take(&mut p, 1)?[0] {
+                0 => None,
+                1 => Some(u32_at(&mut p)?),
+                _ => return None,
+            };
+            let n_ch = u32_at(&mut p)? as usize;
+            let mut children = Vec::with_capacity(n_ch);
+            for _ in 0..n_ch {
+                children.push(u32_at(&mut p)?);
+            }
+            nodes.push(Node {
+                centre,
+                children,
+                word,
+                weight,
+            });
+        }
+        let n_words = u32_at(&mut p)? as usize;
+        let mut words = Vec::with_capacity(n_words);
+        for _ in 0..n_words {
+            words.push(u32_at(&mut p)?);
+        }
+        // Structural sanity: every child / word index in range.
+        let nn = nodes.len() as u32;
+        if nodes.iter().any(|n| n.children.iter().any(|&c| c >= nn))
+            || words.iter().any(|&w| w >= nn)
+        {
+            return None;
+        }
+        Some(Self { nodes, words })
     }
 }
 
@@ -566,5 +667,60 @@ mod tests {
         db.add(v.transform(&image_of(&p, 0, 3, 1)));
         assert!(db.query(&BowVector::default(), 5, |_| false).is_empty());
         assert_eq!(BowVector::default().score(&BowVector::default()), 0.0);
+    }
+
+    #[test]
+    fn serialize_roundtrips_and_rejects_garbage() {
+        let p = corpus(9);
+        let v = vocab(&p);
+        let bytes = v.to_bytes();
+        let w = Vocabulary::from_bytes(&bytes).expect("decoded");
+        // Structurally identical …
+        assert!(w == v, "vocab struct differs after round-trip");
+        // … and behaviourally identical on fresh inputs.
+        for place in [0usize, 3, 7] {
+            let img = image_of(&p, place, 4, 500 + place as u64);
+            assert_eq!(v.transform(&img), w.transform(&img));
+            assert_eq!(v.transform_indexed(&img).1, w.transform_indexed(&img).1);
+        }
+        // Bad magic / version / truncation → None, never a panic.
+        assert!(Vocabulary::from_bytes(&[]).is_none());
+        assert!(Vocabulary::from_bytes(b"NOPEx").is_none());
+        let mut bad = bytes.clone();
+        bad[4] = 99; // version
+        assert!(Vocabulary::from_bytes(&bad).is_none());
+        assert!(Vocabulary::from_bytes(&bytes[..bytes.len() - 3]).is_none());
+        // Empty vocab also round-trips.
+        let e = Vocabulary::build(&[], 4, 3, 1);
+        assert!(Vocabulary::from_bytes(&e.to_bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn direct_index_groups_features_by_word() {
+        let p = corpus(8);
+        let v = vocab(&p);
+        let img = image_of(&p, 1, 6, 77);
+        let (bv, per_feat) = v.transform_indexed(&img);
+        assert_eq!(per_feat.len(), img.len());
+        // The transform's words are exactly the distinct direct-index
+        // words (consistency between the two outputs).
+        let mut from_idx: Vec<u32> = per_feat.iter().flatten().copied().collect();
+        from_idx.sort_unstable();
+        from_idx.dedup();
+        let mut from_vec: Vec<u32> = bv.as_slice().iter().map(|&(w, _)| w).collect();
+        from_vec.sort_unstable();
+        assert_eq!(from_idx, from_vec);
+        // Guided match: two views of the same place share words, so
+        // grouping by word pairs most features (cheap vs all-pairs).
+        let a = image_of(&p, 4, 6, 1);
+        let b = image_of(&p, 4, 6, 2);
+        let wa = v.transform_indexed(&a).1;
+        let wb = v.transform_indexed(&b).1;
+        let shared = wa
+            .iter()
+            .flatten()
+            .filter(|w| wb.iter().flatten().any(|x| x == *w))
+            .count();
+        assert!(shared >= a.len() / 2, "weak word overlap: {shared}");
     }
 }

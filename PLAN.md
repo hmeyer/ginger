@@ -146,25 +146,30 @@ into the live `Frontend` + decoupled `LocalMapper` so a lost track
 recovers and a revisited place straightens the map. Broken into five
 testable sub-steps:
 
-- **M6-2a ⏭ — vocabulary lifecycle + direct index** (`bow`, the M6-1a
-  deferrals). Add `Vocabulary` (de)serialization (compact binary
-  `to_bytes`/`from_bytes`, no new deps) and a `VocabSource` policy
-  mirroring the `slam.toml` intrinsics pattern: load a shipped
-  `slam_vocab.bin` if present, else **deterministically self-train once**
-  from the pooled descriptors of the first `N_VOCAB_KF` keyframes (no
-  external asset needed for headless/CI). Add the **direct index**
-  (word → that image's feature indices, at a fixed tree level) so a BoW
-  hit yields cheap *guided* descriptor matching instead of brute force.
-  Tests: serde round-trip equality, self-train determinism, guided-match
-  recall vs brute force.
-- **M6-2b ⏭ — place-recognition database in the pipeline.** A shared
+- **M6-2a ✅ — `bow` deferrals: serialization + direct index.**
+  `Vocabulary::to_bytes`/`from_bytes` — a compact, self-describing
+  binary blob (magic + version, structural validation, no new deps) so
+  an offline-trained vocabulary can ship as a static asset.
+  `transform_indexed` returns the **direct index** (the leaf word each
+  input feature fell into, in order) alongside the `BowVector`, one tree
+  descent per feature; grouping two images' features by shared word
+  turns post-BoW cross-image matching from brute force into a guided
+  per-word match. Tests: struct + behavioural round-trip, garbage/
+  version/truncation rejection, direct-index ↔ `BowVector` consistency
+  and word-overlap recall. (The load-or-self-train `VocabSource` policy
+  is frontend wiring → M6-2b.)
+- **M6-2b ⏭ — vocabulary source + place-recognition database.** A
+  `VocabSource` mirroring the `slam.toml` intrinsics pattern: load a
+  shipped `slam_vocab.bin` (`Vocabulary::from_bytes`) if present, else
+  **deterministically self-train once** (`Vocabulary::build`) from the
+  pooled raw descriptors of the first `N_VOCAB_KF` keyframes — no
+  external asset needed for headless/CI. A shared
   `Arc<Mutex<bow::Database>>` + `Arc<RwLock<Option<Vocabulary>>>`
   reachable by both the tracking thread (relocalize) and the
   `LocalMapper` (loop detect). On keyframe insertion the mapper computes
-  the keyframe's `BowVector` (+ direct index over its stored raw
-  features) and adds it to the DB, keyed by keyframe id. Once
-  `N_VOCAB_KF` keyframes exist and no vocab was shipped, self-train and
-  back-fill BoW for existing keyframes.
+  the keyframe's `BowVector` (via `transform_indexed`) and adds it to the
+  DB keyed by keyframe id; when the vocab becomes ready it back-fills BoW
+  for existing keyframes.
 - **M6-2c ⏭ — relocalization on track loss.** Add `Stage::Lost { since
   }` (the planned `Stage` extension). After a short run of failed
   tracks: BoW-query the DB for the current frame → for the top
@@ -227,7 +232,7 @@ markers (orange squares).
 
 - **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
   **M6 (in progress: M6-1a BoW ✅, M6-1b PnP ✅, M6-1c Sim3 ✅;
-  M6-2 wiring next — sub-steps a→e)**.
+  M6-2 wiring in progress — M6-2a ✅; b→e next)**.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing
