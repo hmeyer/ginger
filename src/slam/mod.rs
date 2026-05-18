@@ -1,16 +1,15 @@
 //! Visual SLAM frontend (ORB-SLAM-style), built up in milestones.
 //!
-//! **M3 (current): two-view monocular initialization.** A dedicated
-//! thread consumes the camera independently of the H.264/WebRTC path,
-//! builds a grayscale scale pyramid, runs FAST-9 per level (NMS +
-//! grid-spread cap), computes intensity-centroid orientation + a steered
-//! 256-bit BRIEF descriptor, and matches frames. Against an anchor
-//! frame it accumulates parallax and, once well-conditioned, runs the
-//! calibrated [`ginger_slam_core::twoview`] initializer (essential /
-//! homography → relative pose + triangulated points), publishing a
-//! [`SlamSnapshot`] (live overlay) and a [`MapSnapshot`] (top-down map).
-//! Later milestones add local-map tracking (M4), local BA + keyframes
-//! (M5) and loop closing (M6).
+//! **M4 (current): live tracking.** A dedicated thread consumes the
+//! camera independently of the H.264/WebRTC path, builds a grayscale
+//! pyramid, runs FAST-9 per level (NMS + grid-spread cap), computes
+//! intensity-centroid orientation + a steered 256-bit BRIEF descriptor,
+//! and feeds the [`Frontend`] state machine ([`Stage`]): accumulate
+//! parallax vs an anchor → two-view init ([`ginger_slam_core::twoview`])
+//! → per-frame tracking (constant-velocity + motion-only BA,
+//! [`ginger_slam_core::tracking`]), publishing a [`SlamSnapshot`] (live
+//! overlay) and a [`MapSnapshot`] (top-down trajectory + map). M5 adds
+//! keyframes / covisibility / local BA; M6 loop closing.
 
 pub mod brief;
 pub mod fast;

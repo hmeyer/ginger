@@ -6,10 +6,10 @@ ORB-SLAM pipeline on the Raspberry Pi 4. The inline roadmap stub lives in
 
 ## Where the code is today
 
-A monocular **two-view bootstrap** runs end-to-end: the frontend
-detects/matches features, accumulates parallax against an anchor frame,
-and recovers a relative pose + an initial triangulated point cloud,
-surfaced live in the WebUI. No tracking/keyframes/BA yet (M4+).
+Monocular SLAM runs end-to-end: detect → two-view bootstrap → **live
+6-DoF tracking** (constant-velocity prediction + motion-only BA),
+surfaced as a growing camera trajectory + point cloud in the WebUI. No
+keyframes / local BA / loop closing yet (M5+).
 
 - **M0** ✅ FAST-9 over an 8-level pyramid + NMS + grid-spread cap (NEON).
 - **M1** ✅ Oriented BRIEF + brute-force mutual-NN matching (Lowe ratio).
@@ -17,8 +17,13 @@ surfaced live in the WebUI. No tracking/keyframes/BA yet (M4+).
   camera + headless replay/CI.
 - **M3** ✅ Two-view initialization (essential + homography) wired into
   the live pipeline with a top-down map in the WebUI.
-- Live WebUI overlay + HUD, `slam_bench` / `slam_replay` harnesses,
-  decoupled frontend thread.
+- **M4** ✅ Tracking thread — constant-velocity model + motion-only BA
+  (Huber) re-finding map points each frame; live trajectory.
+- **M5** 🔄 Local mapping — **M5-0 done** (explicit `Stage` enum);
+  keyframes / covisibility / local BA next.
+- Testing stabilized: the pipeline state machine is a testable
+  `Frontend::on_frame` seam covered by headless `pipeline_tests`;
+  `slam_bench` / `slam_replay` harnesses; decoupled frontend thread.
 
 ## Critical gaps — resolved in M2
 
@@ -71,16 +76,23 @@ session):
 - Deferred to M5: promoting the two views to proper **keyframes** +
   covisibility (M3 yields poses + points, not a keyframe graph yet).
 
-### M4 — Tracking thread (live 6-DoF pose)
+### M4 — Tracking thread (live 6-DoF pose) ✅
 
-- Constant-velocity motion model → predicted pose.
-- Guided projection matching (search window) replacing brute-force.
-- Motion-only BA (SE3, robust Huber); reference-keyframe fallback when
-  the motion model fails.
-- **Deliverable:** live camera trajectory in the WebUI.
+- Done in `ginger_slam_core::tracking`: constant-velocity prediction +
+  motion-only BA (SE3 via `lie`, Huber on the hardened LM); behind-
+  camera points get a clamped-depth penalty.
+- Wired into `Frontend`: descriptor-match the map into each frame →
+  `Observation`s → predict → `track_pose` → append to the trajectory;
+  weak/failed solves report "tracking lost" without corrupting the map
+  (relocalization is M6).
+- **Deliverable ✅:** live camera-centre trajectory on the WebUI canvas.
+- Caveat: guided/windowed projection matching is still brute-force
+  descriptor matching against the whole map (refine in M5).
 
-### M5 — Local Mapping thread
+### M5 — Local Mapping thread 🔄
 
+- **M5-0 ✅** explicit `Stage` enum (`Bootstrapping` / `Tracking`),
+  replacing the implicit `Option` trio — sets up the new states below.
 - Keyframe insertion policy; covisibility graph + spanning tree.
 - Epipolar-guided triangulation of new map points.
 - **Local BA** over a keyframe window — the Pi 4 performance crux; runs
@@ -100,14 +112,14 @@ session):
   straighter on the canvas.
 
 **WebUI surface:** all milestones draw into the single top-down canvas
-(`/api/slam/map`, `map` overlay mode) + the `#slam-hud` line; M3 fills
-it with the bootstrap point cloud + two camera centres, M4+ extend it
-with the live trajectory and growing map.
+(`/api/slam/map`, `map` overlay mode) + the `#slam-hud` line; M3 filled
+it with the bootstrap cloud + two cameras, M4 extended it with the live
+trajectory, M5 grows the map + keyframes.
 
 ## Sequencing & risks
 
-- **Strict dependency chain:** M2 ✅ → M3 ✅ → **M4 (next)** → M5;
-  M6 last.
+- **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → **M5 (in
+  progress)** → M6 last.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing
