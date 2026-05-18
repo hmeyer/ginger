@@ -32,6 +32,7 @@ use serde::Serialize;
 
 use ginger_slam_core::camera::CameraModel;
 use ginger_slam_core::map::Map;
+use ginger_slam_core::pnp::{self, PnpOptions};
 use ginger_slam_core::tracking::{self, Observation};
 use ginger_slam_core::twoview::{self, InitOptions};
 use nalgebra::{Isometry3, Rotation3, Translation3, UnitQuaternion, Vector2, Vector3};
@@ -414,6 +415,7 @@ impl MapSnapshot {
 /// the per-frame `T_cw` trajectory (oldest first; `[0]` = view-1
 /// origin), the reference keyframe + frames since it, and the init
 /// model badge.
+#[derive(Clone)]
 struct TrackState {
     trajectory: Vec<Isometry3<f64>>,
     ref_kf: u32,
@@ -498,7 +500,19 @@ enum Stage {
     Bootstrapping { anchor: Option<FrameFeatures> },
     /// Post-init: live tracking against the shared keyframe map.
     Tracking(TrackState),
+    /// Track lost (M6-2c): per frame, BoW-query the place DB and try to
+    /// recover the pose by PnP-RANSAC against candidate keyframes' map
+    /// points; on success resume [`Stage::Tracking`] with the saved
+    /// trajectory/map context. `since` counts frames spent lost.
+    Lost { since: usize, track: TrackState },
 }
+
+/// Relocalization gates (M6-2c). Kept conservative — a false
+/// relocalization corrupts the trajectory, so favour staying lost.
+const RELOC_MAX_CAND: usize = 5;
+const RELOC_COVIS: usize = 5;
+const RELOC_MAX_PTS: usize = 1500;
+const RELOC_MIN_INLIERS: usize = 15;
 
 pub struct Frontend {
     prev: Option<FrameFeatures>,
@@ -637,8 +651,13 @@ impl Frontend {
             .as_ref()
             .map(|i| (i.to_camera_model(), i.fx))
         {
-            let mut to_tracking: Option<TrackState> = None;
-            match &mut self.stage {
+            // Own the stage for this frame so arms can move between
+            // states (Tracking⇄Lost); `next` overrides on transition,
+            // else the (possibly mutated-in-place) `stage` is kept.
+            let mut stage =
+                std::mem::replace(&mut self.stage, Stage::Bootstrapping { anchor: None });
+            let mut next: Option<Stage> = None;
+            match &mut stage {
                 Stage::Bootstrapping { anchor } => {
                     let mut want_anchor = false;
                     if let Some((apts, adesc)) = anchor.as_ref() {
@@ -755,7 +774,7 @@ impl Frontend {
                                         tv.r_h,
                                         mm.len()
                                     );
-                                    to_tracking = Some(ts);
+                                    next = Some(Stage::Tracking(ts));
                                 }
                             } else {
                                 self.map.status = format!(
@@ -769,7 +788,7 @@ impl Frontend {
                     } else {
                         want_anchor = true;
                     }
-                    if want_anchor && to_tracking.is_none() {
+                    if want_anchor && next.is_none() {
                         *anchor = Some((points.to_vec(), descs.to_vec()));
                         self.map.status = "anchor set — translate sideways for parallax".into();
                     }
@@ -884,23 +903,134 @@ impl Frontend {
                             }
                             Some(rep) => {
                                 self.map.status = format!(
-                                    "tracking weak: {}/{} inliers",
+                                    "tracking lost: weak {}/{} inliers — relocalizing",
                                     rep.n_inliers,
                                     obs.len()
                                 );
+                                next = Some(Stage::Lost {
+                                    since: 0,
+                                    track: st.clone(),
+                                });
                             }
                             None => {
-                                self.map.status = "tracking lost (solve failed)".into();
+                                self.map.status =
+                                    "tracking lost (solve failed) — relocalizing".into();
+                                next = Some(Stage::Lost {
+                                    since: 0,
+                                    track: st.clone(),
+                                });
                             }
                         }
                     } else {
-                        self.map.status = format!("tracking lost: only {} map matches", mm.len());
+                        self.map.status = format!(
+                            "tracking lost: only {} map matches — relocalizing",
+                            mm.len()
+                        );
+                        next = Some(Stage::Lost {
+                            since: 0,
+                            track: st.clone(),
+                        });
+                    }
+                }
+                Stage::Lost { since, track } => {
+                    *since += 1;
+                    // BoW place-recognition candidates for this frame.
+                    let cands = self
+                        .place
+                        .lock()
+                        .unwrap()
+                        .query(descs, RELOC_MAX_CAND, |_| false);
+                    // Gather candidate map points (pos + descriptor) from
+                    // the candidate keyframes + their covisible
+                    // neighbours, bounded.
+                    let (cpos, cdesc) = if cands.is_empty() {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        let w = self.world.lock().unwrap();
+                        let mut seen = std::collections::HashSet::new();
+                        let mut cpos: Vec<Vector3<f64>> = Vec::new();
+                        let mut cdesc: Vec<brief::Descriptor> = Vec::new();
+                        'outer: for &(kf, _) in &cands {
+                            let mut kfs = vec![kf];
+                            kfs.extend(
+                                w.covisibility(kf)
+                                    .into_iter()
+                                    .take(RELOC_COVIS)
+                                    .map(|(c, _)| c),
+                            );
+                            for k in kfs {
+                                let Some(kfr) = w.keyframe(k) else { continue };
+                                for &(pid, _) in &kfr.obs {
+                                    if seen.insert(pid)
+                                        && let Some(p) = w.point(pid)
+                                    {
+                                        cpos.push(p.pos);
+                                        cdesc.push(p.desc);
+                                        if cpos.len() >= RELOC_MAX_PTS {
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        (cpos, cdesc)
+                    };
+
+                    let mut report = None;
+                    if cdesc.len() >= RELOC_MIN_INLIERS {
+                        let pairs = brief::match_descriptors(&cdesc, descs);
+                        if pairs.len() >= RELOC_MIN_INLIERS {
+                            let obs: Vec<Observation> = pairs
+                                .iter()
+                                .map(|&(im, ic)| {
+                                    let kp = points[ic as usize];
+                                    Observation {
+                                        point: cpos[im as usize],
+                                        obs: calib_norm(&cam, kp.x, kp.y),
+                                    }
+                                })
+                                .collect();
+                            report = pnp::pnp_ransac(
+                                &obs,
+                                PnpOptions {
+                                    thresh: 5.0 / fx,
+                                    min_inliers: RELOC_MIN_INLIERS,
+                                    ..PnpOptions::default()
+                                },
+                            );
+                        }
+                    }
+
+                    if let Some(rep) = report {
+                        let mut tr = track.clone();
+                        tr.trajectory.push(rep.pose);
+                        if tr.trajectory.len() > MAX_TRAJECTORY * 2 {
+                            let drop = tr.trajectory.len() - MAX_TRAJECTORY;
+                            tr.trajectory.drain(0..drop);
+                        }
+                        let best = cands.first().map(|&(k, _)| k).unwrap_or(0);
+                        let status = format!(
+                            "relocalized: {} inliers (kf {best}, lost {} frames)",
+                            rep.n_inliers, *since
+                        );
+                        self.map = {
+                            let w = self.world.lock().unwrap();
+                            publish_map(
+                                &w,
+                                &tr.trajectory,
+                                &tr.model,
+                                tr.r_h,
+                                status,
+                                rep.n_inliers as u32,
+                            )
+                        };
+                        next = Some(Stage::Tracking(tr));
+                    } else {
+                        self.map.status = format!("relocalizing… (lost {} frames)", *since);
                     }
                 }
             }
-            if let Some(st) = to_tracking {
-                self.stage = Stage::Tracking(st);
-            }
+            self.stage = next.unwrap_or(stage);
         }
 
         self.prev = Some((points.to_vec(), descs.to_vec()));
@@ -1394,5 +1524,92 @@ mod pipeline_tests {
         );
         // Deterministic: identical query ⇒ identical top hit.
         assert_eq!(fe.place_query(&q_start, 5), hit_start);
+    }
+
+    /// M6-2c: garbage frames lose the track (no map corruption); a
+    /// recognizable frame then relocalizes via BoW + PnP-RANSAC and
+    /// tracking resumes.
+    #[test]
+    fn relocalizes_after_track_loss() {
+        let (pts, ds) = scene(220);
+        let cam = cam_model();
+        let mut fe = Frontend::new();
+        let mut good = None;
+        for i in 0..64 {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.07));
+            good = Some(step(&mut fe, &fp, &fd));
+        }
+        let good = good.unwrap();
+        assert!(
+            good.map.tracking,
+            "precondition: tracking ({})",
+            good.map.status
+        );
+        let (ready, _) = fe.place_stats();
+        assert!(ready, "vocab must be trained for relocalization");
+        let n_pts = good.map.n_points;
+        let traj = good.map.cameras.len();
+
+        // A run of pure-garbage frames → lost, and the map is *not*
+        // corrupted while lost (points + trajectory frozen).
+        let mut r = Rng(0x6105);
+        for _ in 0..4 {
+            let fd: Vec<brief::Descriptor> = (0..200)
+                .map(|_| {
+                    let mut d = [0u8; brief::DESC_BYTES];
+                    for b in d.iter_mut() {
+                        *b = r.byte();
+                    }
+                    d
+                })
+                .collect();
+            let fp: Vec<FeaturePoint> = (0..200)
+                .map(|i| FeaturePoint {
+                    x: (i % W) as u16,
+                    y: (i % H) as u16,
+                    level: 0,
+                    score: 1,
+                    angle: 0.0,
+                })
+                .collect();
+            let lost = step(&mut fe, &fp, &fd);
+            assert!(
+                lost.map.status.contains("lost") || lost.map.status.contains("relocaliz"),
+                "expected lost/relocalizing, got: {}",
+                lost.map.status
+            );
+            assert_eq!(lost.map.n_points, n_pts, "map corrupted while lost");
+            assert_eq!(lost.map.cameras.len(), traj, "trajectory grew while lost");
+        }
+
+        // A frame from a previously-mapped place → relocalize.
+        let (fp, fd) = frame(&pts, &ds, &cam, &pose(0.05));
+        let reloc = step(&mut fe, &fp, &fd);
+        assert!(
+            reloc.map.status.contains("relocalized"),
+            "did not relocalize: {}",
+            reloc.map.status
+        );
+        assert!(reloc.map.tracking);
+        // Map intact; exactly one recovered pose appended.
+        assert_eq!(
+            reloc.map.n_points, n_pts,
+            "relocalization corrupted the map"
+        );
+        assert_eq!(
+            reloc.map.cameras.len(),
+            traj + 1,
+            "recovered pose not appended"
+        );
+
+        // Tracking continues normally after recovery.
+        let (fp, fd) = frame(&pts, &ds, &cam, &pose(0.12));
+        let cont = step(&mut fe, &fp, &fd);
+        assert!(
+            cont.map.tracking,
+            "tracking did not resume: {}",
+            cont.map.status
+        );
+        assert!(cont.map.cameras.len() > traj);
     }
 }
