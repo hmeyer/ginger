@@ -56,8 +56,33 @@ jobs:
           echo "PKG_CONFIG_PATH=/opt/libcamera/lib/pkgconfig:/opt/libcamera/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=/opt/libcamera/lib:/opt/libcamera/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
 
-      - name: Install Rust linker deps
-        run: sudo apt-get install -y --no-install-recommends libclang-dev
+      # bindgen (via libcamera-sys) only needs libclang at build time,
+      # and clang-sys honours LIBCLANG_PATH. The runner already ships
+      # LLVM 16/17/18, so point bindgen at the preinstalled toolchain
+      # instead of apt-installing the whole libclang-dev tree (~7 min).
+      # Fall back to apt only if libclang is somehow absent, so this can
+      # never be slower than the previous unconditional install.
+      - name: Provide libclang for bindgen
+        run: |
+          set -eu
+          found=""
+          for d in \
+            "$(llvm-config-18 --libdir 2>/dev/null || true)" \
+            "$(llvm-config --libdir 2>/dev/null || true)" \
+            /usr/lib/llvm-18/lib /usr/lib/llvm-17/lib /usr/lib/llvm-16/lib \
+            /usr/lib/x86_64-linux-gnu; do
+            if [ -n "$d" ] && ls "$d"/libclang*.so* >/dev/null 2>&1; then
+              found="$d"; break
+            fi
+          done
+          if [ -n "$found" ]; then
+            echo "Using preinstalled libclang at $found"
+            echo "LIBCLANG_PATH=$found" >> "$GITHUB_ENV"
+          else
+            echo "Preinstalled libclang not found; installing libclang-dev"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends libclang-dev
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -126,12 +151,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+
+      # Date in the key so a fresh cache is saved daily; restore-keys
+      # seeds from the most recent prior cache. cargo-audit still
+      # `git fetch`es the advisory DB on every run, so the audit stays
+      # current — caching only skips the full clone, not the freshness.
+      - name: Cache RustSec advisory DB
+        id: advisory-db-date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # RUSTSEC-2024-0436: `paste` is unmaintained (build-time
-          # proc-macro, no runtime/security surface), pulled in only via
-          # nalgebra → simba → paste. Not a vulnerability; mirrored in
-          # .cargo/audit.toml for local `make audit` parity. Revisit
-          # when nalgebra/simba drop the dependency.
-          ignore: RUSTSEC-2024-0436
+          path: ~/.cargo/advisory-db
+          key: advisory-db-${{ runner.os }}-${{ steps.advisory-db-date.outputs.date }}
+          restore-keys: |
+            advisory-db-${{ runner.os }}-
+
+      # Prebuilt cargo-audit binary — rustsec/audit-check compiled it
+      # from source on every run (~minutes). taiki-e/install-action
+      # downloads a release binary in seconds.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # RUSTSEC-2024-0436 (`paste` unmaintained — build-time proc-macro,
+      # no runtime/security surface, via nalgebra → simba → paste) is
+      # ignored through .cargo/audit.toml, the single source of truth
+      # also used by local `make audit`. Revisit when simba drops it.
+      - run: cargo audit
