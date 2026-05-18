@@ -36,6 +36,11 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.05em}
 
 /* SLAM feature overlay (sits exactly over the video's contained image) */
 #feat-overlay{position:absolute;pointer-events:none;z-index:5;left:0;top:0}
+#slam-map{
+  position:absolute;right:8px;bottom:8px;z-index:6;display:none;
+  background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.18);
+  border-radius:6px
+}
 #slam-hud{
   position:absolute;left:8px;top:8px;z-index:6;
   display:flex;align-items:center;gap:8px;
@@ -161,6 +166,7 @@ footer{
 <div id="cam-wrap">
   <video id="cam" autoplay muted playsinline></video>
   <canvas id="feat-overlay"></canvas>
+  <canvas id="slam-map"></canvas>
   <div id="slam-hud">
     <select id="feat-mode" title="Feature overlay">
       <option value="off">feat: off</option>
@@ -169,6 +175,7 @@ footer{
       <option value="orient">BRIEF: orient</option>
       <option value="match">BRIEF: match</option>
       <option value="both">BRIEF: both</option>
+      <option value="map">map (M3)</option>
     </select>
     <span id="feat-stat">—</span>
   </div>
@@ -737,6 +744,8 @@ startStream();
   const ctx    = canvas.getContext('2d');
   const modeSel = document.getElementById('feat-mode');
   const stat   = document.getElementById('feat-stat');
+  const mapCanvas = document.getElementById('slam-map');
+  const mctx   = mapCanvas.getContext('2d');
   let snap = null;
 
   const es = new EventSource('/api/slam/stream');
@@ -763,6 +772,34 @@ startStream();
     canvas.style.height = bh + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, bw, bh);
+
+    // M2 stub: top-down map canvas. Transport (/api/slam/map) and the
+    // canvas exist now; M3's two-view init is the first thing to fill it.
+    if (mode === 'map') {
+      mapCanvas.style.display = 'block';
+      const S = 168, d2 = window.devicePixelRatio || 1;
+      if (mapCanvas.width !== Math.round(S * d2)) {
+        mapCanvas.width = Math.round(S * d2);
+        mapCanvas.height = Math.round(S * d2);
+        mapCanvas.style.width = S + 'px';
+        mapCanvas.style.height = S + 'px';
+      }
+      mctx.setTransform(d2, 0, 0, d2, 0, 0);
+      mctx.clearRect(0, 0, S, S);
+      mctx.strokeStyle = 'rgba(120,200,255,.45)';
+      mctx.beginPath();
+      mctx.moveTo(S / 2, 16); mctx.lineTo(S / 2, S - 8);
+      mctx.moveTo(8, S / 2); mctx.lineTo(S - 8, S / 2);
+      mctx.stroke();
+      mctx.fillStyle = '#9cf';
+      mctx.font = '10px monospace';
+      mctx.fillText('top-down map', 8, 12);
+      mctx.fillText('empty · awaiting M3', 8, S - 8);
+      stat.textContent = 'map: awaiting M3 two-view init';
+      requestAnimationFrame(frame);
+      return;
+    }
+    mapCanvas.style.display = 'none';
 
     if (mode === 'off' || !snap || !snap.width || !snap.points) {
       stat.textContent = mode === 'off' ? 'off' : '—';
@@ -816,6 +853,11 @@ startStream();
 
     const mtxt = showMatch ? ` · ${ms.length} match` : '';
     const kept = snap.n_kept != null ? snap.n_kept : pts.length;
+    const ci = snap.intrinsics;
+    const cal = ci && ci.fx
+      ? `\ncal f${ci.fx.toFixed(0)} ${ci.fov_deg.toFixed(0)}° ` +
+        (ci.verified ? 'OK' : 'UNVERIFIED')
+      : '';
     const st = snap.stages;
     const brk = st
       ? `\ngr${st.gray.toFixed(0)} py${st.pyramid.toFixed(0)} fa${st.fast.toFixed(0)} ` +
@@ -824,7 +866,7 @@ startStream();
       : '';
     stat.textContent =
       `${kept}/${snap.n_total}${mtxt} · ${snap.detect_ms.toFixed(0)}ms · ` +
-      `${snap.fps.toFixed(1)}f/s${brk}`;
+      `${snap.fps.toFixed(1)}f/s${brk}${cal}`;
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

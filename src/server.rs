@@ -49,6 +49,7 @@ pub async fn serve(state: AppState) {
         .route("/", get(serve_html))
         .route("/api/sensors/stream", get(sensor_stream))
         .route("/api/slam/stream", get(slam_stream))
+        .route("/api/slam/map", get(slam_map))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -116,6 +117,13 @@ async fn slam_stream(
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Top-down map (poses + points) for the WebUI canvas. **M2 stub:**
+/// returns an empty map so the transport + canvas exist now; M3's
+/// two-view init is the first thing that fills it.
+async fn slam_map() -> impl IntoResponse {
+    Json(serde_json::json!({ "poses": [], "points": [] }))
 }
 
 // ── WebRTC signalling ─────────────────────────────────────────────────────────

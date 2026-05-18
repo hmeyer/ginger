@@ -200,6 +200,14 @@ fn run_camera(
     let width = cfgs.get(0).unwrap().get_size().width;
     let height = cfgs.get(0).unwrap().get_size().height;
 
+    // SLAM M2: the intrinsics prior assumes this ViewFinder stream is a
+    // full-FOV downscale (FOV-derivation is then resolution-agnostic),
+    // not a center crop. Log the negotiated mode so that assumption is
+    // visible/auditable; a crop would need fx/fy from the full-res
+    // pixel focal instead. (Querying libcamera Model/PixelArraySize for
+    // hardware confirmation is a deferred follow-up.)
+    log::info!("camera: ViewFinder stream negotiated {width}x{height} YUYV (assumed full-FOV)");
+
     cam.configure(&mut cfgs)?;
 
     let mut alloc = FrameBufferAllocator::new(&cam);

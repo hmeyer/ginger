@@ -989,6 +989,7 @@ dependencies = [
  "env_logger",
  "futures",
  "ginger-fast",
+ "ginger-slam-core",
  "libc",
  "libcamera",
  "log",
