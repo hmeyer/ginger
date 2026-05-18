@@ -21,11 +21,13 @@
 //! - [`twoview`] — two-view monocular initialization (M3).
 //! - [`tracking`] — constant-velocity prediction + motion-only BA (M4).
 //! - [`map`] — keyframes / map points / covisibility graph (M5).
+//! - [`local_ba`] — block-sparse Schur local bundle adjustment (M5).
 
 pub mod camera;
 pub mod dataset;
 pub mod intrinsics;
 pub mod lie;
+pub mod local_ba;
 pub mod map;
 pub mod optimize;
 pub mod tracking;

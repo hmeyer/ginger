@@ -99,6 +99,38 @@ impl Map {
         id
     }
 
+    /// Overwrite a live keyframe's pose (local-BA write-back).
+    pub fn set_keyframe_pose(&mut self, id: u32, pose: Isometry3<f64>) {
+        if let Some(k) = self.keyframes.get_mut(id as usize)
+            && k.alive
+        {
+            k.pose = pose;
+        }
+    }
+
+    /// Overwrite a live map point's position (local-BA write-back).
+    pub fn set_point_pos(&mut self, id: u32, pos: Vector3<f64>) {
+        if let Some(p) = self.points.get_mut(id as usize)
+            && p.alive
+        {
+            p.pos = pos;
+        }
+    }
+
+    /// Record that live keyframe `kf_id` observes live point `pid` at
+    /// normalized image coord `z` (links both directions). No-op if
+    /// either is dead.
+    pub fn add_observation(&mut self, kf_id: u32, pid: u32, z: Vector2<f64>) {
+        let ok = self.keyframe(kf_id).is_some() && self.point(pid).is_some();
+        if !ok {
+            return;
+        }
+        let kf = &mut self.keyframes[kf_id as usize];
+        let kp_idx = kf.obs.len() as u32;
+        kf.obs.push((pid, z));
+        self.points[pid as usize].obs.push((kf_id, kp_idx));
+    }
+
     pub fn keyframe(&self, id: u32) -> Option<&Keyframe> {
         self.keyframes.get(id as usize).filter(|k| k.alive)
     }
