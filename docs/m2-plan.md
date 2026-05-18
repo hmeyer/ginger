@@ -80,6 +80,33 @@ Concrete rules for M2 math code:
    Motion-only BA (M4) is 6-DOF dense — a small dense LM is enough and
    is the right first solver to harden.
 
+## WebUI-visible outputs
+
+M2 is foundation — by design it ships **no SLAM behaviour**, so its
+user-facing output is diagnostics, not a demo. What we surface now (cheap,
+and it makes M2 progress + risk visible instead of buried in logs), and
+what later milestones draw into the same surface:
+
+- **M2 — calibration-status HUD line.** Extend `SlamSnapshot` /
+  `/api/slam/stream` with the active intrinsics (`fx fy cx cy`, derived
+  FOV) and a `verified` flag; `index.html` `#slam-hud` renders a loud
+  `PRIOR · rev 1.3 · UNVERIFIED` badge until a real calibration lands.
+- **M2 — sensor-mode confirmation.** Surface the one-time libcamera
+  `Model` / `PixelArraySize` and a `full-FOV` vs `crop?` flag, turning
+  the biggest M2 risk into something visible.
+- **M2 — `/api/slam/map` + 2D top-down canvas, as a stub.** Add the
+  transport and an empty toggleable top-down canvas now so M3 has
+  somewhere to draw immediately instead of inventing transport
+  mid-milestone. Honest cost: a little throwaway-ish UI in M2.
+- **M2 — undistortion grid overlay (optional).** A thin warped grid from
+  `CameraModel`; a no-op while `k = 0`, so it proves plumbing only.
+- **M3+** draw into the M2 canvas: M3 initial point cloud + 2 poses;
+  M4 live trajectory + current pose; M5 growing map + keyframes; M6 a
+  "loop detected" event with the trajectory snapping straighter.
+
+Existing surface this extends (no new transport invented): `/api/slam/stream`
+SSE → `index.html` video overlay + `#slam-hud`.
+
 ## Work breakdown
 
 ### A. Crate + math scaffold
@@ -122,6 +149,14 @@ Concrete rules for M2 math code:
   same measured A/B loop as the frontend.
 - CI keeps `cargo check -p slam-core --target aarch64-unknown-linux-gnu`
   (cross-compile guard) + parity tests.
+
+### F. WebUI status surface
+- Extend `SlamSnapshot` with `intrinsics { fx, fy, cx, cy, fov_deg,
+  verified }` and an optional sensor-mode string; serialise over the
+  existing `/api/slam/stream`.
+- `index.html` `#slam-hud`: calibration line + `UNVERIFIED` badge.
+- `/api/slam/map` endpoint + a toggleable empty top-down canvas
+  (stub for M3+).
 
 ## Sequencing
 

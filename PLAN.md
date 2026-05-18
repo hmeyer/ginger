@@ -83,6 +83,8 @@ calibration** — offline OpenCV ChArUco tool emitting a verified
   on a slow background thread, as the current decoupled design
   anticipates.
 - Map-point and keyframe culling.
+- **Visible deliverable:** growing map point cloud + keyframes on the
+  top-down canvas.
 
 ### M6 — Relocalization + loop closing
 
@@ -90,6 +92,13 @@ calibration** — offline OpenCV ChArUco tool emitting a verified
 - PnP-RANSAC relocalization on track loss.
 - Loop detection → Sim3 (monocular scale drift) → Essential-graph pose
   optimization → global BA.
+- **Visible deliverable:** "loop detected" event + trajectory snapping
+  straighter on the canvas.
+
+**WebUI surface:** all milestones draw into the single top-down canvas +
+`#slam-hud` stubbed in M2 (see [`docs/m2-plan.md`](docs/m2-plan.md) §
+WebUI-visible outputs); M2 itself only surfaces the calibration-status /
+sensor-mode diagnostics.
 
 ## Sequencing & risks
 
