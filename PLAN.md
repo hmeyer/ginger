@@ -148,7 +148,8 @@ testable sub-steps:
 
 - **M6-2a ✅ — `bow` deferrals: serialization + direct index.**
   `Vocabulary::to_bytes`/`from_bytes` (compact self-describing binary,
-  magic + version + structural validation, no new deps) and
+  `"GBOW"` magic + version header over a `postcard` payload + structural
+  validation) and
   `transform_indexed` (per-feature leaf word alongside the `BowVector`,
   for guided post-BoW matching). Also hardened `transform` to be
   *bitwise* deterministic (sort words before the L1 sum — the `tf`

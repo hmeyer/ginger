@@ -11,3 +11,6 @@ edition = "2024"
 nalgebra = "0.34"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Compact binary (de)serialization for the BoW vocabulary asset; small,
+# no_std-friendly, serde-based — keeps the crate dependency-light.
+postcard = { version = "1", features = ["alloc"] }

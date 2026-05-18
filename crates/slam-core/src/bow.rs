@@ -30,6 +30,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::map::Descriptor;
 
 /// Hamming distance between two 256-bit descriptors (0..=256). Scalar
@@ -108,7 +110,7 @@ fn kmeans_pp(descs: &[Descriptor], k: usize, rng: &mut Rng) -> Vec<Descriptor> {
 /// One vocabulary-tree node. Internal nodes route by nearest `centre`;
 /// leaves are *visual words* carrying a stable `word` id and its IDF
 /// `weight` (set after the tree is built, from the training corpus).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Node {
     centre: Descriptor,
     children: Vec<u32>,
@@ -119,14 +121,16 @@ struct Node {
 /// A trained visual vocabulary (the offline asset). Maps any descriptor
 /// to a word in `O(depth)` Hamming compares (tree descent) and an image
 /// to a TF-IDF [`BowVector`].
-#[derive(PartialEq)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct Vocabulary {
     nodes: Vec<Node>,
     /// Leaf node index per word id.
     words: Vec<u32>,
 }
 
-/// `to_bytes`/`from_bytes` container tag (`"GBOW"` + format version).
+/// `to_bytes`/`from_bytes` header: `"GBOW"` + format version, ahead of
+/// the postcard payload (postcard is not self-describing, so the magic
+/// rejects non-vocabulary files and the version gates schema changes).
 const VOCAB_MAGIC: [u8; 4] = *b"GBOW";
 const VOCAB_VERSION: u8 = 1;
 
@@ -357,86 +361,39 @@ impl Vocabulary {
         (BowVector(v), per_feat)
     }
 
-    /// Serialize to a compact, self-describing binary blob (magic +
-    /// version + the tree) so a vocabulary trained offline can be
-    /// shipped/loaded as a static asset. No external deps.
+    /// Serialize to a compact binary blob — a `"GBOW"` magic + version
+    /// header followed by a `postcard` encoding of the tree — so a
+    /// vocabulary trained offline can be shipped/loaded as a static
+    /// asset.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::new();
+        // In-memory → bytes can't fail for this plain data model.
+        let payload = postcard::to_allocvec(self).expect("postcard encode vocabulary");
+        let mut b = Vec::with_capacity(5 + payload.len());
         b.extend_from_slice(&VOCAB_MAGIC);
         b.push(VOCAB_VERSION);
-        b.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
-        for n in &self.nodes {
-            b.extend_from_slice(&n.centre);
-            b.extend_from_slice(&n.weight.to_le_bytes());
-            match n.word {
-                Some(w) => {
-                    b.push(1);
-                    b.extend_from_slice(&w.to_le_bytes());
-                }
-                None => b.push(0),
-            }
-            b.extend_from_slice(&(n.children.len() as u32).to_le_bytes());
-            for &c in &n.children {
-                b.extend_from_slice(&c.to_le_bytes());
-            }
-        }
-        b.extend_from_slice(&(self.words.len() as u32).to_le_bytes());
-        for &w in &self.words {
-            b.extend_from_slice(&w.to_le_bytes());
-        }
+        b.extend_from_slice(&payload);
         b
     }
 
     /// Inverse of [`to_bytes`](Self::to_bytes); `None` on a bad magic /
-    /// version / truncated or inconsistent blob.
+    /// version, a malformed/truncated payload, or a structurally
+    /// inconsistent tree (postcard is not self-describing, so the header
+    /// + the index-range check below are what reject junk input).
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        let mut p = 0usize;
-        let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
-            let s = data.get(*p..*p + n)?;
-            *p += n;
-            Some(s)
-        };
-        let u32_at = |p: &mut usize| -> Option<u32> {
-            Some(u32::from_le_bytes(take(p, 4)?.try_into().ok()?))
-        };
-        if take(&mut p, 4)? != VOCAB_MAGIC || take(&mut p, 1)?[0] != VOCAB_VERSION {
+        let rest = data.strip_prefix(&VOCAB_MAGIC)?;
+        let (&ver, payload) = rest.split_first()?;
+        if ver != VOCAB_VERSION {
             return None;
         }
-        let n_nodes = u32_at(&mut p)? as usize;
-        let mut nodes = Vec::with_capacity(n_nodes);
-        for _ in 0..n_nodes {
-            let centre: Descriptor = take(&mut p, 32)?.try_into().ok()?;
-            let weight = f64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
-            let word = match take(&mut p, 1)?[0] {
-                0 => None,
-                1 => Some(u32_at(&mut p)?),
-                _ => return None,
-            };
-            let n_ch = u32_at(&mut p)? as usize;
-            let mut children = Vec::with_capacity(n_ch);
-            for _ in 0..n_ch {
-                children.push(u32_at(&mut p)?);
-            }
-            nodes.push(Node {
-                centre,
-                children,
-                word,
-                weight,
-            });
-        }
-        let n_words = u32_at(&mut p)? as usize;
-        let mut words = Vec::with_capacity(n_words);
-        for _ in 0..n_words {
-            words.push(u32_at(&mut p)?);
-        }
+        let v: Self = postcard::from_bytes(payload).ok()?;
         // Structural sanity: every child / word index in range.
-        let nn = nodes.len() as u32;
-        if nodes.iter().any(|n| n.children.iter().any(|&c| c >= nn))
-            || words.iter().any(|&w| w >= nn)
+        let nn = v.nodes.len() as u32;
+        if v.nodes.iter().any(|n| n.children.iter().any(|&c| c >= nn))
+            || v.words.iter().any(|&w| w >= nn)
         {
             return None;
         }
-        Some(Self { nodes, words })
+        Some(v)
     }
 }
 
