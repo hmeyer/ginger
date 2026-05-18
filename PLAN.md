@@ -14,7 +14,7 @@ surfaced live in the WebUI. No tracking/keyframes/BA yet (M4+).
 - **M0** ✅ FAST-9 over an 8-level pyramid + NMS + grid-spread cap (NEON).
 - **M1** ✅ Oriented BRIEF + brute-force mutual-NN matching (Lowe ratio).
 - **M2** ✅ Calibration prior + pinhole model + math backbone + mock
-  camera + headless replay/CI ([`m2-plan.md`](m2-plan.md)).
+  camera + headless replay/CI.
 - **M3** ✅ Two-view initialization (essential + homography) wired into
   the live pipeline with a top-down map in the WebUI.
 - Live WebUI overlay + HUD, `slam_bench` / `slam_replay` harnesses,
@@ -37,8 +37,7 @@ All three original blockers are closed:
 
 ### M2 — Calibration + pinhole model + replay harness ✅ (foundation done)
 
-Foundation only; no SLAM behaviour. **Detailed plan + status:
-[`m2-plan.md`](m2-plan.md)**.
+Foundation only; no SLAM behaviour.
 
 Done: `ginger-slam-core` (hand-rolled SO3/SE3 `lie`, pinhole +
 Brown–Conrady `CameraModel`, dense LM + Huber, PGM `dataset`); rev 1.3
@@ -100,10 +99,10 @@ session):
 - **Visible deliverable:** "loop detected" event + trajectory snapping
   straighter on the canvas.
 
-**WebUI surface:** all milestones draw into the single top-down canvas +
-`#slam-hud` stubbed in M2 (see [`m2-plan.md`](m2-plan.md) §
-WebUI-visible outputs); M2 itself only surfaces the calibration-status /
-sensor-mode diagnostics.
+**WebUI surface:** all milestones draw into the single top-down canvas
+(`/api/slam/map`, `map` overlay mode) + the `#slam-hud` line; M3 fills
+it with the bootstrap point cloud + two camera centres, M4+ extend it
+with the live trajectory and growing map.
 
 ## Sequencing & risks
 
@@ -119,3 +118,27 @@ sensor-mode diagnostics.
 - **M3 caveat:** verified only against synthetic scenes and the
   degenerate mock-camera scene; real-scene init quality is unproven
   until the deferred frame recorder / a public dataset is run on-Pi.
+
+## Performance strategy (RPi 4 / Cortex-A72)
+
+Durable engineering guidance for M4–M6 kernels (the Pi 4 is a quad-core
+**ARMv8.0-A** Cortex-A72):
+
+- **NEON is the only SIMD** (128-bit; 4×f32 / 2×f64). A72 is ARMv8.0 —
+  no SDOT/i8mm/FP16/SVE; don't design for instructions it lacks. Hamming
+  stays `vcntq_u8` + `vaddvq`. The VideoCore GPU is a dead end for
+  sparse SLAM math (excluded).
+- **Multicore is the biggest lever**, not micro-SIMD: ORB-SLAM's
+  tracking / local-mapping / loop-closing split maps onto the 4 cores —
+  tracking holds frame rate while heavy BA runs off-core at lower
+  cadence. `rayon` is the in-tree data-parallel tool.
+- **Reuse the `crates/fast` discipline:** portable scalar reference →
+  `#[cfg(target_arch="aarch64")]` NEON kernel → differential parity
+  test → `slam_bench` A/B. Let the compiler vectorize first
+  (`target-cpu=cortex-a72` is set); hand-write NEON only at a measured
+  hotspot.
+- **f32 per-observation residual/Jacobian, f64 accumulators.**
+- **Block-sparse with small fixed dense blocks** (6×6 / 3×3 / 6×3),
+  not a generic sparse lib: the Schur inner kernels are L1-resident and
+  auto-vectorize well. nalgebra for the blocks; the block-sparse Schur
+  (M5) is hand-written — it's a layout change, not new numerics.
