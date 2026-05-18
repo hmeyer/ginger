@@ -33,7 +33,18 @@ no pose, no map, no geometry.
 
 ### M2 — Calibration + pinhole model + replay harness
 
-Foundation only; no SLAM yet.
+Foundation only; no SLAM yet. **Detailed plan:
+[`m2-plan.md`](m2-plan.md)** (camera prior, hardware-accel /
+NEON strategy, math backbone, work breakdown, exit criteria).
+
+Decided: proceed on the Pi Camera "rev 1.3" standard-lens prior
+(FOV-derived, flagged unverified); pure-Rust math (`nalgebra` + a small
+`lie`/solver, no BLAS); reuse the `crates/fast` scalar→NEON→parity-test
+discipline for all geometry kernels.
+
+Open follow-up (deferred, needs a physical target): **proper camera
+calibration** — offline OpenCV ChArUco tool emitting a verified
+`slam.toml`. Not kalibr.
 
 - Calibrate the OV5647 (checkerboard) or seed known intrinsics plus a
   calibration utility; store `K` + distortion.
@@ -72,6 +83,8 @@ Foundation only; no SLAM yet.
   on a slow background thread, as the current decoupled design
   anticipates.
 - Map-point and keyframe culling.
+- **Visible deliverable:** growing map point cloud + keyframes on the
+  top-down canvas.
 
 ### M6 — Relocalization + loop closing
 
@@ -79,6 +92,13 @@ Foundation only; no SLAM yet.
 - PnP-RANSAC relocalization on track loss.
 - Loop detection → Sim3 (monocular scale drift) → Essential-graph pose
   optimization → global BA.
+- **Visible deliverable:** "loop detected" event + trajectory snapping
+  straighter on the canvas.
+
+**WebUI surface:** all milestones draw into the single top-down canvas +
+`#slam-hud` stubbed in M2 (see [`m2-plan.md`](m2-plan.md) §
+WebUI-visible outputs); M2 itself only surfaces the calibration-status /
+sensor-mode diagnostics.
 
 ## Sequencing & risks
 
