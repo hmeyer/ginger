@@ -22,6 +22,7 @@
 //! - [`tracking`] — constant-velocity prediction + motion-only BA (M4).
 //! - [`map`] — keyframes / map points / covisibility graph (M5).
 //! - [`local_ba`] — block-sparse Schur local bundle adjustment (M5).
+//! - [`triangulation`] — gated two-view new-point triangulation (M5).
 
 pub mod camera;
 pub mod dataset;
@@ -31,4 +32,5 @@ pub mod local_ba;
 pub mod map;
 pub mod optimize;
 pub mod tracking;
+pub mod triangulation;
 pub mod twoview;
