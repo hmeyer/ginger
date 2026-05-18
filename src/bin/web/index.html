@@ -752,6 +752,12 @@ startStream();
   es.onmessage = e => { try { snap = JSON.parse(e.data); } catch (_) {} };
   es.onerror = () => {};
 
+  // Two-view bootstrap map, polled (cheap, only meaningful once init runs).
+  let mapData = null;
+  setInterval(async () => {
+    try { mapData = await (await fetch('/api/slam/map')).json(); } catch (_) {}
+  }, 500);
+
   // Distinct-ish colour per pyramid level.
   const levelColor = l => `hsl(${(l * 40) % 360} 90% 60%)`;
 
@@ -773,11 +779,10 @@ startStream();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, bw, bh);
 
-    // M2 stub: top-down map canvas. Transport (/api/slam/map) and the
-    // canvas exist now; M3's two-view init is the first thing to fill it.
+    // Top-down (x, z) two-view bootstrap map from /api/slam/map.
     if (mode === 'map') {
       mapCanvas.style.display = 'block';
-      const S = 168, d2 = window.devicePixelRatio || 1;
+      const S = 220, d2 = window.devicePixelRatio || 1;
       if (mapCanvas.width !== Math.round(S * d2)) {
         mapCanvas.width = Math.round(S * d2);
         mapCanvas.height = Math.round(S * d2);
@@ -786,16 +791,51 @@ startStream();
       }
       mctx.setTransform(d2, 0, 0, d2, 0, 0);
       mctx.clearRect(0, 0, S, S);
-      mctx.strokeStyle = 'rgba(120,200,255,.45)';
-      mctx.beginPath();
-      mctx.moveTo(S / 2, 16); mctx.lineTo(S / 2, S - 8);
-      mctx.moveTo(8, S / 2); mctx.lineTo(S - 8, S / 2);
-      mctx.stroke();
       mctx.fillStyle = '#9cf';
       mctx.font = '10px monospace';
-      mctx.fillText('top-down map', 8, 12);
-      mctx.fillText('empty · awaiting M3', 8, S - 8);
-      stat.textContent = 'map: awaiting M3 two-view init';
+      mctx.fillText('top-down map (x→, z↑)', 8, 12);
+
+      const md = mapData;
+      const pts = md && md.points || [];
+      const cams = md && md.cameras || [];
+      if (pts.length || cams.length) {
+        // Uniform fit of all points + camera centres, z-axis up.
+        const all = pts.concat(cams);
+        let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+        for (const [x, z] of all) {
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+        }
+        const pad = 22, span = Math.max(maxX - minX, maxZ - minZ, 1e-6);
+        const sc = (S - 2 * pad) / span;
+        const cx0 = (minX + maxX) / 2, cz0 = (minZ + maxZ) / 2;
+        const PX = x => S / 2 + (x - cx0) * sc;
+        const PY = z => S / 2 - (z - cz0) * sc;
+        mctx.fillStyle = 'rgba(120,200,255,.65)';
+        for (const [x, z] of pts) {
+          mctx.beginPath();
+          mctx.arc(PX(x), PY(z), 1.4, 0, 6.283);
+          mctx.fill();
+        }
+        if (cams.length >= 2) {
+          mctx.strokeStyle = 'rgba(255,255,255,.5)';
+          mctx.beginPath();
+          mctx.moveTo(PX(cams[0][0]), PY(cams[0][1]));
+          mctx.lineTo(PX(cams[1][0]), PY(cams[1][1]));
+          mctx.stroke();
+        }
+        const camCols = ['#3cff78', '#5cf'];
+        cams.forEach(([x, z], i) => {
+          mctx.fillStyle = camCols[i] || '#fc6';
+          mctx.beginPath();
+          mctx.arc(PX(x), PY(z), 3.2, 0, 6.283);
+          mctx.fill();
+        });
+      }
+      const status = md && md.status || 'no map yet';
+      mctx.fillStyle = '#9cf';
+      mctx.fillText(status.slice(0, 34), 8, S - 8);
+      stat.textContent = 'map · ' + status;
       requestAnimationFrame(frame);
       return;
     }
