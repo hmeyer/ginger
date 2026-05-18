@@ -20,11 +20,19 @@ Rust driver library and web control interface for the [Freenove 4WD Smart Car Ki
 
 ## Crate layout
 
-The crate is layered so the dependency direction reads top-down:
-`hal → devices → robot → server → bin`, with `camera`/`video` as
-parallel media stacks and `api` as the shared wire contract.
+A Cargo workspace: the camera/hardware-coupled binary plus two
+dependency-light, camera-free crates (so the SIMD + SLAM math
+cross-compile and unit-test without libcamera). The binary is layered
+top-down `hal → devices → robot → server → bin`, with `camera`/`video`
+as parallel media stacks, `slam` as the visual-SLAM frontend, and `api`
+as the shared wire contract.
 
 ```
+crates/
+  fast/             — FAST-9 + grayscale image/pyramid (NEON), no deps but rayon
+  slam-core/        — camera-free geometry/optimization: lie (SO3/SE3),
+                      camera (pinhole+Brown–Conrady), intrinsics,
+                      optimize (LM+Huber), twoview, tracking, dataset
 src/
   error.rs        — crate-wide Error / Result
   api.rs          — wire contract: telemetry, command protocol, request bodies
@@ -40,21 +48,30 @@ src/
     pan_tilt.rs   — Pan/tilt with invert + trim
   camera/
     capture.rs       — OV5647 via libcamera (streaming background thread)
+    mock.rs          — headless frame source (no libcamera; CI / replay)
     auto_exposure.rs — pure software-AE controller (unit-tested)
   video/
     h264.rs       — V4L2 hardware H.264 encoder
     webrtc.rs     — WHEP signalling + adaptive bitrate
+  slam/           — visual-SLAM frontend (FAST+BRIEF → init → tracking)
+    mod.rs        — Frontend state machine (Stage enum) + run() thread
+    fast.rs / brief.rs / image.rs — detection/descriptor/pyramid glue
   robot/          — domain
     car.rs        — Top-level Car struct with obstacle-avoidance safety
     supervisor.rs — Teleop control loop: collision lock, TTC, dead-man stop
-  server.rs       — axum router + route handlers
+  server.rs       — axum router + handlers (incl. /api/slam/stream, /map)
   bin/
     main.rs       — Composition root: wire up state, spawn supervisor, serve
     web/
-      index.html  — Embedded mobile-first control UI
+      index.html  — Embedded mobile-first control UI (+ SLAM overlay/map)
+examples/
+  slam_bench.rs   — A/B frontend + geometry timing harness
+  slam_replay.rs  — deterministic detect→match over a PGM sequence
 scripts/
   install-service.sh — Install ginger as a systemd user service
 ```
+
+The SLAM roadmap and milestone status live in [`PLAN.md`](PLAN.md).
 
 ## Dependencies
 
@@ -70,6 +87,15 @@ Rust toolchain via [rustup](https://rustup.rs).
 cargo build --release   # always use release; debug is 10-20× slower for JPEG encoding
 # or via make:
 make build
+```
+
+`libcamera` is an opt-out default feature (the only system-coupled
+dep). On a dev machine / CI without libcamera, build & test headless
+with a mock camera — this also exercises the full SLAM pipeline:
+
+```bash
+cargo test  --workspace --no-default-features   # mock camera, no libcamera
+cargo check -p ginger-slam-core --target aarch64-unknown-linux-gnu
 ```
 
 ## Linting

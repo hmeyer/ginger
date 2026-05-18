@@ -1,16 +1,15 @@
 //! Visual SLAM frontend (ORB-SLAM-style), built up in milestones.
 //!
-//! **M3 (current): two-view monocular initialization.** A dedicated
-//! thread consumes the camera independently of the H.264/WebRTC path,
-//! builds a grayscale scale pyramid, runs FAST-9 per level (NMS +
-//! grid-spread cap), computes intensity-centroid orientation + a steered
-//! 256-bit BRIEF descriptor, and matches frames. Against an anchor
-//! frame it accumulates parallax and, once well-conditioned, runs the
-//! calibrated [`ginger_slam_core::twoview`] initializer (essential /
-//! homography → relative pose + triangulated points), publishing a
-//! [`SlamSnapshot`] (live overlay) and a [`MapSnapshot`] (top-down map).
-//! Later milestones add local-map tracking (M4), local BA + keyframes
-//! (M5) and loop closing (M6).
+//! **M4 (current): live tracking.** A dedicated thread consumes the
+//! camera independently of the H.264/WebRTC path, builds a grayscale
+//! pyramid, runs FAST-9 per level (NMS + grid-spread cap), computes
+//! intensity-centroid orientation + a steered 256-bit BRIEF descriptor,
+//! and feeds the [`Frontend`] state machine ([`Stage`]): accumulate
+//! parallax vs an anchor → two-view init ([`ginger_slam_core::twoview`])
+//! → per-frame tracking (constant-velocity + motion-only BA,
+//! [`ginger_slam_core::tracking`]), publishing a [`SlamSnapshot`] (live
+//! overlay) and a [`MapSnapshot`] (top-down trajectory + map). M5 adds
+//! keyframes / covisibility / local BA; M6 loop closing.
 
 pub mod brief;
 pub mod fast;
@@ -460,10 +459,22 @@ pub struct FrameOut {
 /// tracking. Pulled out of the camera/server loop so the whole pipeline
 /// is exercised by deterministic headless tests via [`Frontend::on_frame`]
 /// — no camera, server, or sleeping.
+/// Detected features for one frame: level-0 keypoints + aligned BRIEF.
+type FrameFeatures = (Vec<FeaturePoint>, Vec<brief::Descriptor>);
+
+/// Explicit pipeline state (replaces an implicit `Option` trio so
+/// illegal combinations are unrepresentable and transitions are
+/// obvious). M5/M6 extend this with `Lost` / `Relocalizing`.
+enum Stage {
+    /// Pre-init: accumulating parallax against an optional anchor frame.
+    Bootstrapping { anchor: Option<FrameFeatures> },
+    /// Post-init: live tracking against the map.
+    Tracking(MapState),
+}
+
 pub struct Frontend {
-    prev: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)>,
-    anchor: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)>,
-    state: Option<MapState>,
+    prev: Option<FrameFeatures>,
+    stage: Stage,
     intrinsics: Option<Intrinsics>,
     iview: IntrinsicsView,
     map: MapSnapshot,
@@ -479,8 +490,7 @@ impl Frontend {
     pub fn new() -> Self {
         Self {
             prev: None,
-            anchor: None,
-            state: None,
+            stage: Stage::Bootstrapping { anchor: None },
             intrinsics: None,
             iview: IntrinsicsView::uninitialized(),
             map: MapSnapshot::initial(),
@@ -546,10 +556,11 @@ impl Frontend {
             .as_ref()
             .map(|i| (i.to_camera_model(), i.fx))
         {
-            match self.state.as_mut() {
-                None => {
+            let mut to_tracking: Option<MapState> = None;
+            match &mut self.stage {
+                Stage::Bootstrapping { anchor } => {
                     let mut want_anchor = false;
-                    if let Some((apts, adesc)) = self.anchor.as_ref() {
+                    if let Some((apts, adesc)) = anchor.as_ref() {
                         let mm = brief::match_descriptors(adesc, descs);
                         if mm.len() >= INIT_MIN_MATCHES {
                             let mut disp: Vec<f32> = mm
@@ -624,7 +635,7 @@ impl Frontend {
                                         tv.r_h,
                                         mm.len()
                                     );
-                                    self.state = Some(st);
+                                    to_tracking = Some(st);
                                 }
                             } else {
                                 self.map.status = format!(
@@ -638,12 +649,12 @@ impl Frontend {
                     } else {
                         want_anchor = true;
                     }
-                    if want_anchor && self.state.is_none() {
-                        self.anchor = Some((points.to_vec(), descs.to_vec()));
+                    if want_anchor && to_tracking.is_none() {
+                        *anchor = Some((points.to_vec(), descs.to_vec()));
                         self.map.status = "anchor set — translate sideways for parallax".into();
                     }
                 }
-                Some(st) => {
+                Stage::Tracking(st) => {
                     let mm = brief::match_descriptors(&st.desc, descs);
                     if mm.len() >= TRACK_MIN_MATCHES {
                         let obs: Vec<Observation> = mm
@@ -690,6 +701,9 @@ impl Frontend {
                         self.map.status = format!("tracking lost: only {} map matches", mm.len());
                     }
                 }
+            }
+            if let Some(st) = to_tracking {
+                self.stage = Stage::Tracking(st);
             }
         }
 
