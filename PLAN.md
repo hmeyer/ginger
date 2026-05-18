@@ -7,9 +7,11 @@ ORB-SLAM pipeline on the Raspberry Pi 4. The inline roadmap stub lives in
 ## Where the code is today
 
 Monocular SLAM runs end-to-end: detect → two-view bootstrap → **live
-6-DoF tracking** (constant-velocity prediction + motion-only BA),
-surfaced as a growing camera trajectory + point cloud in the WebUI. No
-keyframes / local BA / loop closing yet (M5+).
+6-DoF tracking** (constant-velocity prediction + motion-only BA) →
+**local mapping** (keyframes + decoupled triangulation + block-sparse
+Schur local BA on a background thread), surfaced as a growing,
+locally-bundle-adjusted point cloud + keyframes + camera trajectory in
+the WebUI. No loop closing / relocalization yet (M6).
 
 - **M0** ✅ FAST-9 over an 8-level pyramid + NMS + grid-spread cap (NEON).
 - **M1** ✅ Oriented BRIEF + brute-force mutual-NN matching (Lowe ratio).
@@ -19,9 +21,11 @@ keyframes / local BA / loop closing yet (M5+).
   the live pipeline with a top-down map in the WebUI.
 - **M4** ✅ Tracking thread — constant-velocity model + motion-only BA
   (Huber) re-finding map points each frame; live trajectory.
-- **M5** 🔄 Local mapping — slam-core core **done** (M5-0 `Stage`
-  enum; M5-1a map/covisibility; M5-1b block-sparse Schur local BA;
-  M5-1c gated triangulation). Only the M5-2 frontend wiring remains.
+- **M5** ✅ Local mapping — M5-0 `Stage` enum; M5-1a
+  map/covisibility; M5-1b block-sparse Schur local BA; M5-1c gated
+  triangulation; **M5-2 frontend wiring** (keyframe insertion +
+  decoupled `LocalMapper` thread: triangulation + local BA over the
+  covisibility window).
 - Testing stabilized: the pipeline state machine is a testable
   `Frontend::on_frame` seam covered by headless `pipeline_tests`;
   `slam_bench` / `slam_replay` harnesses; decoupled frontend thread.
@@ -90,26 +94,32 @@ session):
 - Caveat: guided/windowed projection matching is still brute-force
   descriptor matching against the whole map (refine in M5).
 
-### M5 — Local Mapping thread 🔄
-
-slam-core core complete; only the M5-2 frontend wiring remains.
+### M5 — Local Mapping thread ✅
 
 - **M5-0 ✅** explicit `Stage` enum (`Bootstrapping` / `Tracking`),
   replacing the implicit `Option` trio.
 - **M5-1a ✅** `map`: keyframes / map points / covisibility graph +
   spanning tree / culling / `needs_keyframe` insertion policy /
-  `local_window` selector.
+  `local_window` selector (+ `add_point_observed`: link a
+  late-discovered point into its keyframe once per side, so local-BA
+  observations and covisibility weights stay exact).
 - **M5-1b ✅** `local_ba`: block-sparse Schur local bundle adjustment
   over a covisibility window (the Pi 4 performance crux).
 - **M5-1c ✅** `triangulation`: gated two-view new-point triangulation
   (cheirality / parallax / symmetric reprojection).
-- **M5-2 ⏭** wiring: in `Frontend`, insert keyframes via
-  `needs_keyframe`, spawn points via `triangulate`, run
-  `local_bundle_adjust` over `local_window` (decoupled background
-  thread per the perf strategy); per-keyframe raw-feature storage for
-  inter-keyframe matching; extend `pipeline_tests`.
-- **Visible deliverable:** growing map point cloud + keyframes on the
-  top-down canvas.
+- **M5-2 ✅** wiring (`slam/mapper.rs`): bootstrap promotes the two
+  views to keyframes; tracking inserts keyframes via `needs_keyframe`
+  (tracked inliers as observations) and hands them + their raw features
+  to a **decoupled `LocalMapper` thread** that triangulates new points
+  against covisible keyframes and runs `local_bundle_adjust` over
+  `local_window` at a short per-keyframe iteration budget (heavy BA off
+  the tracking core, lower cadence). The work unit
+  (`LocalMapper::process_pending`) is the headless-tested seam — `run`
+  drives it from a thread, `pipeline_tests` synchronously — so the
+  tested path equals production. Coarse single map mutex; a finer
+  tracking/mapping handoff is an M6 refinement.
+- **Visible deliverable ✅:** growing, locally-bundle-adjusted point
+  cloud + keyframe markers on the top-down canvas.
 
 ### M6 — Relocalization + loop closing
 
@@ -123,12 +133,13 @@ slam-core core complete; only the M5-2 frontend wiring remains.
 **WebUI surface:** all milestones draw into the single top-down canvas
 (`/api/slam/map`, `map` overlay mode) + the `#slam-hud` line; M3 filled
 it with the bootstrap cloud + two cameras, M4 extended it with the live
-trajectory, M5 grows the map + keyframes.
+trajectory, M5 grows the locally-bundle-adjusted map + draws keyframe
+markers (orange squares).
 
 ## Sequencing & risks
 
-- **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → **M5 (in
-  progress)** → M6 last.
+- **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
+  **M6 (next)**.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing
