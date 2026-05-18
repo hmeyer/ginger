@@ -129,3 +129,9 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2024-0436: `paste` is unmaintained (build-time
+          # proc-macro, no runtime/security surface), pulled in only via
+          # nalgebra → simba → paste. Not a vulnerability; mirrored in
+          # .cargo/audit.toml for local `make audit` parity. Revisit
+          # when nalgebra/simba drop the dependency.
+          ignore: RUSTSEC-2024-0436
