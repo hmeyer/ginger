@@ -126,6 +126,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Date in the key so a fresh cache is saved daily; restore-keys
+      # seeds from the most recent prior cache. cargo-audit still
+      # `git fetch`es the advisory DB on every run, so the audit stays
+      # current — caching only skips the full clone, not the freshness.
+      - name: Cache RustSec advisory DB
+        id: advisory-db-date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/advisory-db
+          key: advisory-db-${{ runner.os }}-${{ steps.advisory-db-date.outputs.date }}
+          restore-keys: |
+            advisory-db-${{ runner.os }}-
+
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
