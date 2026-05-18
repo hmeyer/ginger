@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fast"]
+members = [".", "crates/fast", "crates/slam-core"]
 resolver = "2"
 
 [package]

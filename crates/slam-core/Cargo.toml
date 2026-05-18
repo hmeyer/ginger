@@ -1,0 +1,13 @@
+[package]
+name = "ginger-slam-core"
+version = "0.1.0"
+edition = "2024"
+
+# Dependency-light and camera-free (like ginger-fast) so the geometry /
+# optimization math cross-compiles and unit-tests without libcamera:
+#   cargo test  -p ginger-slam-core
+#   cargo check -p ginger-slam-core --target aarch64-unknown-linux-gnu
+[dependencies]
+nalgebra = "0.34"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
