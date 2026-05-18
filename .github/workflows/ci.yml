@@ -166,12 +166,15 @@ jobs:
           restore-keys: |
             advisory-db-${{ runner.os }}-
 
-      - uses: rustsec/audit-check@v2
+      # Prebuilt cargo-audit binary — rustsec/audit-check compiled it
+      # from source on every run (~minutes). taiki-e/install-action
+      # downloads a release binary in seconds.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # RUSTSEC-2024-0436: `paste` is unmaintained (build-time
-          # proc-macro, no runtime/security surface), pulled in only via
-          # nalgebra → simba → paste. Not a vulnerability; mirrored in
-          # .cargo/audit.toml for local `make audit` parity. Revisit
-          # when nalgebra/simba drop the dependency.
-          ignore: RUSTSEC-2024-0436
+          tool: cargo-audit
+
+      # RUSTSEC-2024-0436 (`paste` unmaintained — build-time proc-macro,
+      # no runtime/security surface, via nalgebra → simba → paste) is
+      # ignored through .cargo/audit.toml, the single source of truth
+      # also used by local `make audit`. Revisit when simba drops it.
+      - run: cargo audit
