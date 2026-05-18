@@ -1,4 +1,4 @@
-//! Two-view monocular initialization geometry (M3, part 1).
+//! Two-view monocular initialization geometry (M3).
 //!
 //! Camera-free and operating on **calibrated/normalized** image points
 //! (`x = X/Z, y = Y/Z`; the caller undistorts + unprojects pixels via
@@ -11,9 +11,11 @@
 //! 8-point) **and** a homography (normalized 4-point DLT) in parallel,
 //! score both with the symmetric transfer error, pick the model by the
 //! `R_H = S_H / (S_H + S_F)` heuristic, then recover relative pose from
-//! the essential matrix (SVD decomposition + cheirality) and triangulate
-//! the initial points. Homography → pose decomposition (the planar path)
-//! is M3 part 2.
+//! the chosen model — essential via SVD decomposition, homography via
+//! the Faugeras–Lustman decomposition (the planar / low-parallax path)
+//! — disambiguated by cheirality, with a fall-back to the other model
+//! if the chosen one yields no valid pose. Triangulates the initial
+//! points.
 
 use nalgebra::{DMatrix, Matrix3, Vector2, Vector3};
 
@@ -275,9 +277,61 @@ fn decompose_essential(e: &Matrix3<f64>) -> PoseCandidates {
     [(r1, t), (r1, -t), (r2, t), (r2, -t)]
 }
 
+/// Decompose a *calibrated* homography into its physically distinct
+/// (R, t) candidates (Faugeras–Lustman SVD method). Translation is
+/// up-to-scale; cheirality (`best_pose`) disambiguates the ≤ 8
+/// solutions, same as the essential path.
+fn decompose_homography(h: &Matrix3<f64>) -> Vec<Pose> {
+    let svd = h.svd(true, true);
+    let u = svd.u.unwrap();
+    let vt = svd.v_t.unwrap();
+    let sv = svd.singular_values;
+    let (d1, d2, d3) = (sv[0], sv[1], sv[2]); // descending
+    // Normalize so the middle singular value is 1 (Faugeras scaling).
+    if d2.abs() < 1e-12 {
+        return Vec::new();
+    }
+    let v = vt.transpose();
+    let s = u.determinant() * v.determinant();
+
+    // Near-pure-rotation (d1 ≈ d3): plane normal is undetermined.
+    if (d1 - d3).abs() < 1e-9 {
+        return vec![(s * u * vt, Vector3::zeros())];
+    }
+
+    let aux1 = ((d1 * d1 - d2 * d2) / (d1 * d1 - d3 * d3)).max(0.0).sqrt();
+    let aux3 = ((d2 * d2 - d3 * d3) / (d1 * d1 - d3 * d3)).max(0.0).sqrt();
+    let e1 = [1.0, -1.0, 1.0, -1.0];
+    let e3 = [1.0, 1.0, -1.0, -1.0];
+    let mut out = Vec::with_capacity(8);
+
+    // Case d' = +d2.
+    let aux_st = ((d1 * d1 - d2 * d2) * (d2 * d2 - d3 * d3)).max(0.0).sqrt() / ((d1 + d3) * d2);
+    let ctheta = (d2 * d2 + d1 * d3) / ((d1 + d3) * d2);
+    for k in 0..4 {
+        let stheta = aux_st * e1[k] * e3[k];
+        let rp = Matrix3::new(ctheta, 0.0, -stheta, 0.0, 1.0, 0.0, stheta, 0.0, ctheta);
+        let r = s * u * rp * vt;
+        let tp = Vector3::new((d1 - d3) * aux1 * e1[k], 0.0, -(d1 - d3) * aux3 * e3[k]);
+        out.push((r, u * tp));
+    }
+    // Case d' = -d2.
+    let aux_sp = ((d1 * d1 - d2 * d2) * (d2 * d2 - d3 * d3)).max(0.0).sqrt() / ((d1 - d3) * d2);
+    let cphi = (d1 * d3 - d2 * d2) / ((d1 - d3) * d2);
+    for k in 0..4 {
+        let sphi = aux_sp * e1[k] * e3[k];
+        let rp = Matrix3::new(cphi, 0.0, sphi, 0.0, -1.0, 0.0, sphi, 0.0, -cphi);
+        let r = s * u * rp * vt;
+        let tp = Vector3::new((d1 + d3) * aux1 * e1[k], 0.0, (d1 + d3) * aux3 * e3[k]);
+        out.push((r, u * tp));
+    }
+    out
+}
+
 /// Pick the (R, t) with the most inlier points in front of *both*
 /// cameras (cheirality), returning that pose and its triangulated set.
-fn best_pose(cands: &PoseCandidates, corrs: &[Corr], inliers: &[bool]) -> Option<PoseWithPoints> {
+/// Works for any candidate count (essential gives 4, homography ≤ 8).
+fn best_pose(cands: &[Pose], corrs: &[Corr], inliers: &[bool]) -> Option<PoseWithPoints> {
     let mut best: Option<(usize, PoseWithPoints)> = None;
     for &(r, t) in cands.iter() {
         let mut pts = Vec::new();
@@ -381,24 +435,36 @@ pub fn initialize(corrs: &[Corr], opt: InitOptions) -> Option<TwoView> {
     let r_h = if se + sh > 0.0 { sh / (se + sh) } else { 0.0 };
 
     // ORB-SLAM: prefer the homography when it explains ≳45% of the
-    // combined score (planar / low-parallax). Pose-from-H is M3 part 2,
-    // so for now we still recover pose via E but report the decision.
+    // combined score (planar / low-parallax), recovering pose from H;
+    // otherwise from the essential matrix. Fall back to E if the H
+    // decomposition yields no cheirality-consistent pose.
     let model = if r_h > 0.45 {
         Model::Homography
     } else {
         Model::Essential
     };
-    let _ = best_h;
 
-    let inliers = if model == Model::Homography && !mask_h.is_empty() {
-        mask_h
-    } else {
-        mask_e
+    let recover = |m: Model| -> Option<(PoseWithPoints, Vec<bool>)> {
+        match m {
+            Model::Homography => {
+                let cands = decompose_homography(&best_h);
+                best_pose(&cands, corrs, &mask_h).map(|p| (p, mask_h.clone()))
+            }
+            Model::Essential => {
+                let cands = decompose_essential(&best_e);
+                best_pose(&cands[..], corrs, &mask_e).map(|p| (p, mask_e.clone()))
+            }
+        }
     };
-    let cands = decompose_essential(&best_e);
-    let (r, t, points) = best_pose(&cands, corrs, &inliers)?;
+    let order = if model == Model::Homography {
+        [Model::Homography, Model::Essential]
+    } else {
+        [Model::Essential, Model::Homography]
+    };
+    let (used, ((r, t, points), inliers)) =
+        order.into_iter().find_map(|m| recover(m).map(|p| (m, p)))?;
     Some(TwoView {
-        model,
+        model: used,
         r,
         t: t.normalize(),
         points,
@@ -540,6 +606,17 @@ mod tests {
         assert!(rot_angle_deg(&r, &r_gt) < 1e-6);
         assert!(t.normalize().dot(&t_gt.normalize()).abs() > 1.0 - 1e-9);
         assert_eq!(pts.iter().filter(|p| p.z <= 0.0).count(), 0);
+    }
+
+    #[test]
+    fn homography_recovers_pose_on_plane() {
+        let (corrs, r_gt, t_gt) = scene(150, true, 0.0);
+        let tv = initialize(&corrs, InitOptions::default()).expect("init");
+        assert_eq!(tv.model, Model::Homography);
+        let dr = rot_angle_deg(&tv.r, &r_gt);
+        assert!(dr < 1.5, "R off on plane: {dr:.4}°");
+        let cos = tv.t.normalize().dot(&t_gt.normalize()).abs();
+        assert!(cos > 0.99, "t dir off on plane: cos={cos}");
     }
 
     #[test]
