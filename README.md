@@ -32,7 +32,9 @@ crates/
   fast/             — FAST-9 + grayscale image/pyramid (NEON), no deps but rayon
   slam-core/        — camera-free geometry/optimization: lie (SO3/SE3),
                       camera (pinhole+Brown–Conrady), intrinsics,
-                      optimize (LM+Huber), twoview, tracking, dataset
+                      optimize (LM+Huber), twoview, tracking, map
+                      (keyframes/covisibility), local_ba (Schur),
+                      triangulation, dataset
 src/
   error.rs        — crate-wide Error / Result
   api.rs          — wire contract: telemetry, command protocol, request bodies

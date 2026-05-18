@@ -19,8 +19,9 @@ keyframes / local BA / loop closing yet (M5+).
   the live pipeline with a top-down map in the WebUI.
 - **M4** ✅ Tracking thread — constant-velocity model + motion-only BA
   (Huber) re-finding map points each frame; live trajectory.
-- **M5** 🔄 Local mapping — **M5-0 done** (explicit `Stage` enum);
-  keyframes / covisibility / local BA next.
+- **M5** 🔄 Local mapping — slam-core core **done** (M5-0 `Stage`
+  enum; M5-1a map/covisibility; M5-1b block-sparse Schur local BA;
+  M5-1c gated triangulation). Only the M5-2 frontend wiring remains.
 - Testing stabilized: the pipeline state machine is a testable
   `Frontend::on_frame` seam covered by headless `pipeline_tests`;
   `slam_bench` / `slam_replay` harnesses; decoupled frontend thread.
@@ -91,14 +92,22 @@ session):
 
 ### M5 — Local Mapping thread 🔄
 
+slam-core core complete; only the M5-2 frontend wiring remains.
+
 - **M5-0 ✅** explicit `Stage` enum (`Bootstrapping` / `Tracking`),
-  replacing the implicit `Option` trio — sets up the new states below.
-- Keyframe insertion policy; covisibility graph + spanning tree.
-- Epipolar-guided triangulation of new map points.
-- **Local BA** over a keyframe window — the Pi 4 performance crux; runs
-  on a slow background thread, as the current decoupled design
-  anticipates.
-- Map-point and keyframe culling.
+  replacing the implicit `Option` trio.
+- **M5-1a ✅** `map`: keyframes / map points / covisibility graph +
+  spanning tree / culling / `needs_keyframe` insertion policy /
+  `local_window` selector.
+- **M5-1b ✅** `local_ba`: block-sparse Schur local bundle adjustment
+  over a covisibility window (the Pi 4 performance crux).
+- **M5-1c ✅** `triangulation`: gated two-view new-point triangulation
+  (cheirality / parallax / symmetric reprojection).
+- **M5-2 ⏭** wiring: in `Frontend`, insert keyframes via
+  `needs_keyframe`, spawn points via `triangulate`, run
+  `local_bundle_adjust` over `local_window` (decoupled background
+  thread per the perf strategy); per-keyframe raw-feature storage for
+  inter-keyframe matching; extend `pipeline_tests`.
 - **Visible deliverable:** growing map point cloud + keyframes on the
   top-down canvas.
 
