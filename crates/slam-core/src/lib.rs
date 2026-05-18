@@ -26,6 +26,8 @@
 //! - [`bow`] — binary Bag-of-Words vocabulary + database for place
 //!   recognition / loop closure / relocalization (M6).
 //! - [`pnp`] — P3P + RANSAC pose recovery from 3D↔2D matches (M6).
+//! - [`sim3`] — Sim(3) group + Essential-graph pose-graph optimization
+//!   for loop-closure / scale-drift correction (M6).
 
 pub mod bow;
 pub mod camera;
@@ -36,6 +38,7 @@ pub mod local_ba;
 pub mod map;
 pub mod optimize;
 pub mod pnp;
+pub mod sim3;
 pub mod tracking;
 pub mod triangulation;
 pub mod twoview;
