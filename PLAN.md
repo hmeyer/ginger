@@ -169,15 +169,18 @@ testable sub-steps:
   a DB entry back to its keyframe. Pipeline test: a long sweep
   self-trains, indexes every keyframe, and a query resolves an earlier
   place to an earlier keyframe (deterministic).
-- **M6-2c ⏭ — relocalization on track loss.** Add `Stage::Lost { since
-  }` (the planned `Stage` extension). After a short run of failed
-  tracks: BoW-query the DB for the current frame → for the top
-  candidates, guided-match the frame's descriptors to those keyframes'
-  observed **map points** (descriptor carried in `map`) → assemble
-  `pnp::Observation`s (3D map point ↔ normalized obs) → `pnp_ransac` →
-  on enough inliers, jump pose back and resume `Tracking`; else stay
-  `Lost` (map uncorrupted, no trajectory growth). Bounded candidates/
-  iters so it stays on the tracking thread without stalling.
+- **M6-2c ✅ — relocalization on track loss.** Added `Stage::Lost {
+  since, track }`: a lost track (weak/failed solve, or too few map
+  matches) saves the trajectory/map context and transitions to `Lost`
+  instead of dead-ending. Each lost frame BoW-queries the place DB →
+  collects candidate keyframes' (+ covisible) observed **map points**
+  (3D pos + descriptor from `map`) → brute-force match (candidate-
+  restricted) → `pnp::pnp_ransac` (bounded iters, conservative
+  `RELOC_MIN_INLIERS`) → on success append the recovered pose and
+  resume `Tracking`; else stay `Lost` (map + trajectory frozen — no
+  corruption). Runs on the tracking thread (bounded). Pipeline test:
+  garbage frames lose the track without corruption, a recognizable
+  frame relocalizes, tracking continues.
 - **M6-2d ⏭ — loop closing on the `LocalMapper` thread.** Per new
   keyframe (after local BA): BoW-query the DB **excluding covisible +
   recent** keyframes; on a candidate passing the score gate, geometric
@@ -230,7 +233,7 @@ markers (orange squares).
 ## Sequencing & risks
 
 - **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
-  **M6 (in progress: M6-1a/b/c ✅; M6-2 wiring: a✅ b✅, c→e next)**.
+  **M6 (in progress: M6-1a/b/c ✅; M6-2 wiring: a✅ b✅ c✅, d→e next)**.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing
