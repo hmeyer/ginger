@@ -31,31 +31,27 @@ no pose, no map, no geometry.
 
 ## Milestones
 
-### M2 — Calibration + pinhole model + replay harness
+### M2 — Calibration + pinhole model + replay harness ✅ (foundation done)
 
-Foundation only; no SLAM yet. **Detailed plan:
-[`m2-plan.md`](m2-plan.md)** (camera prior, hardware-accel /
-NEON strategy, math backbone, work breakdown, exit criteria).
+Foundation only; no SLAM behaviour. **Detailed plan + status:
+[`m2-plan.md`](m2-plan.md)**.
 
-Decided: proceed on the Pi Camera "rev 1.3" standard-lens prior
-(FOV-derived, flagged unverified); pure-Rust math (`nalgebra` + a small
-`lie`/solver, no BLAS); reuse the `crates/fast` scalar→NEON→parity-test
-discipline for all geometry kernels.
+Done: `ginger-slam-core` (hand-rolled SO3/SE3 `lie`, pinhole +
+Brown–Conrady `CameraModel`, dense LM + Huber, PGM `dataset`); rev 1.3
+FOV prior wired into `slam` with an `UNVERIFIED` HUD badge over
+`/api/slam/stream`; `/api/slam/map` + top-down canvas stub; **mock
+camera** behind an opt-out `libcamera` Cargo feature so the whole crate
+builds/tests headless; deterministic `slam_replay` runner; `slam_bench`
+geometry stages; `headless` + `aarch64-check` CI jobs. Pure-Rust math
+(`nalgebra`, no BLAS); `crates/fast` scalar→NEON→parity discipline kept
+for future kernels.
 
-Open follow-up (deferred, needs a physical target): **proper camera
-calibration** — offline OpenCV ChArUco tool emitting a verified
-`slam.toml`. Not kalibr.
-
-- Calibrate the OV5647 (checkerboard) or seed known intrinsics plus a
-  calibration utility; store `K` + distortion.
-- `src/slam/camera_model.rs`: project / unproject / keypoint
-  undistortion.
-- Offline replay: feed a recorded YUYV/PNG sequence through
-  `detect_features` → matching, deterministically. Extend the
-  `slam_bench` pattern.
-- Decide the math backbone (recommended: `nalgebra` + hand-rolled SE3 +
-  a small Gauss-Newton / Levenberg-Marquardt; full BA libraries are
-  heavy for a Pi 4).
+Open follow-ups (deferred, need the physical robot + target in one
+session):
+- **Proper camera calibration** — offline OpenCV ChArUco tool emitting a
+  verified `slam.toml`. Not kalibr.
+- **Frame recorder** — dump live libcamera frames to `*.pgm` to feed the
+  (already-built) replay harness with real robot scenes.
 
 ### M3 — Two-view monocular initialization
 

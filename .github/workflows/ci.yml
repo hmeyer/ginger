@@ -67,8 +67,43 @@ jobs:
 
       - run: make lint
 
-  aarch64-fast:
-    name: aarch64 FAST check
+  headless:
+    name: Headless (mock camera)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--no-default-features` drops libcamera and swaps in the mock
+      # camera, so the whole crate (server, SLAM frontend, replay
+      # harness) builds and tests headless — no from-source libcamera.
+      - name: Test + clippy (no libcamera)
+        run: |
+          cargo test --workspace --no-default-features
+          cargo clippy --workspace --no-default-features --all-targets -- -D warnings
+
+      # Deterministic replay-harness smoke over generated PGM frames.
+      - name: Replay harness smoke
+        run: |
+          mkdir -p /tmp/rt
+          python3 - <<'PY'
+          W,H=96,72
+          for f in range(5):
+              b=bytearray()
+              for y in range(H):
+                  for x in range(W):
+                      b.append(min(255,((((x+f*3)//8)+(y//8))%2)*200+((x*7+y*13+f*5)%40)))
+              open(f"/tmp/rt/frame_{f:04d}.pgm","wb").write(b"P5\n%d %d\n255\n"%(W,H)+bytes(b))
+          PY
+          cargo run --no-default-features --example slam_replay -- /tmp/rt
+
+  aarch64-check:
+    name: aarch64 cross-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,11 +114,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Compile-only check of the NEON path. `ginger-fast` depends only
-      # on `rayon`, so this needs no libcamera/v4l cross-build and no
-      # linker (cargo check does not link). Correctness is verified by
-      # the `neon_parity` differential test run natively on the Pi.
+      # Compile-only check of the NEON / geometry paths. `ginger-fast`
+      # and `ginger-slam-core` are dependency-light (no libcamera/v4l,
+      # no linker — cargo check does not link). Correctness is verified
+      # by the differential / unit tests run natively + in `headless`.
       - run: cargo check -p ginger-fast --target aarch64-unknown-linux-gnu
+      - run: cargo check -p ginger-slam-core --target aarch64-unknown-linux-gnu
 
   audit:
     name: Audit

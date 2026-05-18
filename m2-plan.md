@@ -134,21 +134,33 @@ SSE → `index.html` video overlay + `#slam-hud`.
   warning while `verified = false`.
 - Wire `slam::run` to build the `CameraModel` from actual resolution.
 
-### D. Replay harness
-- **Recorder:** env-gated dump of live frames (raw YUYV + timestamp).
-- **Replay runner:** generalize `examples/slam_bench.rs` to read an
-  ordered frame directory deterministically; accept either a recorded Pi
-  clip or a standard dataset (TUM/EuRoC/KITTI mono) with its own
-  intrinsics TOML. This is what makes M3+ correctness regression-testable
-  headless / in CI.
+### D. Replay harness — **done**
+- **Mock camera (decided):** `libcamera` is now an opt-out default Cargo
+  feature; `--no-default-features` swaps in `src/camera/mock.rs`, a
+  drop-in `camera_loop` that serves frames from `GINGER_MOCK_FRAMES`
+  (looped `*.pgm`) or a deterministic synthetic scene. This makes the
+  *whole* crate (server, SLAM frontend, replay) build/test headless and
+  in CI — no from-source libcamera. Pi build is unchanged (`cargo build`,
+  default on).
+- **Replay runner:** `examples/slam_replay.rs` reads an ordered `*.pgm`
+  directory via `slam-core`'s `FrameSequence`, runs the real
+  `detect_features` + `match_descriptors`, and prints a stable,
+  timing-free summary (deterministic — verified identical across runs).
+  Accepts a recorded clip or a public dataset (TUM/EuRoC/KITTI) with its
+  own `slam.toml`.
+- **Recorder: deferred** — the only libcamera-coupled piece left, and
+  ground-truthed public datasets are the better M3+ input anyway. Bundled
+  with the calibration follow-up (both need the physical robot + target).
 - Commit only a tiny synthetic clip; document fetching a public set
   (sequences are large; keep them gitignored).
 
-### E. Bench + CI
-- Extend `slam_bench` with geometry/solver stages so M2 math has the
-  same measured A/B loop as the frontend.
-- CI keeps `cargo check -p slam-core --target aarch64-unknown-linux-gnu`
-  (cross-compile guard) + parity tests.
+### E. Bench + CI — **done**
+- `slam_bench` extended with geometry/solver stages (`project`,
+  `lm-solve`) so the M2 math rides the same measured A/B loop.
+- New `headless` CI job: `cargo test/clippy --workspace
+  --no-default-features` + a `slam_replay` smoke. `aarch64-check` job
+  now also cross-checks `ginger-slam-core`. The existing from-source
+  libcamera `lint` job stays so the real path can't bit-rot.
 
 ### F. WebUI status surface
 - Extend `SlamSnapshot` with `intrinsics { fx, fy, cx, cy, fov_deg,
@@ -160,8 +172,8 @@ SSE → `index.html` video overlay + `#slam-hud`.
 
 ## Sequencing
 
-A → (B, C parallel) → D → E. E's recorder feeds the first real Pi clip;
-the FOV prior is the placeholder until calibration lands.
+A → (B, C parallel) → D → E, all done. The replay path is dataset-fed
+(headless/CI); the FOV prior is the placeholder until calibration lands.
 
 ## Risks
 
@@ -176,20 +188,23 @@ the FOV prior is the placeholder until calibration lands.
   dense LM and the small-block NEON kernels in M2 so M5 only adds the
   sparse Schur structure, not new numerics.
 
-## Deferred follow-ups
+## Deferred follow-ups (need the physical robot + target, same session)
 
-- **Proper camera calibration** (blocked on a physical target). Offline
-  `tools/calibrate.py` (OpenCV ChArUco) consuming recorded frames →
-  emits `slam.toml` with `verified = true`. Not kalibr (overkill: ROS,
-  AprilGrid, built for cam-IMU/multi-cam). Mirrored as the open M2 item
-  in `PLAN.md`.
+- **Proper camera calibration.** Offline `tools/calibrate.py` (OpenCV
+  ChArUco) → emits `slam.toml` with `verified = true`. Not kalibr
+  (overkill: ROS, AprilGrid, built for cam-IMU/multi-cam).
+- **Frame recorder.** Env-gated dump of live libcamera frames to `*.pgm`
+  so real robot scenes can feed the (already-built) replay harness.
 
-## Exit criteria
+Both mirrored as the open M2 items in `PLAN.md`.
 
-- `slam-core` cross-compiles to aarch64; parity tests green.
-- `CameraModel` round-trip tests pass; built from live resolution with
-  the flagged rev 1.3 prior.
-- Replay runner reproduces a deterministic detect→match over a frame
-  directory (Pi clip and one public dataset).
-- `slam_bench` reports geometry/solver stages.
-- No SLAM behaviour yet — that's M3.
+## Exit criteria — met
+
+- ✅ `slam-core` cross-compiles to aarch64 (CI `aarch64-check`); unit
+  tests green.
+- ✅ `CameraModel` round-trip tests pass; built from the live resolution
+  with the flagged rev 1.3 prior.
+- ✅ Replay runner reproduces a deterministic detect→match over a frame
+  directory, headless + in CI (recorded clip or public dataset).
+- ✅ `slam_bench` reports geometry/solver stages.
+- ✅ No SLAM behaviour yet — that's M3.

@@ -993,6 +993,7 @@ dependencies = [
  "libc",
  "libcamera",
  "log",
+ "nalgebra",
  "rayon",
  "rppal",
  "serde",

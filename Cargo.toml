@@ -14,7 +14,7 @@ rppal = "0.22"
 log = "0.4"
 env_logger = "0.11"
 thiserror = "2"
-libcamera = "0.7"
+libcamera = { version = "0.7", optional = true }
 
 # Web server
 axum = "0.8"
@@ -28,6 +28,19 @@ rayon = "1"
 webrtc = "0.17"
 v4l = "0.14"
 libc = "0.2.186"
+
+# `libcamera` is the only system-coupled dep; making it an opt-out
+# default feature lets CI / dev machines build and run the full crate
+# (server, slam frontend, replay harness) headless with a mock camera,
+# while the Pi build stays a plain `cargo build` (default on).
+[features]
+default = ["libcamera"]
+libcamera = ["dep:libcamera"]
+
+# Only the `slam_bench` example needs nalgebra directly (to build the
+# geometry-stage inputs); keep it out of the runtime crate.
+[dev-dependencies]
+nalgebra = "0.34"
 
 [[bin]]
 name = "ginger"
