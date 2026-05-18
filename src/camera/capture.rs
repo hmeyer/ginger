@@ -8,8 +8,11 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "libcamera")]
+use std::time::Instant;
 
+#[cfg(feature = "libcamera")]
 use libcamera::{
     camera::CameraConfigurationStatus,
     camera_manager::CameraManager,
@@ -22,10 +25,19 @@ use libcamera::{
     stream::StreamRole,
 };
 
-use crate::camera::auto_exposure::{ExposureConfig, ae_step, mean_luma, settings_to_brightness};
+use crate::camera::auto_exposure::ExposureConfig;
+#[cfg(feature = "libcamera")]
+use crate::camera::auto_exposure::{ae_step, mean_luma, settings_to_brightness};
 use crate::{Error, Result};
 
+// Headless replacement for the libcamera capture loop. Same signature,
+// selected when the `libcamera` feature is off (CI / dev machines).
+#[cfg(not(feature = "libcamera"))]
+use super::mock::camera_loop;
+
+#[cfg(feature = "libcamera")]
 const YUYV: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'Y', b'U', b'Y', b'V']), 0);
+#[cfg(feature = "libcamera")]
 const WARMUP_FRAMES: usize = 5;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -72,12 +84,12 @@ impl Frame {
 
 // ── Internal shared state ─────────────────────────────────────────────────────
 
-struct FrameState {
-    frame: Option<Arc<Frame>>,
-    generation: u64,
+pub(crate) struct FrameState {
+    pub(crate) frame: Option<Arc<Frame>>,
+    pub(crate) generation: u64,
 }
 
-type Shared = Arc<(Mutex<FrameState>, Condvar)>;
+pub(crate) type Shared = Arc<(Mutex<FrameState>, Condvar)>;
 
 // ── Camera ────────────────────────────────────────────────────────────────────
 
@@ -166,6 +178,7 @@ impl Camera {
 
 // ── Background capture loop ───────────────────────────────────────────────────
 
+#[cfg(feature = "libcamera")]
 fn camera_loop(
     shared: Shared,
     fps_x10: Arc<AtomicU32>,
@@ -177,6 +190,7 @@ fn camera_loop(
     }
 }
 
+#[cfg(feature = "libcamera")]
 fn run_camera(
     shared: Shared,
     fps_x10: Arc<AtomicU32>,

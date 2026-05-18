@@ -105,6 +105,88 @@ fn main() {
     println!("  ----------------");
     println!("  TOTAL     {total:>7.2}   ({:.1} fps)", 1000.0 / total);
     println!("  corners   {n_kept}/{n_total} kept/total");
+
+    geometry_stages();
+}
+
+/// M2 math stages, on the same measured A/B loop as the frontend so
+/// `slam-core` changes (CameraModel, the LM solver) are tracked too.
+fn geometry_stages() {
+    use ginger_slam_core::camera::CameraModel;
+    use ginger_slam_core::intrinsics::Intrinsics;
+    use ginger_slam_core::optimize::{LeastSquaresProblem, LmOptions, levenberg_marquardt};
+    use nalgebra::{DMatrix, DVector, Vector3};
+
+    // project ∘ unproject round-trip over a deterministic point cloud.
+    let cam: CameraModel = Intrinsics::rev1_3_prior(640, 480).to_camera_model();
+    let pts: Vec<Vector3<f64>> = (0..200_000)
+        .map(|i| {
+            let t = i as f64 * 1e-4;
+            Vector3::new(
+                (t).sin() * 0.4,
+                (t * 1.3).cos() * 0.3,
+                1.0 + (t * 0.2).sin() * 0.5,
+            )
+        })
+        .collect();
+    let t = Instant::now();
+    let mut acc = 0.0f64;
+    for p in &pts {
+        if let Some(px) = cam.project(p) {
+            acc += cam.unproject(&px).x;
+        }
+    }
+    std::hint::black_box(acc);
+    let proj_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    // One representative dense LM solve (a 2-param nonlinear fit).
+    struct Fit {
+        xs: Vec<f64>,
+        ys: Vec<f64>,
+    }
+    impl LeastSquaresProblem for Fit {
+        fn residuals(&self, p: &DVector<f64>) -> DVector<f64> {
+            DVector::from_iterator(
+                self.xs.len(),
+                self.xs
+                    .iter()
+                    .zip(&self.ys)
+                    .map(|(&x, &y)| p[0] * (p[1] * x).exp() - y),
+            )
+        }
+        fn jacobian(&self, p: &DVector<f64>) -> DMatrix<f64> {
+            DMatrix::from_fn(self.xs.len(), 2, |i, c| {
+                let x = self.xs[i];
+                if c == 0 {
+                    (p[1] * x).exp()
+                } else {
+                    p[0] * x * (p[1] * x).exp()
+                }
+            })
+        }
+    }
+    let xs: Vec<f64> = (0..200).map(|i| i as f64 * 0.02).collect();
+    let ys: Vec<f64> = xs.iter().map(|&x| 2.5 * (-0.7 * x).exp()).collect();
+    let prob = Fit { xs, ys };
+    let iters = 200;
+    let t = Instant::now();
+    let mut conv = 0;
+    for _ in 0..iters {
+        let r = levenberg_marquardt(
+            &prob,
+            DVector::from_vec(vec![1.0, 0.0]),
+            LmOptions::default(),
+        );
+        conv += r.converged as i32;
+    }
+    let solve_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    println!("  ---- geometry (slam-core, M2) ----");
+    println!("  project   {:>7.2}   <- 200k project∘unproject", proj_ms);
+    println!(
+        "  lm-solve  {:>7.3}   <- per solve ({conv}/{iters} conv)",
+        solve_ms
+    );
 }
 
 #[derive(Default)]
