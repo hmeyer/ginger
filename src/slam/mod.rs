@@ -1,13 +1,16 @@
 //! Visual SLAM frontend (ORB-SLAM-style), built up in milestones.
 //!
-//! **M1 (current): FAST + oriented BRIEF.** A dedicated thread consumes
-//! the camera independently of the H.264/WebRTC path, builds a grayscale
-//! scale pyramid, runs FAST-9 per level with non-maximal suppression and
-//! a grid-spread cap, computes an intensity-centroid orientation and a
-//! steered 256-bit BRIEF descriptor per keypoint, brute-force matches
-//! against the previous frame, and publishes a compact [`SlamSnapshot`]
-//! (points + match lines) for the WebUI to draw live. Later milestones
-//! add two-view init, local-map tracking, local BA and loop closing.
+//! **M3 (current): two-view monocular initialization.** A dedicated
+//! thread consumes the camera independently of the H.264/WebRTC path,
+//! builds a grayscale scale pyramid, runs FAST-9 per level (NMS +
+//! grid-spread cap), computes intensity-centroid orientation + a steered
+//! 256-bit BRIEF descriptor, and matches frames. Against an anchor
+//! frame it accumulates parallax and, once well-conditioned, runs the
+//! calibrated [`ginger_slam_core::twoview`] initializer (essential /
+//! homography → relative pose + triangulated points), publishing a
+//! [`SlamSnapshot`] (live overlay) and a [`MapSnapshot`] (top-down map).
+//! Later milestones add local-map tracking (M4), local BA + keyframes
+//! (M5) and loop closing (M6).
 
 pub mod brief;
 pub mod fast;
