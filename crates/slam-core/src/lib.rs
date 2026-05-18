@@ -23,7 +23,10 @@
 //! - [`map`] — keyframes / map points / covisibility graph (M5).
 //! - [`local_ba`] — block-sparse Schur local bundle adjustment (M5).
 //! - [`triangulation`] — gated two-view new-point triangulation (M5).
+//! - [`bow`] — binary Bag-of-Words vocabulary + database for place
+//!   recognition / loop closure / relocalization (M6).
 
+pub mod bow;
 pub mod camera;
 pub mod dataset;
 pub mod intrinsics;

@@ -34,7 +34,7 @@ crates/
                       camera (pinhole+Brown–Conrady), intrinsics,
                       optimize (LM+Huber), twoview, tracking, map
                       (keyframes/covisibility), local_ba (Schur),
-                      triangulation, dataset
+                      triangulation, bow (Bag-of-Words DB), dataset
 src/
   error.rs        — crate-wide Error / Result
   api.rs          — wire contract: telemetry, command protocol, request bodies
