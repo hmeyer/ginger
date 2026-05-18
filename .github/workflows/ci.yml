@@ -56,8 +56,33 @@ jobs:
           echo "PKG_CONFIG_PATH=/opt/libcamera/lib/pkgconfig:/opt/libcamera/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=/opt/libcamera/lib:/opt/libcamera/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
 
-      - name: Install Rust linker deps
-        run: sudo apt-get install -y --no-install-recommends libclang-dev
+      # bindgen (via libcamera-sys) only needs libclang at build time,
+      # and clang-sys honours LIBCLANG_PATH. The runner already ships
+      # LLVM 16/17/18, so point bindgen at the preinstalled toolchain
+      # instead of apt-installing the whole libclang-dev tree (~7 min).
+      # Fall back to apt only if libclang is somehow absent, so this can
+      # never be slower than the previous unconditional install.
+      - name: Provide libclang for bindgen
+        run: |
+          set -eu
+          found=""
+          for d in \
+            "$(llvm-config-18 --libdir 2>/dev/null || true)" \
+            "$(llvm-config --libdir 2>/dev/null || true)" \
+            /usr/lib/llvm-18/lib /usr/lib/llvm-17/lib /usr/lib/llvm-16/lib \
+            /usr/lib/x86_64-linux-gnu; do
+            if [ -n "$d" ] && ls "$d"/libclang*.so* >/dev/null 2>&1; then
+              found="$d"; break
+            fi
+          done
+          if [ -n "$found" ]; then
+            echo "Using preinstalled libclang at $found"
+            echo "LIBCLANG_PATH=$found" >> "$GITHUB_ENV"
+          else
+            echo "Preinstalled libclang not found; installing libclang-dev"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends libclang-dev
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
