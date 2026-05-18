@@ -202,7 +202,8 @@ impl LocalMapper {
                 info!(
                     "slam: local map kf{kf} +{created} pts · BA {cams}c/{pts}p \
                      cost {:.3e}→{:.3e}",
-                    rep.cost0, rep.cost1, /**/
+                    rep.cost0,
+                    rep.cost1, /**/
                     cams = rep.cameras,
                     pts = rep.points,
                 );
@@ -245,8 +246,8 @@ impl LocalMapper {
             let mut m = self.map.lock().unwrap();
             for (i, j) in pairs {
                 let (i, j) = (i as usize, j as usize);
-                let bound = self.raw[&kf].assigned[i].is_some()
-                    || self.raw[&c].assigned[j].is_some();
+                let bound =
+                    self.raw[&kf].assigned[i].is_some() || self.raw[&c].assigned[j].is_some();
                 if bound {
                     continue;
                 }

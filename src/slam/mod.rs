@@ -669,8 +669,7 @@ impl Frontend {
                                     let mut b_assigned = vec![None; points.len()];
                                     let (n, kf1) = {
                                         let mut w = self.world.lock().unwrap();
-                                        let kf0 =
-                                            w.add_keyframe(Isometry3::identity(), Vec::new());
+                                        let kf0 = w.add_keyframe(Isometry3::identity(), Vec::new());
                                         let kf1 = w.add_keyframe(pose2, Vec::new());
                                         let mut pi = 0usize;
                                         let mut n = 0usize;
@@ -874,8 +873,7 @@ impl Frontend {
                             }
                         }
                     } else {
-                        self.map.status =
-                            format!("tracking lost: only {} map matches", mm.len());
+                        self.map.status = format!("tracking lost: only {} map matches", mm.len());
                     }
                 }
             }
@@ -1130,11 +1128,7 @@ mod pipeline_tests {
     /// features, then synchronously drive the local mapper exactly as
     /// its thread would (the tested seam is identical to production —
     /// only the driver differs: sync pump vs `recv` loop).
-    fn step(
-        fe: &mut Frontend,
-        fp: &[FeaturePoint],
-        fd: &[brief::Descriptor],
-    ) -> FrameOut {
+    fn step(fe: &mut Frontend, fp: &[FeaturePoint], fd: &[brief::Descriptor]) -> FrameOut {
         let out = fe.on_frame(fp, fd, W, H);
         fe.pump_local_mapper();
         out
@@ -1242,10 +1236,7 @@ mod pipeline_tests {
         assert!(n_kf >= 3, "too few keyframes: {n_kf}");
         // … and the local mapper triangulated new points beyond the
         // bootstrap set as fresh landmarks swept into view.
-        assert!(
-            n_pts > init_pts,
-            "map did not grow: {init_pts} → {n_pts}"
-        );
+        assert!(n_pts > init_pts, "map did not grow: {init_pts} → {n_pts}");
         // Published snapshot stays consistent + finite.
         assert_eq!(out.map.n_points as usize, n_pts);
         assert!(out.map.keyframes.len() >= 3);
