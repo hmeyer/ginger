@@ -142,3 +142,23 @@ Durable engineering guidance for M4–M6 kernels (the Pi 4 is a quad-core
   not a generic sparse lib: the Schur inner kernels are L1-resident and
   auto-vectorize well. nalgebra for the blocks; the block-sparse Schur
   (M5) is hand-written — it's a layout change, not new numerics.
+
+## Verification
+
+The gating correctness signal is **fast, deterministic, headless
+`cargo test`** (CI `Headless` + `aarch64-check`), with three tiers:
+
+- **slam-core unit tests** — geometry/optimization math on synthetic
+  scenes with ground truth (`lie`, `camera`, `optimize`, `twoview`,
+  `tracking`).
+- **Pipeline integration tests** (`src/slam`, `pipeline_tests`) — drive
+  the full `Frontend` state machine (anchor → two-view init → tracking →
+  trajectory) via synthetic features projected from a known 3D scene +
+  camera path, **bypassing image detection** (separately tested). The
+  `slam::run` loop is a thin camera/server wrapper around the tested
+  `Frontend::on_frame` seam.
+- **`slam_replay`** — deterministic detect→match over a PGM sequence.
+
+A live-server HTTP smoke is **on-Pi / non-gating only** (the sandbox
+SIGKILLs long-running spawned servers; it adds nothing the headless
+tests don't already gate).

@@ -414,7 +414,7 @@ impl MapState {
         [c.x as f32, c.z as f32]
     }
 
-    fn publish(&self, map: &Arc<RwLock<MapSnapshot>>, status: String, n_tracked: u32) {
+    fn publish(&self, snap: &mut MapSnapshot, status: String, n_tracked: u32) {
         let points: Vec<[f32; 2]> = self
             .pts
             .iter()
@@ -424,18 +424,16 @@ impl MapState {
         let n = self.poses.len();
         let start = n.saturating_sub(MAX_TRAJECTORY);
         let cameras: Vec<[f32; 2]> = self.poses[start..].iter().map(Self::centre).collect();
-        if let Ok(mut m) = map.write() {
-            *m = MapSnapshot {
-                status,
-                model: self.model.clone(),
-                n_points: points.len() as u32,
-                points,
-                cameras,
-                r_h: self.r_h,
-                tracking: true,
-                n_tracked,
-            };
-        }
+        *snap = MapSnapshot {
+            status,
+            model: self.model.clone(),
+            n_points: points.len() as u32,
+            points,
+            cameras,
+            r_h: self.r_h,
+            tracking: true,
+            n_tracked,
+        };
     }
 }
 
@@ -447,39 +445,59 @@ fn calib_norm(cam: &CameraModel, x: u16, y: u16) -> Vector2<f64> {
 
 // ── Frontend thread ───────────────────────────────────────────────────────────
 
-/// Own a dedicated thread: pull frames (independently of the video
-/// encoder), detect features, and publish into `snapshot`.
-pub fn run(
-    camera: Arc<Camera>,
-    snapshot: Arc<RwLock<SlamSnapshot>>,
-    map: Arc<RwLock<MapSnapshot>>,
-) {
-    let mut detect_ms = 0.0f32;
-    let mut fps = 0.0f32;
-    let mut stages = StageMs::default();
-    let mut frame_n: u64 = 0;
-    let mut last = Instant::now();
-    let mut prev: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)> = None;
-    // Two-view bootstrap: an anchor frame to accumulate parallax
-    // against, until `state` holds a map; then M4 tracking takes over.
-    let mut anchor: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)> = None;
-    let mut state: Option<MapState> = None;
-    // Resolved once from the first frame's resolution (the libcamera
-    // ViewFinder mode is full-FOV, so the FOV-derived prior is
-    // resolution-agnostic — no need to query libcamera properties).
-    let mut intrinsics: Option<Intrinsics> = None;
-    let mut iview = IntrinsicsView::uninitialized();
-    info!("slam: frontend started (FAST + oriented BRIEF, {N_LEVELS} levels)");
+/// Per-frame output of [`Frontend::on_frame`]: overlay match lines, the
+/// current intrinsics view + map snapshot, and the overlay-match wall
+/// time (ms) for the HUD `matching` stage.
+pub struct FrameOut {
+    pub matches: Vec<Match>,
+    pub intrinsics: IntrinsicsView,
+    pub map: MapSnapshot,
+    pub match_ms: f32,
+}
 
-    loop {
-        let frame = camera.wait_frame();
-        let t0 = Instant::now();
-        let tg = Instant::now();
-        let gray = gray_from_yuyv(&frame);
-        let gray_ms = ms(tg.elapsed());
+/// The camera-free SLAM pipeline state machine: intrinsics resolution,
+/// frame-to-frame overlay matching, two-view initialization and live
+/// tracking. Pulled out of the camera/server loop so the whole pipeline
+/// is exercised by deterministic headless tests via [`Frontend::on_frame`]
+/// — no camera, server, or sleeping.
+pub struct Frontend {
+    prev: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)>,
+    anchor: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)>,
+    state: Option<MapState>,
+    intrinsics: Option<Intrinsics>,
+    iview: IntrinsicsView,
+    map: MapSnapshot,
+}
 
-        if intrinsics.is_none() {
-            let i = resolve_intrinsics(gray.width as u32, gray.height as u32);
+impl Default for Frontend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Frontend {
+    pub fn new() -> Self {
+        Self {
+            prev: None,
+            anchor: None,
+            state: None,
+            intrinsics: None,
+            iview: IntrinsicsView::uninitialized(),
+            map: MapSnapshot::initial(),
+        }
+    }
+
+    /// Process one frame's detected features (level-0 pixel coords with
+    /// aligned descriptors). Pure given its inputs + prior state.
+    pub fn on_frame(
+        &mut self,
+        points: &[FeaturePoint],
+        descs: &[brief::Descriptor],
+        width: usize,
+        height: usize,
+    ) -> FrameOut {
+        if self.intrinsics.is_none() {
+            let i = resolve_intrinsics(width as u32, height as u32);
             if i.verified {
                 info!(
                     "slam: camera intrinsics verified (model={:?}, fov≈{:.1}°)",
@@ -494,18 +512,14 @@ pub fn run(
                     i.hfov_deg()
                 );
             }
-            iview = IntrinsicsView::of(&i);
-            intrinsics = Some(i);
+            self.iview = IntrinsicsView::of(&i);
+            self.intrinsics = Some(i);
         }
 
-        let (points, descs, n_total, mut stage) = detect_features(&gray);
-        stage.gray = gray_ms;
-        let n_kept = points.len() as u32;
-
-        // Brute-force match against the previous frame's descriptors.
+        // Overlay matches vs the previous frame (HUD only); time just this.
         let tm = Instant::now();
-        let matches = match &prev {
-            Some((pp, pd)) => brief::match_descriptors(pd, &descs)
+        let matches: Vec<Match> = match &self.prev {
+            Some((pp, pd)) => brief::match_descriptors(pd, descs)
                 .into_iter()
                 .map(|(i, j)| {
                     let a = pp[i as usize];
@@ -520,18 +534,23 @@ pub fn run(
                 .collect(),
             None => Vec::new(),
         };
-        stage.matching = ms(tm.elapsed());
+        let match_ms = ms(tm.elapsed());
 
         // Pre-init: accumulate parallax vs an anchor, run two-view init.
         // Post-init: project the map into each frame and refine the pose
-        // (constant-velocity prediction + motion-only BA).
-        if let Some(intr) = intrinsics.as_ref() {
-            let cam = intr.to_camera_model();
-            match state.as_mut() {
+        // (constant-velocity prediction + motion-only BA). Copy the
+        // intrinsics-derived values out so `self.intrinsics` is no
+        // longer borrowed while the state machine mutates other fields.
+        if let Some((cam, fx)) = self
+            .intrinsics
+            .as_ref()
+            .map(|i| (i.to_camera_model(), i.fx))
+        {
+            match self.state.as_mut() {
                 None => {
                     let mut want_anchor = false;
-                    if let Some((apts, adesc)) = anchor.as_ref() {
-                        let mm = brief::match_descriptors(adesc, &descs);
+                    if let Some((apts, adesc)) = self.anchor.as_ref() {
+                        let mm = brief::match_descriptors(adesc, descs);
                         if mm.len() >= INIT_MIN_MATCHES {
                             let mut disp: Vec<f32> = mm
                                 .iter()
@@ -545,7 +564,7 @@ pub fn run(
                                 .collect();
                             disp.sort_by(|x, y| x.partial_cmp(y).unwrap());
                             let med = disp[disp.len() / 2];
-                            let min_disp = gray.width as f32 * INIT_MIN_DISP_FRAC;
+                            let min_disp = width as f32 * INIT_MIN_DISP_FRAC;
                             if med >= min_disp {
                                 let corrs: Vec<twoview::Corr> = mm
                                     .iter()
@@ -587,15 +606,15 @@ pub fn run(
                                         twoview::Model::Homography => "homography",
                                     };
                                     let n = pts.len();
-                                    let ms = MapState {
+                                    let st = MapState {
                                         pts,
                                         desc,
                                         poses: vec![Isometry3::identity(), pose2],
                                         model: model.into(),
                                         r_h: tv.r_h as f32,
                                     };
-                                    ms.publish(
-                                        &map,
+                                    st.publish(
+                                        &mut self.map,
                                         format!("initialized: {n} pts via {model}"),
                                         n as u32,
                                     );
@@ -605,10 +624,10 @@ pub fn run(
                                         tv.r_h,
                                         mm.len()
                                     );
-                                    state = Some(ms);
+                                    self.state = Some(st);
                                 }
-                            } else if let Ok(mut m) = map.write() {
-                                m.status = format!(
+                            } else {
+                                self.map.status = format!(
                                     "parallax {med:.0}/{min_disp:.0}px · {} matches",
                                     mm.len()
                                 );
@@ -619,15 +638,13 @@ pub fn run(
                     } else {
                         want_anchor = true;
                     }
-                    if want_anchor && state.is_none() {
-                        anchor = Some((points.clone(), descs.clone()));
-                        if let Ok(mut m) = map.write() {
-                            m.status = "anchor set — translate sideways for parallax".into();
-                        }
+                    if want_anchor && self.state.is_none() {
+                        self.anchor = Some((points.to_vec(), descs.to_vec()));
+                        self.map.status = "anchor set — translate sideways for parallax".into();
                     }
                 }
                 Some(st) => {
-                    let mm = brief::match_descriptors(&st.desc, &descs);
+                    let mm = brief::match_descriptors(&st.desc, descs);
                     if mm.len() >= TRACK_MIN_MATCHES {
                         let obs: Vec<Observation> = mm
                             .iter()
@@ -645,8 +662,8 @@ pub fn run(
                         } else {
                             st.poses[np - 1]
                         };
-                        let huber = 2.0 / intr.fx;
-                        let thr = 5.0 / intr.fx;
+                        let huber = 2.0 / fx;
+                        let thr = 5.0 / fx;
                         match tracking::track_pose(&obs, &predict, huber, thr) {
                             Some(rep) if rep.converged && rep.n_inliers >= TRACK_MIN_INLIERS => {
                                 st.poses.push(rep.pose);
@@ -656,34 +673,68 @@ pub fn run(
                                 }
                                 let status =
                                     format!("tracking: {}/{} inliers", rep.n_inliers, obs.len());
-                                st.publish(&map, status, rep.n_inliers as u32);
+                                st.publish(&mut self.map, status, rep.n_inliers as u32);
                             }
                             Some(rep) => {
-                                if let Ok(mut m) = map.write() {
-                                    m.status = format!(
-                                        "tracking weak: {}/{} inliers",
-                                        rep.n_inliers,
-                                        obs.len()
-                                    );
-                                }
+                                self.map.status = format!(
+                                    "tracking weak: {}/{} inliers",
+                                    rep.n_inliers,
+                                    obs.len()
+                                );
                             }
                             None => {
-                                if let Ok(mut m) = map.write() {
-                                    m.status = "tracking lost (solve failed)".into();
-                                }
+                                self.map.status = "tracking lost (solve failed)".into();
                             }
                         }
-                    } else if let Ok(mut m) = map.write() {
-                        m.status = format!("tracking lost: only {} map matches", mm.len());
+                    } else {
+                        self.map.status = format!("tracking lost: only {} map matches", mm.len());
                     }
                 }
             }
         }
 
-        prev = Some((points.clone(), descs));
+        self.prev = Some((points.to_vec(), descs.to_vec()));
+        FrameOut {
+            matches,
+            intrinsics: self.iview.clone(),
+            map: self.map.clone(),
+            match_ms,
+        }
+    }
+}
+
+// ── Frontend thread ───────────────────────────────────────────────────────────
+
+/// Own a dedicated thread: pull frames (independently of the video
+/// encoder), run the [`Frontend`] pipeline, and publish snapshots.
+pub fn run(
+    camera: Arc<Camera>,
+    snapshot: Arc<RwLock<SlamSnapshot>>,
+    map: Arc<RwLock<MapSnapshot>>,
+) {
+    let mut fe = Frontend::new();
+    let mut detect_ms = 0.0f32;
+    let mut fps = 0.0f32;
+    let mut stages = StageMs::default();
+    let mut frame_n: u64 = 0;
+    let mut last = Instant::now();
+    info!("slam: frontend started (FAST + oriented BRIEF, {N_LEVELS} levels)");
+
+    loop {
+        let frame = camera.wait_frame();
+        let t0 = Instant::now();
+        let tg = Instant::now();
+        let gray = gray_from_yuyv(&frame);
+        let gray_ms = ms(tg.elapsed());
+
+        let (points, descs, n_total, mut stage) = detect_features(&gray);
+        stage.gray = gray_ms;
+        let n_kept = points.len() as u32;
+
+        let out = fe.on_frame(&points, &descs, gray.width, gray.height);
+        stage.matching = out.match_ms;
 
         let elapsed = t0.elapsed().as_secs_f32() * 1000.0;
-
         let now = Instant::now();
         let dt = now.duration_since(last).as_secs_f32();
         last = now;
@@ -732,9 +783,12 @@ pub fn run(
                 stages,
                 fps,
                 points,
-                matches,
-                intrinsics: iview.clone(),
+                matches: out.matches,
+                intrinsics: out.intrinsics,
             };
+        }
+        if let Ok(mut m) = map.write() {
+            *m = out.map;
         }
     }
 }
@@ -775,5 +829,214 @@ mod tests {
         assert_eq!(n_total, 0);
         assert!(pts.is_empty());
         assert!(descs.is_empty());
+    }
+}
+
+/// Pipeline integration tests: drive the full [`Frontend`] state machine
+/// (anchor → two-view init → tracking) with deterministic synthetic
+/// features projected from a known 3D scene + camera trajectory. No
+/// camera, server, image detection, or sleeping — bypasses the
+/// (separately tested) image→features path by injecting features
+/// directly.
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use ginger_slam_core::camera::CameraModel;
+    use ginger_slam_core::intrinsics::Intrinsics;
+    use nalgebra::Isometry3;
+
+    const W: usize = 640;
+    const H: usize = 480;
+
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn byte(&mut self) -> u8 {
+            (self.f() * 256.0) as u8
+        }
+    }
+
+    /// `n` world landmarks (varied depth/lateral spread) each with a
+    /// unique, frame-stable BRIEF descriptor (mutually far apart → the
+    /// matcher pairs them unambiguously, isolating pipeline behaviour
+    /// from matcher robustness, which `brief` tests separately).
+    fn scene(n: usize) -> (Vec<Vector3<f64>>, Vec<brief::Descriptor>) {
+        let mut r = Rng(0x00AB_CDEF_1234_5678);
+        let mut pts = Vec::with_capacity(n);
+        let mut ds = Vec::with_capacity(n);
+        for _ in 0..n {
+            pts.push(Vector3::new(
+                (r.f() - 0.5) * 6.0,
+                (r.f() - 0.5) * 4.0,
+                3.0 + r.f() * 6.0,
+            ));
+            let mut d = [0u8; brief::DESC_BYTES];
+            for b in d.iter_mut() {
+                *b = r.byte();
+            }
+            ds.push(d);
+        }
+        (pts, ds)
+    }
+
+    /// `T_cw` for a camera that has translated `+tx` along world-x with
+    /// no rotation (centre = `(tx, 0, 0)`); frame 0 (`tx = 0`) = world.
+    fn pose(tx: f64) -> Isometry3<f64> {
+        Isometry3::translation(-tx, 0.0, 0.0)
+    }
+
+    /// Project the visible landmarks into one frame's features.
+    fn frame(
+        pts: &[Vector3<f64>],
+        ds: &[brief::Descriptor],
+        cam: &CameraModel,
+        tcw: &Isometry3<f64>,
+    ) -> (Vec<FeaturePoint>, Vec<brief::Descriptor>) {
+        let (mut fp, mut fd) = (Vec::new(), Vec::new());
+        for (xw, d) in pts.iter().zip(ds) {
+            let pc = tcw.rotation * xw + tcw.translation.vector;
+            if pc.z <= 0.1 {
+                continue;
+            }
+            if let Some(px) = cam.project(&pc)
+                && px.x >= 0.0
+                && px.y >= 0.0
+                && px.x < W as f64 - 1.0
+                && px.y < H as f64 - 1.0
+            {
+                fp.push(FeaturePoint {
+                    x: px.x.round() as u16,
+                    y: px.y.round() as u16,
+                    level: 0,
+                    score: 100,
+                    angle: 0.0,
+                });
+                fd.push(*d);
+            }
+        }
+        (fp, fd)
+    }
+
+    fn cam_model() -> CameraModel {
+        Intrinsics::rev1_3_prior(W as u32, H as u32).to_camera_model()
+    }
+
+    #[test]
+    fn full_lifecycle_anchor_init_tracking() {
+        let (pts, ds) = scene(240);
+        let cam = cam_model();
+        let mut fe = Frontend::new();
+
+        // Sideways sweep; frame 0 is the anchor, parallax then grows.
+        let mut last = None;
+        let mut init_frame = None;
+        for i in 0..24 {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.08));
+            assert!(
+                fp.len() >= INIT_MIN_MATCHES,
+                "frame {i}: only {} feats",
+                fp.len()
+            );
+            let out = fe.on_frame(&fp, &fd, W, H);
+            if out.map.tracking && init_frame.is_none() {
+                init_frame = Some(i);
+                assert!(["essential", "homography"].contains(&out.map.model.as_str()));
+                assert!(out.map.n_points > 20, "thin map: {}", out.map.n_points);
+            }
+            last = Some(out);
+        }
+
+        let init_at = init_frame.expect("never initialized");
+        assert!(init_at < 12, "init took too long: frame {init_at}");
+        let out = last.unwrap();
+        assert!(out.map.tracking);
+        assert!(
+            out.map.status.starts_with("tracking:"),
+            "final status: {}",
+            out.map.status
+        );
+        // Trajectory accumulated past the 2 init poses and moved.
+        assert!(out.map.cameras.len() > 5, "short trajectory");
+        let first = out.map.cameras[0];
+        let lastc = *out.map.cameras.last().unwrap();
+        let moved = ((first[0] - lastc[0]).powi(2) + (first[1] - lastc[1]).powi(2)).sqrt();
+        assert!(moved > 1e-3, "camera did not move: {moved}");
+    }
+
+    #[test]
+    fn trajectory_grows_each_tracked_frame() {
+        let (pts, ds) = scene(240);
+        let cam = cam_model();
+        let mut fe = Frontend::new();
+        for i in 0..8 {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.1));
+            fe.on_frame(&fp, &fd, W, H);
+        }
+        // Must be tracking by now.
+        let (fp, fd) = frame(&pts, &ds, &cam, &pose(0.8));
+        let a = fe.on_frame(&fp, &fd, W, H);
+        assert!(
+            a.map.tracking,
+            "not tracking after warm-up: {}",
+            a.map.status
+        );
+        let n0 = a.map.cameras.len();
+        let (fp, fd) = frame(&pts, &ds, &cam, &pose(0.9));
+        let b = fe.on_frame(&fp, &fd, W, H);
+        assert_eq!(b.map.cameras.len(), n0 + 1, "trajectory did not extend");
+        assert!(b.map.n_tracked >= TRACK_MIN_INLIERS as u32);
+    }
+
+    #[test]
+    fn tracking_lost_on_unmatchable_frame_without_corruption() {
+        let (pts, ds) = scene(240);
+        let cam = cam_model();
+        let mut fe = Frontend::new();
+        for i in 0..10 {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.1));
+            fe.on_frame(&fp, &fd, W, H);
+        }
+        let good = {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(1.0));
+            fe.on_frame(&fp, &fd, W, H)
+        };
+        assert!(good.map.tracking, "precondition: tracking");
+        let n_pts = good.map.n_points;
+        let traj = good.map.cameras.len();
+
+        // A frame of pure garbage descriptors → no map matches.
+        let mut r = Rng(0x99);
+        let fd: Vec<brief::Descriptor> = (0..200)
+            .map(|_| {
+                let mut d = [0u8; brief::DESC_BYTES];
+                for b in d.iter_mut() {
+                    *b = r.byte();
+                }
+                d
+            })
+            .collect();
+        let fp: Vec<FeaturePoint> = (0..200)
+            .map(|i| FeaturePoint {
+                x: (i % W) as u16,
+                y: (i % H) as u16,
+                level: 0,
+                score: 1,
+                angle: 0.0,
+            })
+            .collect();
+        let lost = fe.on_frame(&fp, &fd, W, H);
+        assert!(
+            lost.map.status.contains("lost"),
+            "status: {}",
+            lost.map.status
+        );
+        // Map not corrupted: points unchanged, trajectory not extended.
+        assert_eq!(lost.map.n_points, n_pts);
+        assert_eq!(lost.map.cameras.len(), traj);
     }
 }
