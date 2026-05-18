@@ -18,10 +18,13 @@
 //!   the first solver to harden per the M2 plan.
 //! - [`dataset`] — camera-free half of the replay harness: PGM
 //!   sequence + intrinsics loading.
+//! - [`twoview`] — two-view monocular initialization (M3).
+//! - [`tracking`] — constant-velocity prediction + motion-only BA (M4).
 
 pub mod camera;
 pub mod dataset;
 pub mod intrinsics;
 pub mod lie;
 pub mod optimize;
+pub mod tracking;
 pub mod twoview;
