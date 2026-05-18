@@ -121,14 +121,26 @@ session):
 - **Visible deliverable ✅:** growing, locally-bundle-adjusted point
   cloud + keyframe markers on the top-down canvas.
 
-### M6 — Relocalization + loop closing
+### M6 — Relocalization + loop closing 🔄
 
-- Bag-of-Words vocabulary over ORB for place recognition.
-- PnP-RANSAC relocalization on track loss.
-- Loop detection → Sim3 (monocular scale drift) → Essential-graph pose
-  optimization → global BA.
-- **Visible deliverable:** "loop detected" event + trajectory snapping
-  straighter on the canvas.
+slam-core retrieval primitive started; the rest is built on it.
+
+- **M6-1a ✅** `bow`: binary DBoW2-style visual vocabulary
+  (hierarchical Hamming k-means tree, trained offline + deterministic),
+  TF-IDF L1-normalized image vectors, and an inverted-index `Database`
+  for `query`-by-place. Camera-free, Pi-cheap (bitwise, no BLAS).
+  Deferred to M6-2: direct index (word→features for guided matching)
+  and on-disk vocabulary (de)serialization.
+- **M6-1b ⏭** `pnp`: P3P + RANSAC pose-from-3D↔2D (the recovery solver).
+- **M6-1c ⏭** Sim3 `lie` exp/log + Sim3 alignment + Essential-graph
+  pose-graph optimization (monocular scale drift); optional global BA.
+- **M6-2 ⏭** frontend wiring: relocalize on track loss (BoW candidates
+  → guided match → PnP-RANSAC); per-keyframe BoW added on insertion;
+  loop detection (query DB minus covisible/recent) → Sim3 verify →
+  pose-graph correction on the local-mapper thread; extend
+  `pipeline_tests`.
+- **Visible deliverable:** "relocalized" / "loop detected" event +
+  trajectory snapping straighter on the canvas.
 
 **WebUI surface:** all milestones draw into the single top-down canvas
 (`/api/slam/map`, `map` overlay mode) + the `#slam-hud` line; M3 filled
@@ -139,7 +151,7 @@ markers (orange squares).
 ## Sequencing & risks
 
 - **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
-  **M6 (next)**.
+  **M6 (in progress: M6-1a BoW ✅)**.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing
