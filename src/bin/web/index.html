@@ -817,18 +817,20 @@ startStream();
           mctx.arc(PX(x), PY(z), 1.4, 0, 6.283);
           mctx.fill();
         }
+        // Camera-centre trajectory: polyline + faint waypoints, start
+        // green, current (newest) yellow + larger.
         if (cams.length >= 2) {
-          mctx.strokeStyle = 'rgba(255,255,255,.5)';
+          mctx.strokeStyle = 'rgba(255,255,255,.55)';
           mctx.beginPath();
           mctx.moveTo(PX(cams[0][0]), PY(cams[0][1]));
-          mctx.lineTo(PX(cams[1][0]), PY(cams[1][1]));
+          for (let i = 1; i < cams.length; i++) mctx.lineTo(PX(cams[i][0]), PY(cams[i][1]));
           mctx.stroke();
         }
-        const camCols = ['#3cff78', '#5cf'];
         cams.forEach(([x, z], i) => {
-          mctx.fillStyle = camCols[i] || '#fc6';
+          const last = i === cams.length - 1;
+          mctx.fillStyle = i === 0 ? '#3cff78' : last ? '#fd6' : 'rgba(150,200,255,.5)';
           mctx.beginPath();
-          mctx.arc(PX(x), PY(z), 3.2, 0, 6.283);
+          mctx.arc(PX(x), PY(z), last ? 3.6 : 1.6, 0, 6.283);
           mctx.fill();
         });
       }

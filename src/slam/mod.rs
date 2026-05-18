@@ -24,8 +24,9 @@ use log::{info, warn};
 use serde::Serialize;
 
 use ginger_slam_core::camera::CameraModel;
+use ginger_slam_core::tracking::{self, Observation};
 use ginger_slam_core::twoview::{self, InitOptions};
-use nalgebra::Vector2;
+use nalgebra::{Isometry3, Rotation3, Translation3, UnitQuaternion, Vector2, Vector3};
 
 use crate::camera::Camera;
 use image::{GrayImage, build_pyramid, gray_from_yuyv};
@@ -37,6 +38,11 @@ use image::{GrayImage, build_pyramid, gray_from_yuyv};
 const INIT_MIN_MATCHES: usize = 80;
 const INIT_MIN_DISP_FRAC: f32 = 0.04;
 const ANCHOR_RESET_MATCHES: usize = 25;
+
+// Tracking gates: min map-point matches to attempt a pose solve, and
+// min reprojection inliers for the refined pose to be trusted.
+const TRACK_MIN_MATCHES: usize = 15;
+const TRACK_MIN_INLIERS: usize = 10;
 
 /// Where an operator-supplied calibration is read from, if present.
 /// Absent → the rev 1.3 FOV-derived prior (`verified = false`).
@@ -358,13 +364,17 @@ pub struct MapSnapshot {
     pub status: String,
     /// `"essential"`, `"homography"`, or empty before init.
     pub model: String,
-    /// Triangulated points, top-down `(x, z)`, view-1 frame.
+    /// Triangulated map points, top-down `(x, z)`, world (view-1) frame.
     pub points: Vec<[f32; 2]>,
-    /// Camera centres, top-down `(x, z)`: `[cam1, cam2]`.
+    /// Camera-centre trajectory, top-down `(x, z)`, oldest → newest.
     pub cameras: Vec<[f32; 2]>,
     pub n_points: u32,
-    /// Homography-vs-essential selection ratio of the solved model.
+    /// Homography-vs-essential selection ratio of the init model.
     pub r_h: f32,
+    /// True once tracking is live (post-initialization).
+    pub tracking: bool,
+    /// Map points matched+inlier in the latest tracked frame.
+    pub n_tracked: u32,
 }
 
 impl MapSnapshot {
@@ -376,6 +386,55 @@ impl MapSnapshot {
             cameras: Vec::new(),
             n_points: 0,
             r_h: 0.0,
+            tracking: false,
+            n_tracked: 0,
+        }
+    }
+}
+
+/// Live map + pose history once two-view init has succeeded. Points are
+/// in the world (view-1) frame, paired with the init-frame descriptor
+/// used to re-find them; `poses` are `T_cw` (world → camera), oldest
+/// first (`poses[0]` = identity = view-1).
+struct MapState {
+    pts: Vec<Vector3<f64>>,
+    desc: Vec<brief::Descriptor>,
+    poses: Vec<Isometry3<f64>>,
+    model: String,
+    r_h: f32,
+}
+
+/// Trajectory payload cap (memory + JSON bound); keep the newest.
+const MAX_TRAJECTORY: usize = 800;
+
+impl MapState {
+    /// Camera centre of a `T_cw` pose in world coords: `-Rᵀt`.
+    fn centre(t: &Isometry3<f64>) -> [f32; 2] {
+        let c = t.inverse().translation.vector;
+        [c.x as f32, c.z as f32]
+    }
+
+    fn publish(&self, map: &Arc<RwLock<MapSnapshot>>, status: String, n_tracked: u32) {
+        let points: Vec<[f32; 2]> = self
+            .pts
+            .iter()
+            .filter(|p| p.x.is_finite() && p.z.is_finite())
+            .map(|p| [p.x as f32, p.z as f32])
+            .collect();
+        let n = self.poses.len();
+        let start = n.saturating_sub(MAX_TRAJECTORY);
+        let cameras: Vec<[f32; 2]> = self.poses[start..].iter().map(Self::centre).collect();
+        if let Ok(mut m) = map.write() {
+            *m = MapSnapshot {
+                status,
+                model: self.model.clone(),
+                n_points: points.len() as u32,
+                points,
+                cameras,
+                r_h: self.r_h,
+                tracking: true,
+                n_tracked,
+            };
         }
     }
 }
@@ -402,10 +461,9 @@ pub fn run(
     let mut last = Instant::now();
     let mut prev: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)> = None;
     // Two-view bootstrap: an anchor frame to accumulate parallax
-    // against; one-shot for M3 (M4 takes over tracking once a map
-    // exists).
+    // against, until `state` holds a map; then M4 tracking takes over.
     let mut anchor: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)> = None;
-    let mut initialized = false;
+    let mut state: Option<MapState> = None;
     // Resolved once from the first frame's resolution (the libcamera
     // ViewFinder mode is full-FOV, so the FOV-derived prior is
     // resolution-agnostic — no need to query libcamera properties).
@@ -464,82 +522,160 @@ pub fn run(
         };
         stage.matching = ms(tm.elapsed());
 
-        // Two-view bootstrap (one-shot): accumulate parallax against an
-        // anchor frame, then run the calibrated initializer.
-        if !initialized && let Some(intr) = intrinsics.as_ref() {
-            let mut want_anchor = false;
-            if let Some((apts, adesc)) = anchor.as_ref() {
-                let mm = brief::match_descriptors(adesc, &descs);
-                if mm.len() >= INIT_MIN_MATCHES {
-                    let mut disp: Vec<f32> = mm
-                        .iter()
-                        .map(|&(ia, ib)| {
-                            let a = apts[ia as usize];
-                            let b = points[ib as usize];
-                            let dx = a.x as f32 - b.x as f32;
-                            let dy = a.y as f32 - b.y as f32;
-                            (dx * dx + dy * dy).sqrt()
-                        })
-                        .collect();
-                    disp.sort_by(|x, y| x.partial_cmp(y).unwrap());
-                    let med = disp[disp.len() / 2];
-                    let min_disp = gray.width as f32 * INIT_MIN_DISP_FRAC;
-                    if med >= min_disp {
-                        let cam = intr.to_camera_model();
-                        let corrs: Vec<twoview::Corr> = mm
+        // Pre-init: accumulate parallax vs an anchor, run two-view init.
+        // Post-init: project the map into each frame and refine the pose
+        // (constant-velocity prediction + motion-only BA).
+        if let Some(intr) = intrinsics.as_ref() {
+            let cam = intr.to_camera_model();
+            match state.as_mut() {
+                None => {
+                    let mut want_anchor = false;
+                    if let Some((apts, adesc)) = anchor.as_ref() {
+                        let mm = brief::match_descriptors(adesc, &descs);
+                        if mm.len() >= INIT_MIN_MATCHES {
+                            let mut disp: Vec<f32> = mm
+                                .iter()
+                                .map(|&(ia, ib)| {
+                                    let a = apts[ia as usize];
+                                    let b = points[ib as usize];
+                                    let dx = a.x as f32 - b.x as f32;
+                                    let dy = a.y as f32 - b.y as f32;
+                                    (dx * dx + dy * dy).sqrt()
+                                })
+                                .collect();
+                            disp.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                            let med = disp[disp.len() / 2];
+                            let min_disp = gray.width as f32 * INIT_MIN_DISP_FRAC;
+                            if med >= min_disp {
+                                let corrs: Vec<twoview::Corr> = mm
+                                    .iter()
+                                    .map(|&(ia, ib)| {
+                                        let a = apts[ia as usize];
+                                        let b = points[ib as usize];
+                                        (calib_norm(&cam, a.x, a.y), calib_norm(&cam, b.x, b.y))
+                                    })
+                                    .collect();
+                                if let Some(tv) =
+                                    twoview::initialize(&corrs, InitOptions::default())
+                                {
+                                    // cam1 = world origin; cam2 = Tcw = [R|t].
+                                    let pose2 = Isometry3::from_parts(
+                                        Translation3::from(tv.t),
+                                        UnitQuaternion::from_rotation_matrix(
+                                            &Rotation3::from_matrix_unchecked(tv.r),
+                                        ),
+                                    );
+                                    // Align triangulated points with the
+                                    // init-frame descriptor that re-finds them.
+                                    let (mut pts, mut desc) = (Vec::new(), Vec::new());
+                                    let mut pi = 0usize;
+                                    for (k, &(_ia, ib)) in mm.iter().enumerate() {
+                                        if tv.inliers[k] {
+                                            if let Some(&x) = tv.points.get(pi)
+                                                && x.z > 0.0
+                                                && x.x.is_finite()
+                                                && x.z.is_finite()
+                                            {
+                                                pts.push(x);
+                                                desc.push(descs[ib as usize]);
+                                            }
+                                            pi += 1;
+                                        }
+                                    }
+                                    let model = match tv.model {
+                                        twoview::Model::Essential => "essential",
+                                        twoview::Model::Homography => "homography",
+                                    };
+                                    let n = pts.len();
+                                    let ms = MapState {
+                                        pts,
+                                        desc,
+                                        poses: vec![Isometry3::identity(), pose2],
+                                        model: model.into(),
+                                        r_h: tv.r_h as f32,
+                                    };
+                                    ms.publish(
+                                        &map,
+                                        format!("initialized: {n} pts via {model}"),
+                                        n as u32,
+                                    );
+                                    info!(
+                                        "slam: two-view init OK — {n} pts, model={model}, \
+                                         R_H={:.2}, matches={}",
+                                        tv.r_h,
+                                        mm.len()
+                                    );
+                                    state = Some(ms);
+                                }
+                            } else if let Ok(mut m) = map.write() {
+                                m.status = format!(
+                                    "parallax {med:.0}/{min_disp:.0}px · {} matches",
+                                    mm.len()
+                                );
+                            }
+                        } else if mm.len() < ANCHOR_RESET_MATCHES {
+                            want_anchor = true;
+                        }
+                    } else {
+                        want_anchor = true;
+                    }
+                    if want_anchor && state.is_none() {
+                        anchor = Some((points.clone(), descs.clone()));
+                        if let Ok(mut m) = map.write() {
+                            m.status = "anchor set — translate sideways for parallax".into();
+                        }
+                    }
+                }
+                Some(st) => {
+                    let mm = brief::match_descriptors(&st.desc, &descs);
+                    if mm.len() >= TRACK_MIN_MATCHES {
+                        let obs: Vec<Observation> = mm
                             .iter()
-                            .map(|&(ia, ib)| {
-                                let a = apts[ia as usize];
-                                let b = points[ib as usize];
-                                (calib_norm(&cam, a.x, a.y), calib_norm(&cam, b.x, b.y))
+                            .map(|&(im, ic)| {
+                                let kp = points[ic as usize];
+                                Observation {
+                                    point: st.pts[im as usize],
+                                    obs: calib_norm(&cam, kp.x, kp.y),
+                                }
                             })
                             .collect();
-                        if let Some(tv) = twoview::initialize(&corrs, InitOptions::default()) {
-                            // cam1 at the origin; cam2 centre = -Rᵀt.
-                            let c2 = -(tv.r.transpose() * tv.t);
-                            let pts2d: Vec<[f32; 2]> = tv
-                                .points
-                                .iter()
-                                .filter(|p| p.z > 0.0 && p.z.is_finite())
-                                .map(|p| [p.x as f32, p.z as f32])
-                                .collect();
-                            let model = match tv.model {
-                                twoview::Model::Essential => "essential",
-                                twoview::Model::Homography => "homography",
-                            };
-                            let n = pts2d.len() as u32;
-                            if let Ok(mut m) = map.write() {
-                                *m = MapSnapshot {
-                                    status: format!("initialized: {n} pts via {model}"),
-                                    model: model.into(),
-                                    points: pts2d,
-                                    cameras: vec![[0.0, 0.0], [c2.x as f32, c2.z as f32]],
-                                    n_points: n,
-                                    r_h: tv.r_h as f32,
-                                };
+                        let np = st.poses.len();
+                        let predict = if np >= 2 {
+                            tracking::constant_velocity(&st.poses[np - 2], &st.poses[np - 1])
+                        } else {
+                            st.poses[np - 1]
+                        };
+                        let huber = 2.0 / intr.fx;
+                        let thr = 5.0 / intr.fx;
+                        match tracking::track_pose(&obs, &predict, huber, thr) {
+                            Some(rep) if rep.converged && rep.n_inliers >= TRACK_MIN_INLIERS => {
+                                st.poses.push(rep.pose);
+                                if st.poses.len() > MAX_TRAJECTORY * 2 {
+                                    let drop = st.poses.len() - MAX_TRAJECTORY;
+                                    st.poses.drain(0..drop);
+                                }
+                                let status =
+                                    format!("tracking: {}/{} inliers", rep.n_inliers, obs.len());
+                                st.publish(&map, status, rep.n_inliers as u32);
                             }
-                            info!(
-                                "slam: two-view init OK — {n} pts, model={model}, \
-                                 R_H={:.2}, matches={}",
-                                tv.r_h,
-                                mm.len()
-                            );
-                            initialized = true;
+                            Some(rep) => {
+                                if let Ok(mut m) = map.write() {
+                                    m.status = format!(
+                                        "tracking weak: {}/{} inliers",
+                                        rep.n_inliers,
+                                        obs.len()
+                                    );
+                                }
+                            }
+                            None => {
+                                if let Ok(mut m) = map.write() {
+                                    m.status = "tracking lost (solve failed)".into();
+                                }
+                            }
                         }
                     } else if let Ok(mut m) = map.write() {
-                        m.status =
-                            format!("parallax {med:.0}/{min_disp:.0}px · {} matches", mm.len());
+                        m.status = format!("tracking lost: only {} map matches", mm.len());
                     }
-                } else if mm.len() < ANCHOR_RESET_MATCHES {
-                    want_anchor = true;
-                }
-            } else {
-                want_anchor = true;
-            }
-            if want_anchor && !initialized {
-                anchor = Some((points.clone(), descs.clone()));
-                if let Ok(mut m) = map.write() {
-                    m.status = "anchor set — translate sideways for parallax".into();
                 }
             }
         }
