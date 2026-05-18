@@ -20,6 +20,7 @@ pub mod brief;
 pub mod fast;
 pub mod image;
 pub mod mapper;
+pub mod place;
 
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
@@ -36,6 +37,7 @@ use ginger_slam_core::twoview::{self, InitOptions};
 use nalgebra::{Isometry3, Rotation3, Translation3, UnitQuaternion, Vector2, Vector3};
 
 use mapper::{KeyframeJob, LocalMapper};
+use place::PlaceDb;
 
 use crate::camera::Camera;
 use image::{GrayImage, build_pyramid, gray_from_yuyv};
@@ -513,6 +515,10 @@ pub struct Frontend {
     /// The mapper, until [`Frontend::take_local_mapper`] moves it to its
     /// own thread (`run`); kept here so tests can pump it synchronously.
     mapper: Option<LocalMapper>,
+    /// Shared BoW place-recognition index (M6): the mapper fills it as
+    /// keyframes are inserted; relocalization (M6-2c) / loop detection
+    /// (M6-2d) query it. Held here so the tracking side can reach it.
+    place: Arc<Mutex<PlaceDb>>,
 }
 
 impl Default for Frontend {
@@ -524,6 +530,7 @@ impl Default for Frontend {
 impl Frontend {
     pub fn new() -> Self {
         let world = Arc::new(Mutex::new(Map::new()));
+        let place = Arc::new(Mutex::new(PlaceDb::new()));
         let (tx, rx) = channel();
         Self {
             prev: None,
@@ -531,9 +538,10 @@ impl Frontend {
             intrinsics: None,
             iview: IntrinsicsView::uninitialized(),
             map: MapSnapshot::initial(),
-            mapper: Some(LocalMapper::new(world.clone(), rx)),
+            mapper: Some(LocalMapper::new(world.clone(), rx, place.clone())),
             world,
             jobs: tx,
+            place,
         }
     }
 
@@ -555,6 +563,19 @@ impl Frontend {
     pub fn map_stats(&self) -> (usize, usize) {
         let m = self.world.lock().unwrap();
         (m.n_keyframes(), m.n_points())
+    }
+
+    /// `(vocab ready, keyframes indexed in the BoW DB)` — test hook.
+    pub fn place_stats(&self) -> (bool, usize) {
+        let p = self.place.lock().unwrap();
+        (p.is_ready(), p.len())
+    }
+
+    /// Place-recognition query against the BoW DB: best
+    /// `(keyframe id, score)` matches for these descriptors. Test/M6-2c
+    /// hook (no skip filter).
+    pub fn place_query(&self, descs: &[brief::Descriptor], max: usize) -> Vec<(u32, f64)> {
+        self.place.lock().unwrap().query(descs, max, |_| false)
     }
 
     /// Process one frame's detected features (level-0 pixel coords with
@@ -1330,5 +1351,48 @@ mod pipeline_tests {
         // Map not corrupted: points unchanged, trajectory not extended.
         assert_eq!(lost.map.n_points, n_pts);
         assert_eq!(lost.map.cameras.len(), traj);
+    }
+
+    /// M6-2b: a long enough sweep self-trains the BoW vocabulary and
+    /// fills the place-recognition DB; a query then maps a place back to
+    /// a keyframe near it (earlier place → earlier keyframe).
+    #[test]
+    fn place_db_self_trains_and_recognizes_place() {
+        let (pts, ds) = scene(220);
+        let cam = cam_model();
+        let mut fe = Frontend::new();
+        for i in 0..64 {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.07));
+            step(&mut fe, &fp, &fd);
+        }
+        let (ready, indexed) = fe.place_stats();
+        assert!(ready, "vocabulary never self-trained");
+        let (n_kf, _) = fe.map_stats();
+        assert!(n_kf >= 6, "too few keyframes: {n_kf}");
+        // Every alive keyframe is indexed (added in kf order, none culled).
+        assert_eq!(indexed, n_kf, "DB/keyframe count mismatch");
+
+        // Re-observe the start vs the far end of the sweep.
+        let (_, q_start) = frame(&pts, &ds, &cam, &pose(0.03));
+        let (_, q_end) = frame(&pts, &ds, &cam, &pose(63.0 * 0.07));
+        let hit_start = fe.place_query(&q_start, 5);
+        let hit_end = fe.place_query(&q_end, 5);
+        assert!(!hit_start.is_empty() && !hit_start[0].1.is_nan());
+        assert!(!hit_end.is_empty());
+        assert!(hit_start[0].1 > 0.0 && hit_end[0].1 > 0.0);
+        // Sorted best-first.
+        for w in hit_start.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+        // Place recognition is spatially sane: the start place resolves
+        // to an earlier keyframe than the far-end place.
+        assert!(
+            hit_start[0].0 < hit_end[0].0,
+            "start kf {} not earlier than end kf {}",
+            hit_start[0].0,
+            hit_end[0].0
+        );
+        // Deterministic: identical query ⇒ identical top hit.
+        assert_eq!(fe.place_query(&q_start, 5), hit_start);
     }
 }
