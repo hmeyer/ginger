@@ -20,11 +20,13 @@
 //!   sequence + intrinsics loading.
 //! - [`twoview`] — two-view monocular initialization (M3).
 //! - [`tracking`] — constant-velocity prediction + motion-only BA (M4).
+//! - [`map`] — keyframes / map points / covisibility graph (M5).
 
 pub mod camera;
 pub mod dataset;
 pub mod intrinsics;
 pub mod lie;
+pub mod map;
 pub mod optimize;
 pub mod tracking;
 pub mod twoview;
