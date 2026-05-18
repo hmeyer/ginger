@@ -71,6 +71,34 @@ impl Map {
         id
     }
 
+    /// Create a map point discovered *after* its keyframes already
+    /// exist (local-mapping triangulation) and immediately record live
+    /// `kf_id` observing it at normalized coord `z`, linking both sides
+    /// exactly once. Unlike [`add_point`] this also pushes into the
+    /// keyframe's `obs` (so the point constrains it in local BA) and
+    /// leaves no pre-seeded back-reference to double-count covisibility;
+    /// pair it with [`add_observation`] for the other view(s). Returns
+    /// `None` if `kf_id` is dead.
+    pub fn add_point_observed(
+        &mut self,
+        pos: Vector3<f64>,
+        desc: Descriptor,
+        kf_id: u32,
+        z: Vector2<f64>,
+    ) -> Option<u32> {
+        self.keyframe(kf_id)?;
+        let id = self.points.len() as u32;
+        self.points.push(MapPoint {
+            id,
+            pos,
+            desc,
+            obs: Vec::new(),
+            alive: true,
+        });
+        self.add_observation(kf_id, id, z);
+        Some(id)
+    }
+
     /// Insert a keyframe observing `obs = [(map_point_id, norm_xy)]`.
     /// Links the observations back into the points, then sets the
     /// spanning-tree parent to the most-covisible existing keyframe.
@@ -321,6 +349,32 @@ mod tests {
         // kf2's parent (was kf1) re-parented to kf1's parent (kf0).
         assert_eq!(m.keyframe(2).unwrap().parent, Some(0));
         assert!(m.point(1).unwrap().obs.iter().all(|&(kf, _)| kf != 1));
+    }
+
+    #[test]
+    fn add_point_observed_links_once_each_side() {
+        let mut m = Map::new();
+        let kf0 = m.add_keyframe(iso(0.0), vec![]);
+        let kf1 = m.add_keyframe(iso(0.3), vec![]);
+        // Triangulated *after* both keyframes exist: seen by kf0 & kf1.
+        let p = m
+            .add_point_observed(Vector3::new(0.0, 0.0, 5.0), [7; 32], kf0, v2(0.0))
+            .unwrap();
+        m.add_observation(kf1, p, v2(0.1));
+        // Exactly one obs per side — no double-counted covisibility.
+        assert_eq!(m.point(p).unwrap().obs, vec![(kf0, 0), (kf1, 0)]);
+        assert_eq!(m.keyframe(kf0).unwrap().obs, vec![(p, v2(0.0))]);
+        assert_eq!(m.keyframe(kf1).unwrap().obs, vec![(p, v2(0.1))]);
+        assert_eq!(m.covisibility(kf0), vec![(kf1, 1)]);
+        assert_eq!(m.covisibility(kf1), vec![(kf0, 1)]);
+        // Dead keyframe → None, no point created.
+        m.cull_keyframe(kf1);
+        let before = m.n_points();
+        assert!(
+            m.add_point_observed(Vector3::zeros(), [0; 32], kf1, v2(0.0))
+                .is_none()
+        );
+        assert_eq!(m.n_points(), before);
     }
 
     #[test]

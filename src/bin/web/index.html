@@ -798,9 +798,10 @@ startStream();
       const md = mapData;
       const pts = md && md.points || [];
       const cams = md && md.cameras || [];
+      const kfs = md && md.keyframes || [];
       if (pts.length || cams.length) {
-        // Uniform fit of all points + camera centres, z-axis up.
-        const all = pts.concat(cams);
+        // Uniform fit of all points + camera/keyframe centres, z up.
+        const all = pts.concat(cams, kfs);
         let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
         for (const [x, z] of all) {
           if (x < minX) minX = x; if (x > maxX) maxX = x;
@@ -833,6 +834,10 @@ startStream();
           mctx.arc(PX(x), PY(z), last ? 3.6 : 1.6, 0, 6.283);
           mctx.fill();
         });
+        // Keyframes (M5): orange squares — the BA-refined subset the
+        // local map is built on.
+        mctx.fillStyle = 'rgba(255,170,60,.9)';
+        for (const [x, z] of kfs) mctx.fillRect(PX(x) - 2.2, PY(z) - 2.2, 4.4, 4.4);
       }
       const status = md && md.status || 'no map yet';
       mctx.fillStyle = '#9cf';
