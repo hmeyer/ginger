@@ -34,7 +34,7 @@ no pose, no map, no geometry.
 ### M2 — Calibration + pinhole model + replay harness
 
 Foundation only; no SLAM yet. **Detailed plan:
-[`docs/m2-plan.md`](docs/m2-plan.md)** (camera prior, hardware-accel /
+[`m2-plan.md`](m2-plan.md)** (camera prior, hardware-accel /
 NEON strategy, math backbone, work breakdown, exit criteria).
 
 Decided: proceed on the Pi Camera "rev 1.3" standard-lens prior
@@ -96,7 +96,7 @@ calibration** — offline OpenCV ChArUco tool emitting a verified
   straighter on the canvas.
 
 **WebUI surface:** all milestones draw into the single top-down canvas +
-`#slam-hud` stubbed in M2 (see [`docs/m2-plan.md`](docs/m2-plan.md) §
+`#slam-hud` stubbed in M2 (see [`m2-plan.md`](m2-plan.md) §
 WebUI-visible outputs); M2 itself only surfaces the calibration-status /
 sensor-mode diagnostics.
 
