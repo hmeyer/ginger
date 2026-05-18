@@ -19,6 +19,10 @@
 //! Schur solve's heavy inner work beyond the (bounded, L1-resident)
 //! window — coarse-grained but adequate at Pi-class map sizes (a
 //! finer-grained tracking/mapping handoff is an M6 refinement).
+//!
+//! M6-2b: each ingested keyframe is also registered with the shared BoW
+//! [`PlaceDb`] (self-trains the vocabulary once enough keyframes exist)
+//! so relocalization / loop detection can query it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::Receiver;
@@ -33,6 +37,7 @@ use nalgebra::{Isometry3, Vector2};
 
 use super::FeaturePoint;
 use super::brief::{self, Descriptor};
+use super::place::PlaceDb;
 
 /// `kf` + top-k covisible keyframes pulled into the local-BA window.
 const LOCAL_BA_K: usize = 6;
@@ -76,15 +81,23 @@ pub struct LocalMapper {
     jobs: Receiver<KeyframeJob>,
     raw: HashMap<u32, RawKf>,
     recent: VecDeque<u32>,
+    /// Shared BoW place-recognition index (M6): every ingested keyframe
+    /// is registered so relocalization / loop detection can query it.
+    place: Arc<Mutex<PlaceDb>>,
 }
 
 impl LocalMapper {
-    pub fn new(map: Arc<Mutex<Map>>, jobs: Receiver<KeyframeJob>) -> Self {
+    pub fn new(
+        map: Arc<Mutex<Map>>,
+        jobs: Receiver<KeyframeJob>,
+        place: Arc<Mutex<PlaceDb>>,
+    ) -> Self {
         Self {
             map,
             jobs,
             raw: HashMap::new(),
             recent: VecDeque::new(),
+            place,
         }
     }
 
@@ -124,6 +137,11 @@ impl LocalMapper {
     }
 
     fn ingest(&mut self, job: KeyframeJob) {
+        // Register the keyframe with the BoW place-recognition index
+        // (self-trains the vocabulary once enough keyframes are seen).
+        if let Ok(mut p) = self.place.lock() {
+            p.on_keyframe(job.kf_id, &job.descs);
+        }
         self.raw.insert(
             job.kf_id,
             RawKf {
