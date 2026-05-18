@@ -140,13 +140,82 @@ slam-core retrieval primitive started; the rest is built on it.
   with scale), and `optimize_pose_graph` (LM over relative-Sim3
   residuals, gauge-fixed) — closes a detected loop + absorbs monocular
   scale drift.
-- **M6-2 ⏭** frontend wiring: relocalize on track loss (BoW candidates
-  → guided match → PnP-RANSAC); per-keyframe BoW added on insertion;
-  loop detection (query DB minus covisible/recent) → Sim3 verify →
-  pose-graph correction on the local-mapper thread; extend
-  `pipeline_tests`.
-- **Visible deliverable:** "relocalized" / "loop detected" event +
-  trajectory snapping straighter on the canvas.
+**M6-2 ⏭ — frontend wiring (the user-visible milestone).** The three
+slam-core primitives (bow / pnp / sim3) are done; M6-2 integrates them
+into the live `Frontend` + decoupled `LocalMapper` so a lost track
+recovers and a revisited place straightens the map. Broken into five
+testable sub-steps:
+
+- **M6-2a ⏭ — vocabulary lifecycle + direct index** (`bow`, the M6-1a
+  deferrals). Add `Vocabulary` (de)serialization (compact binary
+  `to_bytes`/`from_bytes`, no new deps) and a `VocabSource` policy
+  mirroring the `slam.toml` intrinsics pattern: load a shipped
+  `slam_vocab.bin` if present, else **deterministically self-train once**
+  from the pooled descriptors of the first `N_VOCAB_KF` keyframes (no
+  external asset needed for headless/CI). Add the **direct index**
+  (word → that image's feature indices, at a fixed tree level) so a BoW
+  hit yields cheap *guided* descriptor matching instead of brute force.
+  Tests: serde round-trip equality, self-train determinism, guided-match
+  recall vs brute force.
+- **M6-2b ⏭ — place-recognition database in the pipeline.** A shared
+  `Arc<Mutex<bow::Database>>` + `Arc<RwLock<Option<Vocabulary>>>`
+  reachable by both the tracking thread (relocalize) and the
+  `LocalMapper` (loop detect). On keyframe insertion the mapper computes
+  the keyframe's `BowVector` (+ direct index over its stored raw
+  features) and adds it to the DB, keyed by keyframe id. Once
+  `N_VOCAB_KF` keyframes exist and no vocab was shipped, self-train and
+  back-fill BoW for existing keyframes.
+- **M6-2c ⏭ — relocalization on track loss.** Add `Stage::Lost { since
+  }` (the planned `Stage` extension). After a short run of failed
+  tracks: BoW-query the DB for the current frame → for the top
+  candidates, guided-match the frame's descriptors to those keyframes'
+  observed **map points** (descriptor carried in `map`) → assemble
+  `pnp::Observation`s (3D map point ↔ normalized obs) → `pnp_ransac` →
+  on enough inliers, jump pose back and resume `Tracking`; else stay
+  `Lost` (map uncorrupted, no trajectory growth). Bounded candidates/
+  iters so it stays on the tracking thread without stalling.
+- **M6-2d ⏭ — loop closing on the `LocalMapper` thread.** Per new
+  keyframe (after local BA): BoW-query the DB **excluding covisible +
+  recent** keyframes; on a candidate passing the score gate, geometric
+  verify via guided match → `sim3_align` over the shared map points
+  (relative `Sim3`, scale included) gated on inlier count. Assemble the
+  Essential-graph edges — spanning-tree + covisibility edges measured at
+  the *current* estimate (soft "keep relative") plus the loop edge from
+  the verified `Sim3` — and run `sim3::optimize_pose_graph` (gauge-fix
+  the origin keyframe). Write corrected keyframe poses back; rigidly
+  re-transform each map point by the `Sim3` correction of a reference
+  observing keyframe so points track their keyframes. Stays the
+  pumped-synchronously tested seam (`process_pending`), heavy + rare +
+  off the tracking core.
+- **M6-2e ⏭ — surface + tests.** `MapSnapshot` status carries
+  `relocalized` / `loop closed (k↔k)` events; the existing canvas
+  (trajectory + keyframes + points) shows the snap for free once poses
+  move. Extend `pipeline_tests`: (1) induce track loss then feed a
+  recognizable frame → asserts recovery + no map corruption; (2) drive a
+  synthetic loop trajectory → asserts loop detection + end-to-origin
+  drift and scale drift cut sharply after closure, determinism, and a
+  no-loop run is untouched. Update README/PLAN/inline roadmap.
+
+- **Visible deliverable:** a `relocalized` / `loop closed` event on the
+  `#slam-hud` line and the trajectory + keyframes + point cloud visibly
+  snapping straighter on the top-down canvas when a loop closes.
+
+**M6-2 design decisions / risks (durable):**
+- *Self-trained vocabulary* is weaker than a pre-trained ORB vocab but
+  needs no shipped asset and keeps CI headless + deterministic; the
+  `slam_vocab.bin` loader lets a real vocabulary drop in later (same
+  opt-in shape as `slam.toml`). Documented caveat, not a blocker.
+- *False loops* (perceptual aliasing) corrupt the map irreversibly, so a
+  loop fires only on BoW-score gate **and** geometric-inlier gate **and**
+  non-covisible/non-recent candidate; favour misses over false closures.
+- *Map-point consistency:* after pose-graph correction, points are moved
+  by the `Sim3` correction of a chosen observing keyframe (not
+  re-triangulated) — cheap and good enough for the visible deliverable;
+  a post-loop global BA is a deferred refinement.
+- *Concurrency:* relocalization runs on the tracking thread (bounded);
+  loop closing + pose-graph run on the `LocalMapper` thread under the
+  same coarse world mutex as M5 — rare, off the frame-rate path. A
+  finer handoff and post-loop global BA are explicit later steps.
 
 **WebUI surface:** all milestones draw into the single top-down canvas
 (`/api/slam/map`, `map` overlay mode) + the `#slam-hud` line; M3 filled
@@ -158,7 +227,7 @@ markers (orange squares).
 
 - **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
   **M6 (in progress: M6-1a BoW ✅, M6-1b PnP ✅, M6-1c Sim3 ✅;
-  M6-2 wiring next)**.
+  M6-2 wiring next — sub-steps a→e)**.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing
