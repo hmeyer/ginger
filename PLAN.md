@@ -33,7 +33,18 @@ no pose, no map, no geometry.
 
 ### M2 — Calibration + pinhole model + replay harness
 
-Foundation only; no SLAM yet.
+Foundation only; no SLAM yet. **Detailed plan:
+[`docs/m2-plan.md`](docs/m2-plan.md)** (camera prior, hardware-accel /
+NEON strategy, math backbone, work breakdown, exit criteria).
+
+Decided: proceed on the Pi Camera "rev 1.3" standard-lens prior
+(FOV-derived, flagged unverified); pure-Rust math (`nalgebra` + a small
+`lie`/solver, no BLAS); reuse the `crates/fast` scalar→NEON→parity-test
+discipline for all geometry kernels.
+
+Open follow-up (deferred, needs a physical target): **proper camera
+calibration** — offline OpenCV ChArUco tool emitting a verified
+`slam.toml`. Not kalibr.
 
 - Calibrate the OV5647 (checkerboard) or seed known intrinsics plus a
   calibration utility; store `K` + distortion.
