@@ -25,6 +25,7 @@
 //! - [`triangulation`] — gated two-view new-point triangulation (M5).
 //! - [`bow`] — binary Bag-of-Words vocabulary + database for place
 //!   recognition / loop closure / relocalization (M6).
+//! - [`pnp`] — P3P + RANSAC pose recovery from 3D↔2D matches (M6).
 
 pub mod bow;
 pub mod camera;
@@ -34,6 +35,7 @@ pub mod lie;
 pub mod local_ba;
 pub mod map;
 pub mod optimize;
+pub mod pnp;
 pub mod tracking;
 pub mod triangulation;
 pub mod twoview;

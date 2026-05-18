@@ -131,7 +131,10 @@ slam-core retrieval primitive started; the rest is built on it.
   for `query`-by-place. Camera-free, Pi-cheap (bitwise, no BLAS).
   Deferred to M6-2: direct index (word→features for guided matching)
   and on-disk vocabulary (de)serialization.
-- **M6-1b ⏭** `pnp`: P3P + RANSAC pose-from-3D↔2D (the recovery solver).
+- **M6-1b ✅** `pnp`: Grunert P3P (quartic via in-code polynomial
+  elimination + companion-matrix roots) + RANSAC, polished by the
+  tested motion-only BA; reuses `tracking::Observation`. The recovery
+  solver for relocalization / loop verification.
 - **M6-1c ⏭** Sim3 `lie` exp/log + Sim3 alignment + Essential-graph
   pose-graph optimization (monocular scale drift); optional global BA.
 - **M6-2 ⏭** frontend wiring: relocalize on track loss (BoW candidates
@@ -151,7 +154,7 @@ markers (orange squares).
 ## Sequencing & risks
 
 - **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
-  **M6 (in progress: M6-1a BoW ✅)**.
+  **M6 (in progress: M6-1a BoW ✅, M6-1b PnP ✅)**.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing
