@@ -16,11 +16,16 @@ pub mod image;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use log::info;
+use ginger_slam_core::intrinsics::Intrinsics;
+use log::{info, warn};
 use serde::Serialize;
 
 use crate::camera::Camera;
 use image::{GrayImage, build_pyramid, gray_from_yuyv};
+
+/// Where an operator-supplied calibration is read from, if present.
+/// Absent → the rev 1.3 FOV-derived prior (`verified = false`).
+const INTRINSICS_PATH: &str = "slam.toml";
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
 
@@ -101,6 +106,74 @@ fn ms(d: Duration) -> f32 {
     d.as_secs_f32() * 1000.0
 }
 
+/// Active camera intrinsics, surfaced to the WebUI so the calibration
+/// state (and the `UNVERIFIED` rev 1.3 prior) is visible, not buried in
+/// logs. This is M2's only user-facing output — M2 ships no SLAM yet.
+#[derive(Clone, Serialize)]
+pub struct IntrinsicsView {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+    /// Horizontal FOV (deg) implied by `fx`/width.
+    pub fov_deg: f32,
+    /// `false` for the derived prior; `true` only after a real
+    /// calibration. The HUD renders this as an `UNVERIFIED` badge.
+    pub verified: bool,
+    pub model: String,
+}
+
+impl IntrinsicsView {
+    fn of(i: &Intrinsics) -> Self {
+        Self {
+            fx: i.fx as f32,
+            fy: i.fy as f32,
+            cx: i.cx as f32,
+            cy: i.cy as f32,
+            fov_deg: i.hfov_deg() as f32,
+            verified: i.verified,
+            model: i.model.clone(),
+        }
+    }
+
+    fn uninitialized() -> Self {
+        Self {
+            fx: 0.0,
+            fy: 0.0,
+            cx: 0.0,
+            cy: 0.0,
+            fov_deg: 0.0,
+            verified: false,
+            model: "(awaiting first frame)".into(),
+        }
+    }
+}
+
+/// Resolve intrinsics for a given stream resolution: an operator
+/// `slam.toml` if present and parseable, else the rev 1.3 FOV prior.
+fn resolve_intrinsics(width: u32, height: u32) -> Intrinsics {
+    match std::fs::read_to_string(INTRINSICS_PATH) {
+        Ok(s) => match Intrinsics::from_toml_str(&s) {
+            Ok(i) => {
+                info!(
+                    "slam: loaded intrinsics from {INTRINSICS_PATH} \
+                     (model={:?} verified={})",
+                    i.model, i.verified
+                );
+                i
+            }
+            Err(e) => {
+                warn!(
+                    "slam: {INTRINSICS_PATH} unparseable ({e}); \
+                     falling back to rev 1.3 prior"
+                );
+                Intrinsics::rev1_3_prior(width, height)
+            }
+        },
+        Err(_) => Intrinsics::rev1_3_prior(width, height),
+    }
+}
+
 /// Latest frontend result, polled by `GET /api/slam/stream`.
 #[derive(Clone, Serialize)]
 pub struct SlamSnapshot {
@@ -122,6 +195,8 @@ pub struct SlamSnapshot {
     pub points: Vec<FeaturePoint>,
     /// BRIEF correspondences to the previous frame's features.
     pub matches: Vec<Match>,
+    /// Active camera intrinsics + calibration state (M2 surface).
+    pub intrinsics: IntrinsicsView,
 }
 
 impl SlamSnapshot {
@@ -136,6 +211,7 @@ impl SlamSnapshot {
             fps: 0.0,
             points: Vec::new(),
             matches: Vec::new(),
+            intrinsics: IntrinsicsView::uninitialized(),
         }
     }
 }
@@ -267,6 +343,11 @@ pub fn run(camera: Arc<Camera>, snapshot: Arc<RwLock<SlamSnapshot>>) {
     let mut frame_n: u64 = 0;
     let mut last = Instant::now();
     let mut prev: Option<(Vec<FeaturePoint>, Vec<brief::Descriptor>)> = None;
+    // Resolved once from the first frame's resolution (the libcamera
+    // ViewFinder mode is full-FOV, so the FOV-derived prior is
+    // resolution-agnostic — no need to query libcamera properties).
+    let mut intrinsics: Option<Intrinsics> = None;
+    let mut iview = IntrinsicsView::uninitialized();
     info!("slam: frontend started (FAST + oriented BRIEF, {N_LEVELS} levels)");
 
     loop {
@@ -275,6 +356,27 @@ pub fn run(camera: Arc<Camera>, snapshot: Arc<RwLock<SlamSnapshot>>) {
         let tg = Instant::now();
         let gray = gray_from_yuyv(&frame);
         let gray_ms = ms(tg.elapsed());
+
+        if intrinsics.is_none() {
+            let i = resolve_intrinsics(gray.width as u32, gray.height as u32);
+            if i.verified {
+                info!(
+                    "slam: camera intrinsics verified (model={:?}, fov≈{:.1}°)",
+                    i.model,
+                    i.hfov_deg()
+                );
+            } else {
+                warn!(
+                    "slam: camera intrinsics are an UNVERIFIED prior \
+                     (model={:?}, fov≈{:.1}°) — run a calibration and write {INTRINSICS_PATH}",
+                    i.model,
+                    i.hfov_deg()
+                );
+            }
+            iview = IntrinsicsView::of(&i);
+            intrinsics = Some(i);
+        }
+
         let (points, descs, n_total, mut stage) = detect_features(&gray);
         stage.gray = gray_ms;
         let n_kept = points.len() as u32;
@@ -351,6 +453,7 @@ pub fn run(camera: Arc<Camera>, snapshot: Arc<RwLock<SlamSnapshot>>) {
                 fps,
                 points,
                 matches,
+                intrinsics: iview.clone(),
             };
         }
     }
