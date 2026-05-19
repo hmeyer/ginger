@@ -22,11 +22,7 @@ use ginger_rs::slam::image::GrayImage;
 /// like consecutive video frames (gives the matcher real work).
 fn textured(w: usize, h: usize, shift: f32) -> GrayImage {
     let mut g = GrayImage::new(w, h);
-    let hash = |x: i32, y: i32| {
-        let mut n = (x.wrapping_mul(374_761_393) ^ y.wrapping_mul(668_265_263)) as u32;
-        n = (n ^ (n >> 13)).wrapping_mul(1_274_126_177);
-        ((n ^ (n >> 16)) & 0xff) as f32 / 255.0
-    };
+    let hash = ginger_rand::noise_u8;
     let smooth = |fx: f32, fy: f32| {
         let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
         let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);

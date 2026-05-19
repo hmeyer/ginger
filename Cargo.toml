@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fast", "crates/slam-core"]
+members = [".", "crates/fast", "crates/rand", "crates/slam-core"]
 resolver = "2"
 
 [package]
@@ -9,6 +9,7 @@ edition = "2024"
 
 [dependencies]
 ginger-fast = { path = "crates/fast" }
+ginger-rand = { path = "crates/rand" }
 ginger-slam-core = { path = "crates/slam-core" }
 nalgebra = "0.34"
 rppal = "0.22"

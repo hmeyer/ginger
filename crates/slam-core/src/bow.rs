@@ -32,6 +32,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use ginger_rand::Rng64;
+
 use crate::map::Descriptor;
 
 /// Hamming distance between two 256-bit descriptors (0..=256). Scalar
@@ -64,31 +66,12 @@ fn majority(descs: &[Descriptor]) -> Descriptor {
     out
 }
 
-/// Deterministic xorshift PRNG (same scheme as the other core modules),
-/// so a vocabulary is a pure function of `(images, k, depth, seed)` —
-/// the headless-determinism gate.
-struct Rng(u64);
-impl Rng {
-    fn f(&mut self) -> f64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-    }
-    fn upto(&mut self, n: usize) -> usize {
-        if n == 0 {
-            return 0;
-        }
-        ((self.f() * n as f64) as usize).min(n - 1)
-    }
-}
-
 /// k-means++ seeding under Hamming distance: first centre uniform, each
 /// next chosen with probability ∝ (distance to the nearest chosen
 /// centre)². May return fewer than `k` centres if the data has fewer
 /// than `k` distinct points (degenerate node → fewer children).
-fn kmeans_pp(descs: &[Descriptor], k: usize, rng: &mut Rng) -> Vec<Descriptor> {
-    let mut centres = vec![descs[rng.upto(descs.len())]];
+fn kmeans_pp(descs: &[Descriptor], k: usize, rng: &mut Rng64) -> Vec<Descriptor> {
+    let mut centres = vec![descs[rng.upto_unit(descs.len())]];
     while centres.len() < k {
         let mut cum = Vec::with_capacity(descs.len());
         let mut total = 0.0;
@@ -158,7 +141,7 @@ impl Vocabulary {
         if pool.is_empty() || k < 2 {
             return v;
         }
-        let mut rng = Rng(seed | 1);
+        let mut rng = Rng64::new(seed | 1);
         v.cluster(pool, 0, 0, k, depth, &mut rng);
 
         // Assign stable word ids to every leaf (deterministic preorder).
@@ -205,7 +188,7 @@ impl Vocabulary {
         level: usize,
         k: usize,
         depth: usize,
-        rng: &mut Rng,
+        rng: &mut Rng64,
     ) {
         if level >= depth || descs.len() <= 1 {
             self.nodes[node].centre = majority(&descs);
@@ -510,17 +493,17 @@ mod tests {
     /// Deterministic descriptor generator: `proto` flipped in `flips`
     /// pseudo-random bit positions (a noisy observation of a landmark).
     fn noisy(proto: &Descriptor, flips: usize, seed: u64) -> Descriptor {
-        let mut r = Rng(seed | 1);
+        let mut r = Rng64::new(seed | 1);
         let mut d = *proto;
         for _ in 0..flips {
-            let bit = r.upto(256);
+            let bit = r.upto_unit(256);
             d[bit / 8] ^= 1 << (bit % 8);
         }
         d
     }
 
     fn proto(seed: u64) -> Descriptor {
-        let mut r = Rng(seed | 1);
+        let mut r = Rng64::new(seed | 1);
         let mut d = [0u8; 32];
         for b in &mut d {
             *b = (r.f() * 256.0) as u8;

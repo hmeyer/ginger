@@ -16,6 +16,7 @@
 
 use std::sync::OnceLock;
 
+use ginger_rand::Rng32;
 use rayon::prelude::*;
 
 use super::image::GrayImage;
@@ -35,43 +36,17 @@ pub type Descriptor = [u8; DESC_BYTES];
 
 // ── Sampling pattern ──────────────────────────────────────────────────────────
 
-/// Tiny deterministic xorshift32 — only used to build the fixed pattern.
-struct Rng(u32);
-impl Rng {
-    #[inline]
-    fn next_u32(&mut self) -> u32 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.0 = x;
-        x
-    }
-    /// Uniform in `[0, 1)`.
-    #[inline]
-    fn unit(&mut self) -> f32 {
-        (self.next_u32() >> 8) as f32 / (1u32 << 24) as f32
-    }
-    /// Standard normal via Box–Muller.
-    #[inline]
-    fn gauss(&mut self) -> f32 {
-        let u1 = self.unit().max(1e-7);
-        let u2 = self.unit();
-        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-    }
-}
-
 /// 256 point pairs `[ax, ay, bx, by]`, both points inside the patch disc.
 type Pattern = [[i32; 4]; N_TESTS];
 
 fn build_pattern() -> Pattern {
-    let mut rng = Rng(0x9E37_79B9);
+    let mut rng = Rng32::new(0x9E37_79B9);
     let mut pat = [[0i32; 4]; N_TESTS];
     // G_II: first point ~N(0, s1²), second ~N(first, s2²).
     let s1 = PATCH_RADIUS as f32 / 3.0;
     let s2 = PATCH_RADIUS as f32 / 6.0;
     let r2 = (PATCH_RADIUS * PATCH_RADIUS) as f32;
-    let draw = |rng: &mut Rng, cx: i32, cy: i32, sigma: f32| {
+    let draw = |rng: &mut Rng32, cx: i32, cy: i32, sigma: f32| {
         // Reject outside the disc; clamp as a safety net so this can't spin.
         for _ in 0..32 {
             let x = cx + (rng.gauss() * sigma).round() as i32;
@@ -240,7 +215,7 @@ mod tests {
 
     fn noise_image(w: usize, h: usize, seed: u32) -> GrayImage {
         let mut g = GrayImage::new(w, h);
-        let mut r = Rng(seed | 1);
+        let mut r = Rng32::new(seed | 1);
         for p in g.data.iter_mut() {
             *p = (r.next_u32() & 0xff) as u8;
         }
@@ -312,7 +287,7 @@ mod tests {
     fn matcher_recovers_noisy_correspondence() {
         // Build distinct descriptors, perturb a few bits, expect i↔i.
         let n = 40;
-        let mut rng = Rng(12345);
+        let mut rng = Rng32::new(12345);
         let a: Vec<Descriptor> = (0..n)
             .map(|_| {
                 let mut d = [0u8; DESC_BYTES];

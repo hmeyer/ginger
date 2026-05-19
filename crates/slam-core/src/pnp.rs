@@ -21,6 +21,7 @@
 //! and its real roots taken as companion-matrix eigenvalues. Correctness
 //! is pinned by the exact-recovery unit test.
 
+use ginger_rand::Rng64;
 use nalgebra::{Complex, DMatrix, Isometry3, Matrix3, Rotation3, Translation3, Vector2, Vector3};
 
 use crate::tracking::{Observation, track_pose};
@@ -56,20 +57,6 @@ pub struct PnpReport {
     /// Per-correspondence inlier mask under the final pose.
     pub inliers: Vec<bool>,
     pub n_inliers: usize,
-}
-
-/// Deterministic xorshift PRNG (shared scheme across the core).
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn upto(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
 }
 
 /// Convolve two coefficient vectors (ascending powers).
@@ -255,7 +242,7 @@ pub fn pnp_ransac(obs: &[Observation], opt: PnpOptions) -> Option<PnpReport> {
     if n < 4 {
         return None;
     }
-    let mut rng = Rng(opt.seed | 1);
+    let mut rng = Rng64::new(opt.seed | 1);
     let mut best: Option<(usize, Isometry3<f64>)> = None;
 
     for _ in 0..opt.iters {
@@ -322,16 +309,6 @@ mod tests {
     use crate::lie::se3_log;
     use nalgebra::UnitQuaternion;
 
-    struct R(u64);
-    impl R {
-        fn f(&mut self) -> f64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-        }
-    }
-
     fn iso(rx: f64, ry: f64, rz: f64, tx: f64, ty: f64, tz: f64) -> Isometry3<f64> {
         let rot = UnitQuaternion::from_rotation_matrix(&Rotation3::from_euler_angles(rx, ry, rz));
         Isometry3::from_parts(Translation3::new(tx, ty, tz), rot)
@@ -343,7 +320,7 @@ mod tests {
     }
 
     fn cloud(n: usize, seed: u64) -> Vec<Vector3<f64>> {
-        let mut r = R(seed | 1);
+        let mut r = Rng64::new(seed | 1);
         (0..n)
             .map(|_| Vector3::new((r.f() - 0.5) * 4.0, (r.f() - 0.5) * 3.0, 2.5 + r.f() * 5.0))
             .collect()
@@ -379,7 +356,7 @@ mod tests {
     fn ransac_recovers_pose_with_outliers_and_noise() {
         let gt = iso(-0.05, 0.09, -0.03, -0.3, 0.15, 0.5);
         let pts = cloud(80, 42);
-        let mut r = R(7);
+        let mut r = Rng64::new(7);
         let mut obs: Vec<Observation> = pts
             .iter()
             .map(|&x| {

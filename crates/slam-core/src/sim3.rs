@@ -26,6 +26,7 @@
 //! sizes (it runs rarely, off the tracking core); a sparse solver is a
 //! later perf step if measured.
 
+use ginger_rand::Rng64;
 use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Vector3};
 
 use crate::lie::{so3_exp, so3_log};
@@ -188,20 +189,6 @@ pub fn sim3_align(src: &[Vector3<f64>], dst: &[Vector3<f64>]) -> Option<Sim3> {
     Some(Sim3::new(scale, rot, t))
 }
 
-/// Deterministic xorshift PRNG (shared scheme across the core).
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn upto(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Sim3RansacOptions {
     pub iters: usize,
@@ -249,7 +236,7 @@ pub fn sim3_ransac(
             .filter(|(a, b)| (s.transform(a) - *b).norm() <= opt.thresh)
             .count()
     };
-    let mut rng = Rng(opt.seed | 1);
+    let mut rng = Rng64::new(opt.seed | 1);
     let mut best: Option<(usize, Sim3)> = None;
     for _ in 0..opt.iters {
         let i = rng.upto(n);
@@ -479,16 +466,6 @@ pub fn optimize_pose_graph(
 mod tests {
     use super::*;
 
-    struct Rng(u64);
-    impl Rng {
-        fn f(&mut self) -> f64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-        }
-    }
-
     fn rot(rx: f64, ry: f64, rz: f64) -> Rotation3<f64> {
         Rotation3::from_euler_angles(rx, ry, rz)
     }
@@ -527,7 +504,7 @@ mod tests {
 
     #[test]
     fn sim3_align_recovers_scaled_rigid() {
-        let mut r = Rng(0xA11);
+        let mut r = Rng64::new(0xA11);
         let truth = Sim3::new(2.3, rot(0.2, -0.4, 0.7), Vector3::new(1.0, -2.0, 0.5));
         let src: Vec<Vector3<f64>> = (0..30)
             .map(|_| Vector3::new(r.f() * 4.0, r.f() * 3.0, r.f() * 5.0))
@@ -638,7 +615,7 @@ mod tests {
 
     #[test]
     fn sim3_ransac_robust_to_outliers() {
-        let mut r = Rng(0xC0FFEE);
+        let mut r = Rng64::new(0xC0FFEE);
         let truth = Sim3::new(1.7, rot(-0.1, 0.3, 0.2), Vector3::new(-1.0, 2.0, 0.7));
         let src: Vec<Vector3<f64>> = (0..60)
             .map(|_| Vector3::new(r.f() * 4.0, r.f() * 3.0, r.f() * 5.0))
