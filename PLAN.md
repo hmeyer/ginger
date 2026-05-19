@@ -9,9 +9,12 @@ ORB-SLAM pipeline on the Raspberry Pi 4. The inline roadmap stub lives in
 Monocular SLAM runs end-to-end: detect → two-view bootstrap → **live
 6-DoF tracking** (constant-velocity prediction + motion-only BA) →
 **local mapping** (keyframes + decoupled triangulation + block-sparse
-Schur local BA on a background thread), surfaced as a growing,
+Schur local BA on a background thread) → **relocalization** (BoW +
+PnP-RANSAC on track loss) + **loop closing** (BoW detect → Sim3 verify
+→ Essential-graph pose-graph correction), surfaced as a growing,
 locally-bundle-adjusted point cloud + keyframes + camera trajectory in
-the WebUI. No loop closing / relocalization yet (M6).
+the WebUI that snaps straighter on loop closure. The full monocular
+ORB-SLAM pipeline (M2→M6) is in place.
 
 - **M0** ✅ FAST-9 over an 8-level pyramid + NMS + grid-spread cap (NEON).
 - **M1** ✅ Oriented BRIEF + brute-force mutual-NN matching (Lowe ratio).
@@ -121,7 +124,7 @@ session):
 - **Visible deliverable ✅:** growing, locally-bundle-adjusted point
   cloud + keyframe markers on the top-down canvas.
 
-### M6 — Relocalization + loop closing 🔄
+### M6 — Relocalization + loop closing ✅
 
 slam-core retrieval primitive started; the rest is built on it.
 
@@ -207,18 +210,25 @@ testable sub-steps:
     caveat, real-scene validation rides the deferred frame-recorder.
     The pipeline test asserts the conservative gates don't misfire on
     straight motion + the path is deterministic + non-corrupting.
-- **M6-2e ⏭ — surface + tests.** `MapSnapshot` status carries
-  `relocalized` / `loop closed (k↔k)` events; the existing canvas
-  (trajectory + keyframes + points) shows the snap for free once poses
-  move. Extend `pipeline_tests`: (1) induce track loss then feed a
-  recognizable frame → asserts recovery + no map corruption; (2) drive a
-  synthetic loop trajectory → asserts loop detection + end-to-origin
-  drift and scale drift cut sharply after closure, determinism, and a
-  no-loop run is untouched. Update README/PLAN/inline roadmap.
+- **M6-2e ✅ — surface + tests (consolidation).** The events already
+  reach the surface incrementally: the `MapSnapshot` status carries
+  `relocalizing… (lost n)` / `relocalized: …` (M6-2c) and
+  `· loop closed (#n)` (M6-2d), shown untruncated on the `#slam-hud`
+  line; the existing canvas (trajectory + keyframes + points) snaps for
+  free when pose-graph moves the poses; the in-canvas caption was
+  widened so the event is visible there too. `pipeline_tests` already
+  cover (1) track loss → relocalize without map corruption
+  (`relocalizes_after_track_loss`, M6-2c) and (2) the loop-closure path
+  is gated/deterministic/non-corrupting on straight motion
+  (`loop_closing_gated_and_no_false_positive`, M6-2d); closure
+  *efficacy* on a genuinely drifted loop is gated by the slam-core unit
+  tests (`sim3::optimize_pose_graph` + `sim3_ransac`), the synthetic
+  harness limitation documented in M6-2d. README / inline roadmap
+  updated.
 
-- **Visible deliverable:** a `relocalized` / `loop closed` event on the
-  `#slam-hud` line and the trajectory + keyframes + point cloud visibly
-  snapping straighter on the top-down canvas when a loop closes.
+- **Visible deliverable ✅:** a `relocalized` / `loop closed (#n)`
+  event on the `#slam-hud` line and the trajectory + keyframes + point
+  cloud snapping straighter on the top-down canvas when a loop closes.
 
 **M6-2 design decisions / risks (durable):**
 - *Self-trained vocabulary* is weaker than a pre-trained ORB vocab but
@@ -241,12 +251,17 @@ testable sub-steps:
 (`/api/slam/map`, `map` overlay mode) + the `#slam-hud` line; M3 filled
 it with the bootstrap cloud + two cameras, M4 extended it with the live
 trajectory, M5 grows the locally-bundle-adjusted map + draws keyframe
-markers (orange squares).
+markers (orange squares), M6 surfaces `relocalizing…` / `relocalized` /
+`loop closed (#n)` in the HUD and snaps the canvas on loop closure.
 
 ## Sequencing & risks
 
-- **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
-  **M6 (in progress: M6-1a/b/c ✅; M6-2 wiring: a✅ b✅ c✅ d✅, e next)**.
+- **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ → M6 ✅
+  (1a/b/c slam-core + 2a–2e wiring all done). The monocular ORB-SLAM
+  roadmap is complete; remaining items are the deferred hardware-loop
+  follow-ups (real ChArUco calibration, frame recorder) + perf passes
+  (guided-index matching, post-loop global BA, finer mapping handoff,
+  measured NEON hotspots).
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing

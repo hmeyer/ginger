@@ -56,9 +56,10 @@ src/
   video/
     h264.rs       — V4L2 hardware H.264 encoder
     webrtc.rs     — WHEP signalling + adaptive bitrate
-  slam/           — visual-SLAM frontend (FAST+BRIEF → init → track → map)
+  slam/           — visual-SLAM frontend (init → track → map → reloc/loop)
     mod.rs        — Frontend state machine (Stage enum) + run() thread
-    mapper.rs     — decoupled local-mapping thread (triangulation + local BA)
+    mapper.rs     — decoupled local-mapping thread (triangulation, BA, loop close)
+    place.rs      — BoW place-recognition DB (relocalization / loop detection)
     fast.rs / brief.rs / image.rs — detection/descriptor/pyramid glue
   robot/          — domain
     car.rs        — Top-level Car struct with obstacle-avoidance safety
