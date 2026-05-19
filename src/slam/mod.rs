@@ -1084,7 +1084,7 @@ pub fn run(
 ) {
     let mut fe = Frontend::new();
     // Decouple local mapping (triangulation + heavy Schur local BA)
-    // onto its own thread/core per the PLAN.md Pi-4 strategy; tracking
+    // onto its own thread/core per the Pi-4 strategy; tracking
     // here just inserts keyframes over the channel and keeps frame rate.
     if let Some(lm) = fe.take_local_mapper() {
         std::thread::Builder::new()
@@ -1439,7 +1439,7 @@ mod pipeline_tests {
     }
 
     /// The full pipeline incl. local mapping is deterministic headless
-    /// (the PLAN.md gating signal): identical input ⇒ identical map.
+    /// (the gating signal): identical input ⇒ identical map.
     #[test]
     fn pipeline_is_deterministic() {
         let run = || {

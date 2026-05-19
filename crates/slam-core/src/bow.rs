@@ -8,8 +8,8 @@
 //! BoW turns it into a sparse vector compare over an inverted index.
 //!
 //! DBoW2-style and deliberately Pi-cheap (bitwise Hamming, no BLAS, no
-//! float-heavy clustering — per-PLAN.md "binary BoW fits the ARMv8.0,
-//! multicore-not-SIMD strategy"). Camera-free; descriptors are the same
+//! float-heavy clustering — binary BoW fits the ARMv8.0,
+//! multicore-not-SIMD strategy). Camera-free; descriptors are the same
 //! opaque 256-bit ORB blobs the rest of the core carries
 //! ([`crate::map::Descriptor`]).
 //!
@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::map::Descriptor;
 
 /// Hamming distance between two 256-bit descriptors (0..=256). Scalar
-/// reference per the PLAN.md kernel discipline; a NEON `vcntq_u8` +
+/// reference per the `crates/fast` kernel discipline; a NEON `vcntq_u8` +
 /// `vaddvq` version is a later, parity-tested perf step if measured hot.
 #[inline]
 pub fn hamming(a: &Descriptor, b: &Descriptor) -> u32 {
@@ -66,7 +66,7 @@ fn majority(descs: &[Descriptor]) -> Descriptor {
 
 /// Deterministic xorshift PRNG (same scheme as the other core modules),
 /// so a vocabulary is a pure function of `(images, k, depth, seed)` —
-/// the PLAN.md headless-determinism gate.
+/// the headless-determinism gate.
 struct Rng(u64);
 impl Rng {
     fn f(&mut self) -> f64 {

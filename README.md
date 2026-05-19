@@ -76,7 +76,39 @@ scripts/
   install-service.sh — Install ginger as a systemd user service
 ```
 
-The SLAM roadmap and milestone status live in [`PLAN.md`](PLAN.md).
+## SLAM status
+
+The full monocular ORB-SLAM pipeline is implemented and on `main`:
+detection → two-view bootstrap → live 6-DoF tracking → decoupled local
+mapping (keyframes, triangulation, block-sparse Schur local BA) → BoW
+relocalization on track loss → BoW + Sim3 loop detection →
+Essential-graph pose-graph correction, surfaced on the WebUI top-down
+canvas (trajectory + keyframes + points, snapping on loop closure) and
+gated by deterministic headless tests (`cargo test --workspace
+--no-default-features`).
+
+**Deferred — need the physical robot + target in one session:**
+- **Proper camera calibration** — an offline OpenCV ChArUco tool
+  emitting a verified `slam.toml` (today: the rev 1.3 FOV-derived prior,
+  flagged `UNVERIFIED`). Not kalibr.
+- **Frame recorder** — dump live libcamera frames to `*.pgm` to feed
+  the existing replay harness with real scenes. Real-scene init quality
+  (M3) and loop-closure efficacy (M6) are only verified on synthetic /
+  unit-test scenes until this lands; the synthetic harness can't
+  manufacture the drift a closing loop needs.
+
+**Performance / refinement passes (measure first via `slam_bench`):**
+- Wire the BoW direct index into tracking/loop matching (still
+  brute-force descriptor matching against the whole map).
+- Post-loop global bundle adjustment (loop closure currently only
+  pose-graph-corrects + drags points).
+- Finer tracking/mapping handoff (the coarse single `Arc<Mutex<Map>>`
+  lets heavy local BA / pose-graph stall a tracking frame).
+- Analytic Jacobians for `tracking` / `local_ba` (currently central
+  finite differences) — parity-tested.
+- Hand-written NEON only at a measured hotspot (e.g. BoW Hamming
+  `vcntq_u8` + `vaddvq`), keeping the `crates/fast`
+  scalar→NEON→parity discipline.
 
 ## Dependencies
 

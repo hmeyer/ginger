@@ -33,7 +33,7 @@ pub struct PnpOptions {
     pub thresh: f64,
     /// Minimum inliers for the refined pose to be trusted.
     pub min_inliers: usize,
-    /// Deterministic sampler seed (PLAN.md headless-determinism gate).
+    /// Deterministic sampler seed (headless-determinism gate).
     pub seed: u64,
 }
 

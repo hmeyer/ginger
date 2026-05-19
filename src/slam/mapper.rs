@@ -1,7 +1,7 @@
 //! M5 local-mapping thread: turn inserted keyframes into a growing,
 //! locally bundle-adjusted map.
 //!
-//! Decoupled from per-frame tracking per the PLAN.md Pi-4 performance
+//! Decoupled from per-frame tracking per the Pi-4 performance
 //! strategy — the heavy block-sparse Schur local BA
 //! ([`ginger_slam_core::local_ba`]) runs off the tracking core. The pure
 //! work unit is [`LocalMapper::process_pending`]; [`super::run`] drives
@@ -57,7 +57,7 @@ const LOCAL_BA_K: usize = 6;
 /// across many keyframes (overlapping windows re-touch the same poses),
 /// so a short budget per keyframe keeps the heavy Schur step off the
 /// tracking core's critical path while still converging over time — the
-/// PLAN.md "heavy BA at a lower cadence" strategy.
+/// "heavy BA at a lower cadence" strategy.
 const LOCAL_BA_ITERS: usize = 5;
 /// Keep raw features for at most this many recent keyframes (memory
 /// bound). Older keyframes keep their map observations (so they still
