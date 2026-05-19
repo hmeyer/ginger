@@ -533,6 +533,11 @@ pub struct Frontend {
     /// keyframes are inserted; relocalization (M6-2c) / loop detection
     /// (M6-2d) query it. Held here so the tracking side can reach it.
     place: Arc<Mutex<PlaceDb>>,
+    /// Loop closures applied by the mapper (M6-2d); surfaced in the HUD
+    /// status and observable for tests.
+    loops: Arc<std::sync::atomic::AtomicU64>,
+    /// Last `loops` value folded into the status line.
+    last_loops: u64,
 }
 
 impl Default for Frontend {
@@ -545,6 +550,7 @@ impl Frontend {
     pub fn new() -> Self {
         let world = Arc::new(Mutex::new(Map::new()));
         let place = Arc::new(Mutex::new(PlaceDb::new()));
+        let loops = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (tx, rx) = channel();
         Self {
             prev: None,
@@ -552,11 +558,23 @@ impl Frontend {
             intrinsics: None,
             iview: IntrinsicsView::uninitialized(),
             map: MapSnapshot::initial(),
-            mapper: Some(LocalMapper::new(world.clone(), rx, place.clone())),
+            mapper: Some(LocalMapper::new(
+                world.clone(),
+                rx,
+                place.clone(),
+                loops.clone(),
+            )),
             world,
             jobs: tx,
             place,
+            loops,
+            last_loops: 0,
         }
+    }
+
+    /// Loop closures applied so far (M6-2d) — test/observability hook.
+    pub fn loop_closures(&self) -> u64 {
+        self.loops.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Move the local mapper out to run on its own thread (production).
@@ -1031,6 +1049,15 @@ impl Frontend {
                 }
             }
             self.stage = next.unwrap_or(stage);
+        }
+
+        // Surface mapper loop closures (M6-2d) in the HUD: the corrected
+        // keyframes/points are already in the published snapshot (the
+        // map moved under us); annotate the status so the event shows.
+        let lc = self.loops.load(std::sync::atomic::Ordering::Relaxed);
+        if lc != self.last_loops {
+            self.last_loops = lc;
+            self.map.status = format!("{} · loop closed (#{lc})", self.map.status);
         }
 
         self.prev = Some((points.to_vec(), descs.to_vec()));
@@ -1611,5 +1638,55 @@ mod pipeline_tests {
             cont.map.status
         );
         assert!(cont.map.cameras.len() > traj);
+    }
+
+    /// M6-2d: the conservative loop-closure gates must NOT misfire on
+    /// ordinary forward motion (a false loop corrupts the map
+    /// irreversibly) — and the wiring runs end-to-end, deterministically,
+    /// without corrupting the map. Closure *efficacy* on a genuinely
+    /// drifted loop is gated by the slam-core unit tests
+    /// (`sim3::optimize_pose_graph` / `sim3_ransac`); the synthetic
+    /// harness (frame-stable descriptors + whole-map matching) shares
+    /// points across a revisit so it can't manufacture the drift a
+    /// closing loop needs (a known synthetic-harness limit, like the M3
+    /// caveat).
+    #[test]
+    fn loop_closing_gated_and_no_false_positive() {
+        let run = || {
+            let (pts, ds) = scene(220);
+            let cam = cam_model();
+            let mut fe = Frontend::new();
+            let mut tail = None;
+            for i in 0..64 {
+                let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.07));
+                tail = Some(step(&mut fe, &fp, &fd));
+            }
+            let (n_kf, n_pts) = fe.map_stats();
+            let t = tail.unwrap();
+            (
+                n_kf,
+                n_pts,
+                fe.loop_closures(),
+                *t.map.cameras.last().unwrap(),
+                t.map.tracking,
+                t.map
+                    .points
+                    .iter()
+                    .all(|p| p[0].is_finite() && p[1].is_finite()),
+            )
+        };
+        let a = run();
+        // No revisit → the gates must hold (no spurious closure).
+        assert_eq!(a.2, 0, "false loop closure on straight motion");
+        assert!(a.4, "tracking lost");
+        assert!(a.5, "non-finite map geometry");
+        assert!(a.0 >= 6 && a.1 > 0, "map too small: {a:?}");
+        // Whole pipeline (incl. the loop-closure path) is deterministic.
+        let b = run();
+        assert_eq!(
+            (a.0, a.1, a.2, a.3),
+            (b.0, b.1, b.2, b.3),
+            "pipeline not deterministic"
+        );
     }
 }

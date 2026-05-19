@@ -181,19 +181,32 @@ testable sub-steps:
   corruption). Runs on the tracking thread (bounded). Pipeline test:
   garbage frames lose the track without corruption, a recognizable
   frame relocalizes, tracking continues.
-- **M6-2d ⏭ — loop closing on the `LocalMapper` thread.** Per new
-  keyframe (after local BA): BoW-query the DB **excluding covisible +
-  recent** keyframes; on a candidate passing the score gate, geometric
-  verify via guided match → `sim3_align` over the shared map points
-  (relative `Sim3`, scale included) gated on inlier count. Assemble the
-  Essential-graph edges — spanning-tree + covisibility edges measured at
-  the *current* estimate (soft "keep relative") plus the loop edge from
-  the verified `Sim3` — and run `sim3::optimize_pose_graph` (gauge-fix
-  the origin keyframe). Write corrected keyframe poses back; rigidly
-  re-transform each map point by the `Sim3` correction of a reference
-  observing keyframe so points track their keyframes. Stays the
-  pumped-synchronously tested seam (`process_pending`), heavy + rare +
-  off the tracking core.
+- **M6-2d ✅ — loop closing on the `LocalMapper` thread.** Added
+  `sim3::sim3_ransac` (robust Sim3 over 3D↔3D matches, RANSAC + refit;
+  slam-core, outlier-tested). After local BA the just-processed
+  keyframe BoW-queries the DB **excluding itself / covisible / recent**
+  (`LOOP_MIN_GAP`); a candidate over `LOOP_MIN_SCORE` is geometrically
+  verified by matching pooled map-point descriptors (kf vs candidate +
+  covisible) and `sim3_ransac` (≥ `LOOP_MIN_INLIERS`). On acceptance
+  the keyframe-graph poses are snapshotted as `Sim3`, the Essential
+  graph is assembled (spanning-tree + covisibility edges measured at
+  the current estimate as soft rigidity, plus the high-weight loop edge
+  `meas = Sₖ·S⁻¹·S_c⁻¹` that has a non-zero residual pulling the graph),
+  `optimize_pose_graph` runs off-lock (origin gauge-fixed), then
+  corrected keyframe poses (Sim3→SE3, scale folded into translation) +
+  map points (dragged by their reference keyframe's Sim3 correction)
+  are written back. Loop count is shared with the frontend (HUD status
+  `· loop closed (#n)`). Stays the pumped-synchronously tested seam,
+  heavy + rare + off the tracking core. Conservative gates favour a
+  miss over a map-destroying false closure.
+  - *Caveat:* closure **efficacy** is gated by the slam-core unit tests
+    (`optimize_pose_graph` drifted-loop + `sim3_ransac` outliers); the
+    synthetic pipeline harness (frame-stable per-landmark descriptors +
+    whole-map matching) shares points across a revisit so it can't
+    manufacture the drift a closing loop needs — like the M3 synthetic
+    caveat, real-scene validation rides the deferred frame-recorder.
+    The pipeline test asserts the conservative gates don't misfire on
+    straight motion + the path is deterministic + non-corrupting.
 - **M6-2e ⏭ — surface + tests.** `MapSnapshot` status carries
   `relocalized` / `loop closed (k↔k)` events; the existing canvas
   (trajectory + keyframes + points) shows the snap for free once poses
@@ -233,7 +246,7 @@ markers (orange squares).
 ## Sequencing & risks
 
 - **Strict dependency chain:** M2 ✅ → M3 ✅ → M4 ✅ → M5 ✅ →
-  **M6 (in progress: M6-1a/b/c ✅; M6-2 wiring: a✅ b✅ c✅, d→e next)**.
+  **M6 (in progress: M6-1a/b/c ✅; M6-2 wiring: a✅ b✅ c✅ d✅, e next)**.
 - **The Pi 4 is the binding constraint.** Plan from the start to drop
   resolution / feature count for the geometry path and to run local BA
   and loop closing on background threads at a lower rate. The existing

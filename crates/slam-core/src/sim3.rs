@@ -188,6 +188,115 @@ pub fn sim3_align(src: &[Vector3<f64>], dst: &[Vector3<f64>]) -> Option<Sim3> {
     Some(Sim3::new(scale, rot, t))
 }
 
+/// Deterministic xorshift PRNG (shared scheme across the core).
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn upto(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Sim3RansacOptions {
+    pub iters: usize,
+    /// Inlier gate on `‖S·src − dst‖` (same units as the points).
+    pub thresh: f64,
+    pub min_inliers: usize,
+    pub seed: u64,
+}
+
+impl Default for Sim3RansacOptions {
+    fn default() -> Self {
+        Self {
+            iters: 200,
+            thresh: 0.05,
+            min_inliers: 8,
+            seed: 0x5132_0DED,
+        }
+    }
+}
+
+/// Outcome of [`sim3_ransac`].
+#[derive(Clone, Debug)]
+pub struct Sim3Report {
+    pub pose: Sim3,
+    pub inliers: Vec<bool>,
+    pub n_inliers: usize,
+}
+
+/// Robust similarity from putative 3D↔3D correspondences (loop-closure
+/// verification): RANSAC over minimal [`sim3_align`] fits (3 samples),
+/// then a final refit on the largest consensus set. `None` if fewer
+/// than `min_inliers` agree. Deterministic given `opt.seed`.
+pub fn sim3_ransac(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    opt: Sim3RansacOptions,
+) -> Option<Sim3Report> {
+    let n = src.len();
+    if n < 3 || dst.len() != n {
+        return None;
+    }
+    let count = |s: &Sim3| -> usize {
+        src.iter()
+            .zip(dst)
+            .filter(|(a, b)| (s.transform(a) - *b).norm() <= opt.thresh)
+            .count()
+    };
+    let mut rng = Rng(opt.seed | 1);
+    let mut best: Option<(usize, Sim3)> = None;
+    for _ in 0..opt.iters {
+        let i = rng.upto(n);
+        let mut j = rng.upto(n);
+        while j == i {
+            j = rng.upto(n);
+        }
+        let mut k = rng.upto(n);
+        while k == i || k == j {
+            k = rng.upto(n);
+        }
+        let s3 = [src[i], src[j], src[k]];
+        let d3 = [dst[i], dst[j], dst[k]];
+        if let Some(s) = sim3_align(&s3, &d3) {
+            let c = count(&s);
+            if best.as_ref().is_none_or(|&(b, _)| c > b) {
+                best = Some((c, s));
+            }
+        }
+    }
+    let (_, coarse) = best?;
+    // Refit on the full consensus set.
+    let (mut si, mut so): (Vec<Vector3<f64>>, Vec<Vector3<f64>>) = (Vec::new(), Vec::new());
+    for (a, b) in src.iter().zip(dst) {
+        if (coarse.transform(a) - b).norm() <= opt.thresh {
+            si.push(*a);
+            so.push(*b);
+        }
+    }
+    let pose = if si.len() >= 3 {
+        sim3_align(&si, &so).unwrap_or(coarse)
+    } else {
+        coarse
+    };
+    let inliers: Vec<bool> = src
+        .iter()
+        .zip(dst)
+        .map(|(a, b)| (pose.transform(a) - b).norm() <= opt.thresh)
+        .collect();
+    let n_inliers = inliers.iter().filter(|&&x| x).count();
+    (n_inliers >= opt.min_inliers).then_some(Sim3Report {
+        pose,
+        inliers,
+        n_inliers,
+    })
+}
+
 /// One pose-graph constraint: the measured relative similarity such that
 /// ideally `poses[i] = meas ∘ poses[j]` (residual zero). `weight` scales
 /// the squared error (e.g. covisibility strength).
@@ -525,5 +634,47 @@ mod tests {
         let mut p = vec![Sim3::identity(), Sim3::identity()];
         let r = optimize_pose_graph(&mut p, &[], 0, PoseGraphOptions::default());
         assert_eq!((r.iters, r.edges), (0, 0));
+    }
+
+    #[test]
+    fn sim3_ransac_robust_to_outliers() {
+        let mut r = Rng(0xC0FFEE);
+        let truth = Sim3::new(1.7, rot(-0.1, 0.3, 0.2), Vector3::new(-1.0, 2.0, 0.7));
+        let src: Vec<Vector3<f64>> = (0..60)
+            .map(|_| Vector3::new(r.f() * 4.0, r.f() * 3.0, r.f() * 5.0))
+            .collect();
+        let mut dst: Vec<Vector3<f64>> = src.iter().map(|p| truth.transform(p)).collect();
+        // ~30% gross outliers.
+        for d in dst.iter_mut().step_by(3) {
+            *d += Vector3::new(r.f() * 10.0 - 5.0, r.f() * 10.0 - 5.0, r.f() * 10.0 - 5.0);
+        }
+        let rep = sim3_ransac(
+            &src,
+            &dst,
+            Sim3RansacOptions {
+                thresh: 1e-6,
+                ..Sim3RansacOptions::default()
+            },
+        )
+        .expect("verified");
+        assert!((rep.pose.s - truth.s).abs() < 1e-6, "scale {}", rep.pose.s);
+        assert!((rep.pose.r.matrix() - truth.r.matrix()).norm() < 1e-6);
+        assert!((rep.pose.t - truth.t).norm() < 1e-6);
+        assert!(rep.n_inliers >= 35, "only {} inliers", rep.n_inliers);
+        // Planted outliers are flagged out.
+        let bad_in = rep.inliers.iter().step_by(3).filter(|&&x| x).count();
+        assert!(bad_in <= 2, "outliers leaked: {bad_in}");
+        // Determinism + too-few-correspondences guard.
+        let rep2 = sim3_ransac(
+            &src,
+            &dst,
+            Sim3RansacOptions {
+                thresh: 1e-6,
+                ..Sim3RansacOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rep.n_inliers, rep2.n_inliers);
+        assert!(sim3_ransac(&src[..2], &dst[..2], Sim3RansacOptions::default()).is_none());
     }
 }
