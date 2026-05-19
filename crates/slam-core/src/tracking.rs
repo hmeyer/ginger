@@ -9,8 +9,7 @@
 //! [`crate::optimize::levenberg_marquardt`] (SE3 parameterized via
 //! [`crate::lie`], Huber robustifier). The Jacobian is central finite
 //! differences — exact enough and convention-proof; an analytic
-//! Jacobian is a later, parity-tested perf step (see the PLAN.md
-//! performance strategy).
+//! Jacobian is a later, parity-tested perf step.
 
 use nalgebra::{DMatrix, DVector, Isometry3, Vector2, Vector3, Vector6};
 

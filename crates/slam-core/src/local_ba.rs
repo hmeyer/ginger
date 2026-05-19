@@ -3,7 +3,7 @@
 //! error.
 //!
 //! This is the Pi-4 performance crux, so the structure is the planned
-//! **block-sparse Schur complement** (PLAN.md): 6×6 camera blocks, 3×3
+//! **block-sparse Schur complement**: 6×6 camera blocks, 3×3
 //! point blocks, 6×3 coupling. Points are eliminated per-block (3×3
 //! inverse) into a small dense reduced camera system (≤ `6·|window|`,
 //! L1-resident) solved by Cholesky, then back-substituted. LM damping +
