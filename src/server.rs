@@ -56,7 +56,7 @@ pub async fn serve(state: AppState) {
         .route("/api/stop", post(stop_car))
         .route("/api/pan", post(pan))
         .route("/api/tilt", post(tilt))
-        .route("/api/express", post(express))
+        .route("/api/emote", post(emote))
         .route("/api/sensors/config", post(sensor_config))
         .with_state(state);
 
@@ -173,8 +173,8 @@ async fn tilt(State(st): State<AppState>, Json(b): Json<AngleBody>) -> StatusCod
     StatusCode::OK
 }
 
-async fn express(State(st): State<AppState>) -> StatusCode {
-    st.cmd_tx.send(Command::Express).await.ok();
+async fn emote(State(st): State<AppState>) -> StatusCode {
+    st.cmd_tx.send(Command::Emote).await.ok();
     StatusCode::OK
 }
 

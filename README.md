@@ -176,7 +176,7 @@ Features:
 - **Spring-back camera bracket** — releasing the camera joystick re-centers pan/tilt so the ultrasonic sensor faces forward (replaces the old brittle distance-estimated auto-center)
 - **Pan trim** — physical straight-ahead baked in as a servo pulse offset; `set_pan(90°)` always points the sensor forward
 - **Pan / tilt joystick** — 0–180° range, spring-back to forward
-- **Express** — one-tap synchronized LED + buzzer "expression": a random *mood* (excited / curious / grumpy / alarmed / chatty) fixes the pitch band, tempo, rise/fall contour and a matching colour palette; a random *viz* (scanner / VU meter / flood) makes the lights track pitch in lock-step with the bit-banged buzzer warble
+- **Emote** — one-tap synchronized LED + buzzer emote: a random *mood* (excited / curious / grumpy / alarmed / chatty) fixes the pitch band, tempo, rise/fall contour and a matching colour palette; a random *viz* (scanner / VU meter / flood) makes the lights track pitch in lock-step with the bit-banged buzzer warble
 - **Sensor toggles** — enable/disable light, IR, and ultrasonic per sensor
 
 The UI is mobile-first: on phones it stacks camera → scrollable sensor strip → footer controls. On screens ≥ 700 px it switches to a camera + sidebar layout.
