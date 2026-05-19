@@ -319,19 +319,11 @@ pub fn local_bundle_adjust(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::map::Map;
+    use ginger_rand::Rng64;
     use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 
-    struct Rng(u64);
-    impl Rng {
-        fn f(&mut self) -> f64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-        }
-    }
+    use super::*;
+    use crate::map::Map;
 
     fn pose(tx: f64, ry: f64) -> Isometry3<f64> {
         Isometry3::from_parts(
@@ -350,7 +342,7 @@ mod tests {
     /// Ground-truth scene: 4 cameras along x with slight yaw, N points;
     /// cam0 fixed at truth (gauge).
     fn scene(noise: f64) -> Scene {
-        let mut r = Rng(0xBEEF);
+        let mut r = Rng64::new(0xBEEF);
         let truth_pose: Vec<Isometry3<f64>> = (0..4)
             .map(|i| pose(i as f64 * 0.3, i as f64 * 0.02))
             .collect();

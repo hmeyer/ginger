@@ -8,33 +8,18 @@
 
 use std::time::SystemTime;
 
+use ginger_rand::Xs64;
+
 use crate::robot::car::Car;
 
-/// Tiny dependency-free xorshift PRNG, seeded from the wall clock. Good
-/// enough to make the buzzer/LED show feel different every press.
-struct Rng(u64);
-impl Rng {
-    fn new() -> Self {
-        let seed = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        Rng(seed | 1)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    /// Uniform in `[lo, hi]`.
-    fn range(&mut self, lo: u64, hi: u64) -> u64 {
-        lo + self.next() % (hi - lo + 1)
-    }
-    /// Uniform float in `[0, 1)`.
-    fn unit(&mut self) -> f32 {
-        (self.next() >> 40) as f32 / (1u64 << 24) as f32
-    }
+/// The buzzer/LED show's PRNG, seeded from the wall clock so it feels
+/// different every press (stream quality is irrelevant here).
+fn show_rng() -> Xs64 {
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    Xs64::seeded(seed)
 }
 
 /// HSV → RGB. `h` in degrees, `s`/`v` in `[0, 1]`.
@@ -56,7 +41,7 @@ fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
 }
 
 /// A pitch near the phrase's (drifting) centre, jittered within the band.
-fn band_freq(rng: &mut Rng, centre: f32, lo: i32, hi: i32) -> i32 {
+fn band_freq(rng: &mut Xs64, centre: f32, lo: i32, hi: i32) -> i32 {
     let j = (rng.unit() - 0.5) * (hi - lo) as f32 * 0.6;
     (centre + j).clamp(lo as f32, hi as f32) as i32
 }
@@ -135,7 +120,7 @@ fn light(car: &mut Car, pal: &Pal, viz: u64, t: f32, v: f32) {
 /// the show is synchronized by construction. Blocks the supervisor loop
 /// briefly (< ~2.5 s), like the old scan did.
 pub(crate) fn play_emote(car: &mut Car) {
-    let mut rng = Rng::new();
+    let mut rng = show_rng();
 
     let p = |h0: f32, span: f32, sat: f32| Pal { h0, span, sat };
     let moods: [Mood; 5] = [
@@ -210,7 +195,7 @@ pub(crate) fn play_emote(car: &mut Car) {
         _ => (lo + hi) as f32 / 2.0,
     };
     let drift = contour as f32 * span / segments as f32;
-    let dur = |rng: &mut Rng, a: u64, b: u64| (rng.range(a, b) * tempo / 100).max(6);
+    let dur = |rng: &mut Xs64, a: u64, b: u64| (rng.range(a, b) * tempo / 100).max(6);
 
     for _ in 0..segments {
         match kinds[rng.range(0, kinds.len() as u64 - 1) as usize] {

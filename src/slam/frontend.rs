@@ -694,33 +694,22 @@ impl Frontend {
 /// directly.
 #[cfg(test)]
 mod pipeline_tests {
-    use super::*;
+    use ginger_rand::Rng64;
     use ginger_slam_core::camera::CameraModel;
     use ginger_slam_core::intrinsics::Intrinsics;
     use nalgebra::Isometry3;
 
+    use super::*;
+
     const W: usize = 640;
     const H: usize = 480;
-
-    struct Rng(u64);
-    impl Rng {
-        fn f(&mut self) -> f64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-        }
-        fn byte(&mut self) -> u8 {
-            (self.f() * 256.0) as u8
-        }
-    }
 
     /// `n` world landmarks (varied depth/lateral spread) each with a
     /// unique, frame-stable BRIEF descriptor (mutually far apart → the
     /// matcher pairs them unambiguously, isolating pipeline behaviour
     /// from matcher robustness, which `brief` tests separately).
     fn scene(n: usize) -> (Vec<Vector3<f64>>, Vec<brief::Descriptor>) {
-        let mut r = Rng(0x00AB_CDEF_1234_5678);
+        let mut r = Rng64::new(0x00AB_CDEF_1234_5678);
         let mut pts = Vec::with_capacity(n);
         let mut ds = Vec::with_capacity(n);
         for _ in 0..n {
@@ -958,7 +947,7 @@ mod pipeline_tests {
         let traj = good.map.cameras.len();
 
         // A frame of pure garbage descriptors → no map matches.
-        let mut r = Rng(0x99);
+        let mut r = Rng64::new(0x99);
         let fd: Vec<brief::Descriptor> = (0..200)
             .map(|_| {
                 let mut d = [0u8; brief::DESC_BYTES];
@@ -1057,7 +1046,7 @@ mod pipeline_tests {
 
         // A run of pure-garbage frames → lost, and the map is *not*
         // corrupted while lost (points + trajectory frozen).
-        let mut r = Rng(0x6105);
+        let mut r = Rng64::new(0x6105);
         for _ in 0..4 {
             let fd: Vec<brief::Descriptor> = (0..200)
                 .map(|_| {

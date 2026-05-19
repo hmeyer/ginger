@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 rayon = "1"
+
+# Test-only: the deterministic image-fuzz fixtures use the shared PRNG.
+# Kept a dev-dependency so the crate's runtime dep surface stays minimal.
+[dev-dependencies]
+ginger-rand = { path = "../rand" }

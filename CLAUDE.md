@@ -64,6 +64,13 @@ non-decreasing. New behavior needs new tests in the same change.
   the module docstrings.
 - **Determinism** — replay/test paths must stay deterministic.
   Observation ordering in `local_ba`/`map` is load-bearing; preserve it.
+- **Shared primitives** — "dependency-light" means few *external*
+  crates, not duplicated *internal* code. Determinism-critical
+  primitives (the seeded PRNGs) live once in `crates/rand`
+  (`ginger-rand`) and are reused, never re-hand-rolled per file. Its
+  bit sequences gate the headless suite, the k-means BoW vocabulary and
+  the BRIEF pattern; changing an algorithm/constant there is a
+  deliberate, test-re-blessing change, never an incidental cleanup.
 - **NEON discipline** — every SIMD path in `crates/fast` keeps a scalar
   reference and a `parity` test. Add NEON only at a measured hotspot.
 - **Comments** — explain *why*, not *what*. The codebase favors dense,

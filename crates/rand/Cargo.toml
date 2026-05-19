@@ -1,0 +1,12 @@
+[package]
+name = "ginger-rand"
+version = "0.1.0"
+edition = "2024"
+
+# Zero dependencies on purpose: this is the single source of truth for
+# every *seeded, deterministic* random stream in the workspace (RANSAC,
+# k-means++ vocabulary, the BRIEF pattern, the buzzer/LED show, test
+# fixtures). It is the headless-determinism gate, so it must compile and
+# behave identically on the dev host, CI, and the aarch64 Pi target —
+# hence no external crates and no platform entropy.
+[dependencies]

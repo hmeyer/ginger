@@ -275,24 +275,11 @@ mod tests {
     /// sides are scalar, so this still exercises the harness and the
     /// 4-wide block / remainder tiling math.
     mod resize_parity {
+        use ginger_rand::Xs64;
+
         use super::*;
 
-        struct Xorshift(u64);
-        impl Xorshift {
-            fn new(seed: u64) -> Self {
-                Self(seed | 1)
-            }
-            fn next_u32(&mut self) -> u32 {
-                let mut x = self.0;
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                self.0 = x;
-                (x >> 32) as u32
-            }
-        }
-
-        fn rand_img(rng: &mut Xorshift, w: usize, h: usize) -> GrayImage {
+        fn rand_img(rng: &mut Xs64, w: usize, h: usize) -> GrayImage {
             let mut g = GrayImage::new(w, h);
             for p in g.data.iter_mut() {
                 *p = (rng.next_u32() & 0xff) as u8;
@@ -302,7 +289,7 @@ mod tests {
 
         #[test]
         fn neon_matches_scalar() {
-            let mut rng = Xorshift::new(0x0DEF_ACED_DEAD_BEEF);
+            let mut rng = Xs64::seeded(0x0DEF_ACED_DEAD_BEEF);
             // Source sizes (some not multiples of 4) crossed with target
             // sizes: pyramid-like 1.2× steps plus tiny / odd targets to
             // stress the NEON tail and the gather bounds.

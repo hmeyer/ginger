@@ -1012,8 +1012,13 @@ dependencies = [
 name = "ginger-fast"
 version = "0.1.0"
 dependencies = [
+ "ginger-rand",
  "rayon",
 ]
+
+[[package]]
+name = "ginger-rand"
+version = "0.1.0"
 
 [[package]]
 name = "ginger-rs"
@@ -1025,6 +1030,7 @@ dependencies = [
  "env_logger",
  "futures",
  "ginger-fast",
+ "ginger-rand",
  "ginger-slam-core",
  "libc",
  "libcamera",
@@ -1044,6 +1050,7 @@ dependencies = [
 name = "ginger-slam-core"
 version = "0.1.0"
 dependencies = [
+ "ginger-rand",
  "nalgebra",
  "postcard",
  "serde",

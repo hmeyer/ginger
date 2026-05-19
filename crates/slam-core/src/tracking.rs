@@ -142,8 +142,10 @@ pub fn track_pose(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use ginger_rand::Rng64;
     use nalgebra::{Rotation3, Translation3, UnitQuaternion};
+
+    use super::*;
 
     fn iso(rx: f64, ry: f64, rz: f64, tx: f64, ty: f64, tz: f64) -> Isometry3<f64> {
         let rot = UnitQuaternion::from_rotation_matrix(&Rotation3::from_euler_angles(rx, ry, rz));
@@ -153,17 +155,11 @@ mod tests {
     /// Deterministic point cloud + a ground-truth pose; project to
     /// calibrated observations.
     fn scene(n: usize, pose: &Isometry3<f64>) -> Vec<Observation> {
-        let mut s = 1234567u64;
-        let mut rnd = || {
-            s ^= s >> 12;
-            s ^= s << 25;
-            s ^= s >> 27;
-            (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-        };
+        let mut r = Rng64::new(1234567);
         (0..n)
             .map(|_| {
                 let point =
-                    Vector3::new((rnd() - 0.5) * 4.0, (rnd() - 0.5) * 3.0, 2.0 + rnd() * 4.0);
+                    Vector3::new((r.f() - 0.5) * 4.0, (r.f() - 0.5) * 3.0, 2.0 + r.f() * 4.0);
                 let pc = pose.rotation * point + pose.translation.vector;
                 Observation {
                     point,
