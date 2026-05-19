@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use log::{info, warn};
 
+use ginger_slam_core::camera::CameraModel;
 use ginger_slam_core::intrinsics::Intrinsics;
 use ginger_slam_core::map::Map;
 use ginger_slam_core::pnp::{self, PnpOptions};
@@ -249,380 +250,15 @@ impl Frontend {
             // else the (possibly mutated-in-place) `stage` is kept.
             let mut stage =
                 std::mem::replace(&mut self.stage, Stage::Bootstrapping { anchor: None });
-            let mut next: Option<Stage> = None;
-            match &mut stage {
+            let next = match &mut stage {
                 Stage::Bootstrapping { anchor } => {
-                    let mut want_anchor = false;
-                    if let Some((apts, adesc)) = anchor.as_ref() {
-                        let mm = brief::match_descriptors(adesc, descs);
-                        if mm.len() >= INIT_MIN_MATCHES {
-                            let mut disp: Vec<f32> = mm
-                                .iter()
-                                .map(|&(ia, ib)| {
-                                    let a = apts[ia as usize];
-                                    let b = points[ib as usize];
-                                    let dx = a.x as f32 - b.x as f32;
-                                    let dy = a.y as f32 - b.y as f32;
-                                    (dx * dx + dy * dy).sqrt()
-                                })
-                                .collect();
-                            disp.sort_by(|x, y| x.partial_cmp(y).unwrap());
-                            let med = disp[disp.len() / 2];
-                            let min_disp = width as f32 * INIT_MIN_DISP_FRAC;
-                            if med >= min_disp {
-                                let corrs: Vec<twoview::Corr> = mm
-                                    .iter()
-                                    .map(|&(ia, ib)| {
-                                        let a = apts[ia as usize];
-                                        let b = points[ib as usize];
-                                        (calib_norm(&cam, a.x, a.y), calib_norm(&cam, b.x, b.y))
-                                    })
-                                    .collect();
-                                if let Some(tv) =
-                                    twoview::initialize(&corrs, InitOptions::default())
-                                {
-                                    // cam1 = world origin; cam2 = Tcw = [R|t].
-                                    let pose2 = Isometry3::from_parts(
-                                        Translation3::from(tv.t),
-                                        UnitQuaternion::from_rotation_matrix(
-                                            &Rotation3::from_matrix_unchecked(tv.r),
-                                        ),
-                                    );
-                                    let model = match tv.model {
-                                        twoview::Model::Essential => "essential",
-                                        twoview::Model::Homography => "homography",
-                                    };
-                                    // Promote the two views to keyframes
-                                    // kf0 (origin) / kf1 (= pose2) and the
-                                    // gated triangulated points to map
-                                    // points observed by both; record each
-                                    // view's feature→point binding so the
-                                    // local mapper does not re-create them.
-                                    let mut a_assigned = vec![None; apts.len()];
-                                    let mut b_assigned = vec![None; points.len()];
-                                    let (n, kf1) = {
-                                        let mut w = self.world.lock().unwrap();
-                                        let kf0 = w.add_keyframe(Isometry3::identity(), Vec::new());
-                                        let kf1 = w.add_keyframe(pose2, Vec::new());
-                                        let mut pi = 0usize;
-                                        let mut n = 0usize;
-                                        for (k, &(ia, ib)) in mm.iter().enumerate() {
-                                            if tv.inliers[k] {
-                                                if let Some(&x) = tv.points.get(pi)
-                                                    && x.z > 0.0
-                                                    && x.x.is_finite()
-                                                    && x.z.is_finite()
-                                                    && let Some(pid) = w.add_point_observed(
-                                                        x,
-                                                        descs[ib as usize],
-                                                        kf0,
-                                                        corrs[k].0,
-                                                    )
-                                                {
-                                                    w.add_observation(kf1, pid, corrs[k].1);
-                                                    a_assigned[ia as usize] = Some(pid);
-                                                    b_assigned[ib as usize] = Some(pid);
-                                                    n += 1;
-                                                }
-                                                pi += 1;
-                                            }
-                                        }
-                                        (n, kf1)
-                                    };
-                                    let _ = self.jobs.send(KeyframeJob {
-                                        kf_id: 0,
-                                        cam,
-                                        pts: apts.clone(),
-                                        descs: adesc.clone(),
-                                        assigned: a_assigned,
-                                    });
-                                    let _ = self.jobs.send(KeyframeJob {
-                                        kf_id: kf1,
-                                        cam,
-                                        pts: points.to_vec(),
-                                        descs: descs.to_vec(),
-                                        assigned: b_assigned,
-                                    });
-                                    let ts = TrackState {
-                                        trajectory: vec![Isometry3::identity(), pose2],
-                                        ref_kf: kf1,
-                                        frames_since_kf: 0,
-                                        model: model.into(),
-                                        r_h: tv.r_h as f32,
-                                    };
-                                    self.map = {
-                                        let w = self.world.lock().unwrap();
-                                        publish_map(
-                                            &w,
-                                            &ts.trajectory,
-                                            &ts.model,
-                                            ts.r_h,
-                                            format!("initialized: {n} pts via {model}"),
-                                            n as u32,
-                                        )
-                                    };
-                                    info!(
-                                        "slam: two-view init OK — {n} pts, model={model}, \
-                                         R_H={:.2}, matches={}",
-                                        tv.r_h,
-                                        mm.len()
-                                    );
-                                    next = Some(Stage::Tracking(ts));
-                                }
-                            } else {
-                                self.map.status = format!(
-                                    "parallax {med:.0}/{min_disp:.0}px · {} matches",
-                                    mm.len()
-                                );
-                            }
-                        } else if mm.len() < ANCHOR_RESET_MATCHES {
-                            want_anchor = true;
-                        }
-                    } else {
-                        want_anchor = true;
-                    }
-                    if want_anchor && next.is_none() {
-                        *anchor = Some((points.to_vec(), descs.to_vec()));
-                        self.map.status = "anchor set — translate sideways for parallax".into();
-                    }
+                    self.bootstrap(anchor, points, descs, width, cam)
                 }
-                Stage::Tracking(st) => {
-                    // Re-find map points: snapshot (id, desc, pos) of
-                    // every alive point + the reference keyframe's point
-                    // count under a short lock, then match/solve without
-                    // holding it (the matcher is the cost, and the local
-                    // mapper needs the map meanwhile).
-                    let (ids, idesc, ipos, ref_kf_points) = {
-                        let w = self.world.lock().unwrap();
-                        let mut ids: Vec<u32> = Vec::new();
-                        let mut idesc: Vec<brief::Descriptor> = Vec::new();
-                        let mut ipos: Vec<Vector3<f64>> = Vec::new();
-                        for p in w.alive_points() {
-                            ids.push(p.id);
-                            idesc.push(p.desc);
-                            ipos.push(p.pos);
-                        }
-                        let rkp = w.keyframe(st.ref_kf).map_or(0, |k| k.obs.len());
-                        (ids, idesc, ipos, rkp)
-                    };
-                    let mm = if ids.is_empty() {
-                        Vec::new()
-                    } else {
-                        brief::match_descriptors(&idesc, descs)
-                    };
-                    if mm.len() >= TRACK_MIN_MATCHES {
-                        let obs: Vec<Observation> = mm
-                            .iter()
-                            .map(|&(im, ic)| {
-                                let kp = points[ic as usize];
-                                Observation {
-                                    point: ipos[im as usize],
-                                    obs: calib_norm(&cam, kp.x, kp.y),
-                                }
-                            })
-                            .collect();
-                        let np = st.trajectory.len();
-                        let predict = if np >= 2 {
-                            tracking::constant_velocity(
-                                &st.trajectory[np - 2],
-                                &st.trajectory[np - 1],
-                            )
-                        } else {
-                            st.trajectory[np - 1]
-                        };
-                        let huber = 2.0 / fx;
-                        let thr = 5.0 / fx;
-                        match tracking::track_pose(&obs, &predict, huber, thr) {
-                            Some(rep) if rep.converged && rep.n_inliers >= TRACK_MIN_INLIERS => {
-                                st.trajectory.push(rep.pose);
-                                if st.trajectory.len() > MAX_TRAJECTORY * 2 {
-                                    let drop = st.trajectory.len() - MAX_TRAJECTORY;
-                                    st.trajectory.drain(0..drop);
-                                }
-                                st.frames_since_kf += 1;
-                                let mut status =
-                                    format!("tracking: {}/{} inliers", rep.n_inliers, obs.len());
-                                // Keyframe-insertion policy (M5): on a
-                                // healthy solve that has thinned vs the
-                                // reference or gone stale, promote this
-                                // frame to a keyframe (its tracked inliers
-                                // as observations) and hand it + its raw
-                                // features to the local mapper.
-                                if ginger_slam_core::map::needs_keyframe(
-                                    rep.n_inliers,
-                                    ref_kf_points,
-                                    st.frames_since_kf,
-                                    TRACK_MIN_INLIERS,
-                                ) {
-                                    let mut kf_obs = Vec::new();
-                                    let mut assigned = vec![None; points.len()];
-                                    for (k, &(im, ic)) in mm.iter().enumerate() {
-                                        if rep.inliers[k] {
-                                            let pid = ids[im as usize];
-                                            kf_obs.push((pid, obs[k].obs));
-                                            assigned[ic as usize] = Some(pid);
-                                        }
-                                    }
-                                    let kf = {
-                                        let mut w = self.world.lock().unwrap();
-                                        w.add_keyframe(rep.pose, kf_obs)
-                                    };
-                                    let _ = self.jobs.send(KeyframeJob {
-                                        kf_id: kf,
-                                        cam,
-                                        pts: points.to_vec(),
-                                        descs: descs.to_vec(),
-                                        assigned,
-                                    });
-                                    st.ref_kf = kf;
-                                    st.frames_since_kf = 0;
-                                    status = format!(
-                                        "keyframe {kf} · tracking: {}/{} inliers",
-                                        rep.n_inliers,
-                                        obs.len()
-                                    );
-                                }
-                                self.map = {
-                                    let w = self.world.lock().unwrap();
-                                    publish_map(
-                                        &w,
-                                        &st.trajectory,
-                                        &st.model,
-                                        st.r_h,
-                                        status,
-                                        rep.n_inliers as u32,
-                                    )
-                                };
-                            }
-                            Some(rep) => {
-                                self.map.status = format!(
-                                    "tracking lost: weak {}/{} inliers — relocalizing",
-                                    rep.n_inliers,
-                                    obs.len()
-                                );
-                                next = Some(Stage::Lost {
-                                    since: 0,
-                                    track: st.clone(),
-                                });
-                            }
-                            None => {
-                                self.map.status =
-                                    "tracking lost (solve failed) — relocalizing".into();
-                                next = Some(Stage::Lost {
-                                    since: 0,
-                                    track: st.clone(),
-                                });
-                            }
-                        }
-                    } else {
-                        self.map.status = format!(
-                            "tracking lost: only {} map matches — relocalizing",
-                            mm.len()
-                        );
-                        next = Some(Stage::Lost {
-                            since: 0,
-                            track: st.clone(),
-                        });
-                    }
-                }
+                Stage::Tracking(st) => self.track(st, points, descs, cam, fx),
                 Stage::Lost { since, track } => {
-                    *since += 1;
-                    // BoW place-recognition candidates for this frame.
-                    let cands = self
-                        .place
-                        .lock()
-                        .unwrap()
-                        .query(descs, RELOC_MAX_CAND, |_| false);
-                    // Gather candidate map points (pos + descriptor) from
-                    // the candidate keyframes + their covisible
-                    // neighbours, bounded.
-                    let (cpos, cdesc) = if cands.is_empty() {
-                        (Vec::new(), Vec::new())
-                    } else {
-                        let w = self.world.lock().unwrap();
-                        let mut seen = std::collections::HashSet::new();
-                        let mut cpos: Vec<Vector3<f64>> = Vec::new();
-                        let mut cdesc: Vec<brief::Descriptor> = Vec::new();
-                        'outer: for &(kf, _) in &cands {
-                            let mut kfs = vec![kf];
-                            kfs.extend(
-                                w.covisibility(kf)
-                                    .into_iter()
-                                    .take(RELOC_COVIS)
-                                    .map(|(c, _)| c),
-                            );
-                            for k in kfs {
-                                let Some(kfr) = w.keyframe(k) else { continue };
-                                for &(pid, _) in &kfr.obs {
-                                    if seen.insert(pid)
-                                        && let Some(p) = w.point(pid)
-                                    {
-                                        cpos.push(p.pos);
-                                        cdesc.push(p.desc);
-                                        if cpos.len() >= RELOC_MAX_PTS {
-                                            break 'outer;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        (cpos, cdesc)
-                    };
-
-                    let mut report = None;
-                    if cdesc.len() >= RELOC_MIN_INLIERS {
-                        let pairs = brief::match_descriptors(&cdesc, descs);
-                        if pairs.len() >= RELOC_MIN_INLIERS {
-                            let obs: Vec<Observation> = pairs
-                                .iter()
-                                .map(|&(im, ic)| {
-                                    let kp = points[ic as usize];
-                                    Observation {
-                                        point: cpos[im as usize],
-                                        obs: calib_norm(&cam, kp.x, kp.y),
-                                    }
-                                })
-                                .collect();
-                            report = pnp::pnp_ransac(
-                                &obs,
-                                PnpOptions {
-                                    thresh: 5.0 / fx,
-                                    min_inliers: RELOC_MIN_INLIERS,
-                                    ..PnpOptions::default()
-                                },
-                            );
-                        }
-                    }
-
-                    if let Some(rep) = report {
-                        let mut tr = track.clone();
-                        tr.trajectory.push(rep.pose);
-                        if tr.trajectory.len() > MAX_TRAJECTORY * 2 {
-                            let drop = tr.trajectory.len() - MAX_TRAJECTORY;
-                            tr.trajectory.drain(0..drop);
-                        }
-                        let best = cands.first().map(|&(k, _)| k).unwrap_or(0);
-                        let status = format!(
-                            "relocalized: {} inliers (kf {best}, lost {} frames)",
-                            rep.n_inliers, *since
-                        );
-                        self.map = {
-                            let w = self.world.lock().unwrap();
-                            publish_map(
-                                &w,
-                                &tr.trajectory,
-                                &tr.model,
-                                tr.r_h,
-                                status,
-                                rep.n_inliers as u32,
-                            )
-                        };
-                        next = Some(Stage::Tracking(tr));
-                    } else {
-                        self.map.status = format!("relocalizing… (lost {} frames)", *since);
-                    }
+                    self.relocalize(since, track, points, descs, cam, fx)
                 }
-            }
+            };
             self.stage = next.unwrap_or(stage);
         }
 
@@ -642,6 +278,411 @@ impl Frontend {
             map: self.map.clone(),
             match_ms,
         }
+    }
+
+    /// `Stage::Bootstrapping`: accumulate parallax against the anchor;
+    /// on enough matches + median disparity, run two-view init, promote
+    /// the two views to keyframes, seed the map, and transition to
+    /// [`Stage::Tracking`]. A stale anchor (too few matches) is reset.
+    fn bootstrap(
+        &mut self,
+        anchor: &mut Option<FrameFeatures>,
+        points: &[FeaturePoint],
+        descs: &[brief::Descriptor],
+        width: usize,
+        cam: CameraModel,
+    ) -> Option<Stage> {
+        let mut next: Option<Stage> = None;
+        let mut want_anchor = false;
+        if let Some((apts, adesc)) = anchor.as_ref() {
+            let mm = brief::match_descriptors(adesc, descs);
+            if mm.len() >= INIT_MIN_MATCHES {
+                let mut disp: Vec<f32> = mm
+                    .iter()
+                    .map(|&(ia, ib)| {
+                        let a = apts[ia as usize];
+                        let b = points[ib as usize];
+                        let dx = a.x as f32 - b.x as f32;
+                        let dy = a.y as f32 - b.y as f32;
+                        (dx * dx + dy * dy).sqrt()
+                    })
+                    .collect();
+                disp.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                let med = disp[disp.len() / 2];
+                let min_disp = width as f32 * INIT_MIN_DISP_FRAC;
+                if med >= min_disp {
+                    let corrs: Vec<twoview::Corr> = mm
+                        .iter()
+                        .map(|&(ia, ib)| {
+                            let a = apts[ia as usize];
+                            let b = points[ib as usize];
+                            (calib_norm(&cam, a.x, a.y), calib_norm(&cam, b.x, b.y))
+                        })
+                        .collect();
+                    if let Some(tv) = twoview::initialize(&corrs, InitOptions::default()) {
+                        // cam1 = world origin; cam2 = Tcw = [R|t].
+                        let pose2 = Isometry3::from_parts(
+                            Translation3::from(tv.t),
+                            UnitQuaternion::from_rotation_matrix(
+                                &Rotation3::from_matrix_unchecked(tv.r),
+                            ),
+                        );
+                        let model = match tv.model {
+                            twoview::Model::Essential => "essential",
+                            twoview::Model::Homography => "homography",
+                        };
+                        // Promote the two views to keyframes
+                        // kf0 (origin) / kf1 (= pose2) and the
+                        // gated triangulated points to map
+                        // points observed by both; record each
+                        // view's feature→point binding so the
+                        // local mapper does not re-create them.
+                        let mut a_assigned = vec![None; apts.len()];
+                        let mut b_assigned = vec![None; points.len()];
+                        let (n, kf1) = {
+                            let mut w = self.world.lock().unwrap();
+                            let kf0 = w.add_keyframe(Isometry3::identity(), Vec::new());
+                            let kf1 = w.add_keyframe(pose2, Vec::new());
+                            let mut pi = 0usize;
+                            let mut n = 0usize;
+                            for (k, &(ia, ib)) in mm.iter().enumerate() {
+                                if tv.inliers[k] {
+                                    if let Some(&x) = tv.points.get(pi)
+                                        && x.z > 0.0
+                                        && x.x.is_finite()
+                                        && x.z.is_finite()
+                                        && let Some(pid) = w.add_point_observed(
+                                            x,
+                                            descs[ib as usize],
+                                            kf0,
+                                            corrs[k].0,
+                                        )
+                                    {
+                                        w.add_observation(kf1, pid, corrs[k].1);
+                                        a_assigned[ia as usize] = Some(pid);
+                                        b_assigned[ib as usize] = Some(pid);
+                                        n += 1;
+                                    }
+                                    pi += 1;
+                                }
+                            }
+                            (n, kf1)
+                        };
+                        let _ = self.jobs.send(KeyframeJob {
+                            kf_id: 0,
+                            cam,
+                            pts: apts.clone(),
+                            descs: adesc.clone(),
+                            assigned: a_assigned,
+                        });
+                        let _ = self.jobs.send(KeyframeJob {
+                            kf_id: kf1,
+                            cam,
+                            pts: points.to_vec(),
+                            descs: descs.to_vec(),
+                            assigned: b_assigned,
+                        });
+                        let ts = TrackState {
+                            trajectory: vec![Isometry3::identity(), pose2],
+                            ref_kf: kf1,
+                            frames_since_kf: 0,
+                            model: model.into(),
+                            r_h: tv.r_h as f32,
+                        };
+                        self.map = {
+                            let w = self.world.lock().unwrap();
+                            publish_map(
+                                &w,
+                                &ts.trajectory,
+                                &ts.model,
+                                ts.r_h,
+                                format!("initialized: {n} pts via {model}"),
+                                n as u32,
+                            )
+                        };
+                        info!(
+                            "slam: two-view init OK — {n} pts, model={model}, \
+                                     R_H={:.2}, matches={}",
+                            tv.r_h,
+                            mm.len()
+                        );
+                        next = Some(Stage::Tracking(ts));
+                    }
+                } else {
+                    self.map.status =
+                        format!("parallax {med:.0}/{min_disp:.0}px · {} matches", mm.len());
+                }
+            } else if mm.len() < ANCHOR_RESET_MATCHES {
+                want_anchor = true;
+            }
+        } else {
+            want_anchor = true;
+        }
+        if want_anchor && next.is_none() {
+            *anchor = Some((points.to_vec(), descs.to_vec()));
+            self.map.status = "anchor set — translate sideways for parallax".into();
+        }
+        next
+    }
+
+    /// `Stage::Tracking`: re-find map points, predict (constant
+    /// velocity) + motion-only BA the pose, insert a keyframe per the
+    /// M5 policy, and publish. A weak/failed solve transitions to
+    /// [`Stage::Lost`] without corrupting the map.
+    fn track(
+        &mut self,
+        st: &mut TrackState,
+        points: &[FeaturePoint],
+        descs: &[brief::Descriptor],
+        cam: CameraModel,
+        fx: f64,
+    ) -> Option<Stage> {
+        let mut next: Option<Stage> = None;
+        // Re-find map points: snapshot (id, desc, pos) of
+        // every alive point + the reference keyframe's point
+        // count under a short lock, then match/solve without
+        // holding it (the matcher is the cost, and the local
+        // mapper needs the map meanwhile).
+        let (ids, idesc, ipos, ref_kf_points) = {
+            let w = self.world.lock().unwrap();
+            let mut ids: Vec<u32> = Vec::new();
+            let mut idesc: Vec<brief::Descriptor> = Vec::new();
+            let mut ipos: Vec<Vector3<f64>> = Vec::new();
+            for p in w.alive_points() {
+                ids.push(p.id);
+                idesc.push(p.desc);
+                ipos.push(p.pos);
+            }
+            let rkp = w.keyframe(st.ref_kf).map_or(0, |k| k.obs.len());
+            (ids, idesc, ipos, rkp)
+        };
+        let mm = if ids.is_empty() {
+            Vec::new()
+        } else {
+            brief::match_descriptors(&idesc, descs)
+        };
+        if mm.len() >= TRACK_MIN_MATCHES {
+            let obs: Vec<Observation> = mm
+                .iter()
+                .map(|&(im, ic)| {
+                    let kp = points[ic as usize];
+                    Observation {
+                        point: ipos[im as usize],
+                        obs: calib_norm(&cam, kp.x, kp.y),
+                    }
+                })
+                .collect();
+            let np = st.trajectory.len();
+            let predict = if np >= 2 {
+                tracking::constant_velocity(&st.trajectory[np - 2], &st.trajectory[np - 1])
+            } else {
+                st.trajectory[np - 1]
+            };
+            let huber = 2.0 / fx;
+            let thr = 5.0 / fx;
+            match tracking::track_pose(&obs, &predict, huber, thr) {
+                Some(rep) if rep.converged && rep.n_inliers >= TRACK_MIN_INLIERS => {
+                    st.trajectory.push(rep.pose);
+                    if st.trajectory.len() > MAX_TRAJECTORY * 2 {
+                        let drop = st.trajectory.len() - MAX_TRAJECTORY;
+                        st.trajectory.drain(0..drop);
+                    }
+                    st.frames_since_kf += 1;
+                    let mut status = format!("tracking: {}/{} inliers", rep.n_inliers, obs.len());
+                    // Keyframe-insertion policy (M5): on a
+                    // healthy solve that has thinned vs the
+                    // reference or gone stale, promote this
+                    // frame to a keyframe (its tracked inliers
+                    // as observations) and hand it + its raw
+                    // features to the local mapper.
+                    if ginger_slam_core::map::needs_keyframe(
+                        rep.n_inliers,
+                        ref_kf_points,
+                        st.frames_since_kf,
+                        TRACK_MIN_INLIERS,
+                    ) {
+                        let mut kf_obs = Vec::new();
+                        let mut assigned = vec![None; points.len()];
+                        for (k, &(im, ic)) in mm.iter().enumerate() {
+                            if rep.inliers[k] {
+                                let pid = ids[im as usize];
+                                kf_obs.push((pid, obs[k].obs));
+                                assigned[ic as usize] = Some(pid);
+                            }
+                        }
+                        let kf = {
+                            let mut w = self.world.lock().unwrap();
+                            w.add_keyframe(rep.pose, kf_obs)
+                        };
+                        let _ = self.jobs.send(KeyframeJob {
+                            kf_id: kf,
+                            cam,
+                            pts: points.to_vec(),
+                            descs: descs.to_vec(),
+                            assigned,
+                        });
+                        st.ref_kf = kf;
+                        st.frames_since_kf = 0;
+                        status = format!(
+                            "keyframe {kf} · tracking: {}/{} inliers",
+                            rep.n_inliers,
+                            obs.len()
+                        );
+                    }
+                    self.map = {
+                        let w = self.world.lock().unwrap();
+                        publish_map(
+                            &w,
+                            &st.trajectory,
+                            &st.model,
+                            st.r_h,
+                            status,
+                            rep.n_inliers as u32,
+                        )
+                    };
+                }
+                Some(rep) => {
+                    self.map.status = format!(
+                        "tracking lost: weak {}/{} inliers — relocalizing",
+                        rep.n_inliers,
+                        obs.len()
+                    );
+                    next = Some(Stage::Lost {
+                        since: 0,
+                        track: st.clone(),
+                    });
+                }
+                None => {
+                    self.map.status = "tracking lost (solve failed) — relocalizing".into();
+                    next = Some(Stage::Lost {
+                        since: 0,
+                        track: st.clone(),
+                    });
+                }
+            }
+        } else {
+            self.map.status = format!(
+                "tracking lost: only {} map matches — relocalizing",
+                mm.len()
+            );
+            next = Some(Stage::Lost {
+                since: 0,
+                track: st.clone(),
+            });
+        }
+        next
+    }
+
+    /// `Stage::Lost`: BoW-query the place DB, gather candidate map
+    /// points from the matched keyframes + covisible neighbours, and
+    /// attempt PnP-RANSAC recovery. On success resume
+    /// [`Stage::Tracking`] with the saved trajectory; else stay lost.
+    fn relocalize(
+        &mut self,
+        since: &mut usize,
+        track: &TrackState,
+        points: &[FeaturePoint],
+        descs: &[brief::Descriptor],
+        cam: CameraModel,
+        fx: f64,
+    ) -> Option<Stage> {
+        let mut next: Option<Stage> = None;
+        *since += 1;
+        // BoW place-recognition candidates for this frame.
+        let cands = self
+            .place
+            .lock()
+            .unwrap()
+            .query(descs, RELOC_MAX_CAND, |_| false);
+        // Gather candidate map points (pos + descriptor) from
+        // the candidate keyframes + their covisible
+        // neighbours, bounded.
+        let (cpos, cdesc) = if cands.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let w = self.world.lock().unwrap();
+            let mut seen = std::collections::HashSet::new();
+            let mut cpos: Vec<Vector3<f64>> = Vec::new();
+            let mut cdesc: Vec<brief::Descriptor> = Vec::new();
+            'outer: for &(kf, _) in &cands {
+                let mut kfs = vec![kf];
+                kfs.extend(
+                    w.covisibility(kf)
+                        .into_iter()
+                        .take(RELOC_COVIS)
+                        .map(|(c, _)| c),
+                );
+                for k in kfs {
+                    let Some(kfr) = w.keyframe(k) else { continue };
+                    for &(pid, _) in &kfr.obs {
+                        if seen.insert(pid)
+                            && let Some(p) = w.point(pid)
+                        {
+                            cpos.push(p.pos);
+                            cdesc.push(p.desc);
+                            if cpos.len() >= RELOC_MAX_PTS {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+            (cpos, cdesc)
+        };
+
+        let mut report = None;
+        if cdesc.len() >= RELOC_MIN_INLIERS {
+            let pairs = brief::match_descriptors(&cdesc, descs);
+            if pairs.len() >= RELOC_MIN_INLIERS {
+                let obs: Vec<Observation> = pairs
+                    .iter()
+                    .map(|&(im, ic)| {
+                        let kp = points[ic as usize];
+                        Observation {
+                            point: cpos[im as usize],
+                            obs: calib_norm(&cam, kp.x, kp.y),
+                        }
+                    })
+                    .collect();
+                report = pnp::pnp_ransac(
+                    &obs,
+                    PnpOptions {
+                        thresh: 5.0 / fx,
+                        min_inliers: RELOC_MIN_INLIERS,
+                        ..PnpOptions::default()
+                    },
+                );
+            }
+        }
+
+        if let Some(rep) = report {
+            let mut tr = track.clone();
+            tr.trajectory.push(rep.pose);
+            if tr.trajectory.len() > MAX_TRAJECTORY * 2 {
+                let drop = tr.trajectory.len() - MAX_TRAJECTORY;
+                tr.trajectory.drain(0..drop);
+            }
+            let best = cands.first().map(|&(k, _)| k).unwrap_or(0);
+            let status = format!(
+                "relocalized: {} inliers (kf {best}, lost {} frames)",
+                rep.n_inliers, *since
+            );
+            self.map = {
+                let w = self.world.lock().unwrap();
+                publish_map(
+                    &w,
+                    &tr.trajectory,
+                    &tr.model,
+                    tr.r_h,
+                    status,
+                    rep.n_inliers as u32,
+                )
+            };
+            next = Some(Stage::Tracking(tr));
+        } else {
+            self.map.status = format!("relocalizing… (lost {} frames)", *since);
+        }
+        next
     }
 }
 
