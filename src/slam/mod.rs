@@ -1,20 +1,23 @@
 //! Visual SLAM frontend (ORB-SLAM-style), built up in milestones.
 //!
-//! **M5 (current): local mapping.** A dedicated thread consumes the
-//! camera independently of the H.264/WebRTC path, builds a grayscale
-//! pyramid, runs FAST-9 per level (NMS + grid-spread cap), computes
-//! intensity-centroid orientation + a steered 256-bit BRIEF descriptor,
-//! and feeds the [`Frontend`] state machine ([`Stage`]): accumulate
-//! parallax vs an anchor → two-view init ([`ginger_slam_core::twoview`])
-//! → per-frame tracking (constant-velocity + motion-only BA,
-//! [`ginger_slam_core::tracking`]) against a keyframe map. Healthy
-//! frames are promoted to keyframes ([`ginger_slam_core::map`]); a
-//! decoupled [`mapper::LocalMapper`] thread triangulates new points
-//! ([`ginger_slam_core::triangulation`]) and runs block-sparse Schur
-//! local BA ([`ginger_slam_core::local_ba`]) over the covisibility
-//! window, growing + refining the shared map. Publishes a
-//! [`SlamSnapshot`] (live overlay) and a [`MapSnapshot`] (top-down
-//! trajectory + keyframes + map). M6 adds relocalization / loop closing.
+//! **M6 (current): relocalization + loop closing.** A dedicated thread
+//! consumes the camera independently of the H.264/WebRTC path, builds a
+//! grayscale pyramid, runs FAST-9 per level (NMS + grid-spread cap),
+//! computes intensity-centroid orientation + a steered 256-bit BRIEF
+//! descriptor, and feeds the [`Frontend`] state machine ([`Stage`]):
+//! accumulate parallax vs an anchor → two-view init
+//! ([`ginger_slam_core::twoview`]) → per-frame tracking
+//! (constant-velocity + motion-only BA, [`ginger_slam_core::tracking`])
+//! against a keyframe map. Healthy frames become keyframes
+//! ([`ginger_slam_core::map`]); a decoupled [`mapper::LocalMapper`]
+//! thread triangulates new points ([`ginger_slam_core::triangulation`]),
+//! runs block-sparse Schur local BA ([`ginger_slam_core::local_ba`]),
+//! and BoW-detects loops ([`place`] / [`ginger_slam_core::bow`]) →
+//! `Sim3` verify + Essential-graph pose-graph correction
+//! ([`ginger_slam_core::sim3`]). A lost track enters [`Stage::Lost`] and
+//! relocalizes via BoW + PnP-RANSAC ([`ginger_slam_core::pnp`]).
+//! Publishes a [`SlamSnapshot`] (live overlay) and a [`MapSnapshot`]
+//! (top-down trajectory + keyframes + map, snapping on loop closure).
 
 pub mod brief;
 pub mod fast;

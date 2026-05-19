@@ -841,7 +841,7 @@ startStream();
       }
       const status = md && md.status || 'no map yet';
       mctx.fillStyle = '#9cf';
-      mctx.fillText(status.slice(0, 34), 8, S - 8);
+      mctx.fillText(status.slice(0, 48), 8, S - 8);
       stat.textContent = 'map · ' + status;
       requestAnimationFrame(frame);
       return;
