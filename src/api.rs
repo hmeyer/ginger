@@ -86,8 +86,8 @@ pub enum Command {
     Stop,
     SetPan(f32),
     SetTilt(f32),
-    /// Play a short randomized synchronized LED + buzzer "expression".
-    Express,
+    /// Play a short randomized synchronized LED + buzzer emote.
+    Emote,
     SetSensors(SensorConfig),
 }
 

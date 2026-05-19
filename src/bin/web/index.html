@@ -118,8 +118,8 @@ footer{
 .btn:active,.btn:hover{background:#30305a}
 .btn.warn{border-color:var(--warn)}
 .btn.warn:active{background:var(--warn);color:#000}
-/* Express: a compact, content-sized button (don't stretch) */
-#b-express{flex:0 0 auto;font-size:1.5rem;line-height:1;padding:10px 18px}
+/* Emote: a compact, content-sized button (don't stretch) */
+#b-emote{flex:0 0 auto;font-size:1.5rem;line-height:1;padding:10px 18px}
 
 /* ── DESKTOP (≥ 700 px) ───────────────────────────────────────────────────── */
 @media (min-width: 700px) {
@@ -295,7 +295,7 @@ footer{
 
   <div class="right-controls">
     <div class="btn-row">
-      <button class="btn" id="b-express">🤖✨</button>
+      <button class="btn" id="b-emote">🤖✨</button>
     </div>
   </div>
 </footer>
@@ -537,17 +537,17 @@ function camSync(p, t) {
   camShow(rp, rt);
 }
 
-// ── Express ───────────────────────────────────────────────────────────────────
-// One unified, randomized "expression": LEDs and buzzer play together
+// ── Emote ─────────────────────────────────────────────────────────────────────
+// One unified, randomized emote: LEDs and buzzer play together
 // (lights track pitch and vice-versa). It needs tight timing so it runs
 // server-side (see supervisor.rs); the button just triggers it and
 // self-disables while it plays.
 (() => {
-  const btn = document.getElementById('b-express');
+  const btn = document.getElementById('b-emote');
   btn.addEventListener('click', () => {
     if (btn.disabled) return;
     btn.disabled = true;
-    post('/api/express');
+    post('/api/emote');
     setTimeout(() => { btn.disabled = false; }, 3600);
   });
 })();

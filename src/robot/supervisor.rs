@@ -186,13 +186,13 @@ fn light(car: &mut Car, pal: &Pal, viz: u64, t: f32, v: f32) {
     car.leds.show().ok();
 }
 
-/// One unified, randomized "expression": LEDs and buzzer play together.
+/// One unified, randomized emote: LEDs and buzzer play together.
 /// A random *mood* fixes the pitch band, tempo, rise/fall contour and a
 /// matching colour palette; a random *viz* fixes how the lights track
 /// the pitch. Every tone is preceded by the matching `light()` frame, so
 /// the show is synchronized by construction. Blocks the supervisor loop
 /// briefly (< ~2.5 s), like the old scan did.
-fn play_expression(car: &mut Car) {
+fn play_emote(car: &mut Car) {
     let mut rng = Rng::new();
 
     let p = |h0: f32, span: f32, sat: f32| Pal { h0, span, sat };
@@ -405,8 +405,8 @@ pub fn run(mut cmd_rx: mpsc::Receiver<Command>, sensors: Arc<RwLock<SensorSnapsh
                     car.pan_tilt().set_tilt(a).ok();
                     cur_tilt = a;
                 }
-                Command::Express => {
-                    play_expression(&mut car);
+                Command::Emote => {
+                    play_emote(&mut car);
                 }
                 Command::SetSensors(cfg) => {
                     config = cfg;
