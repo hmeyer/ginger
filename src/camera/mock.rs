@@ -46,11 +46,21 @@ fn gray_to_yuyv(width: u32, height: u32, luma: &[u8]) -> Frame {
     }
 }
 
+/// Integer value-noise hash, `(x, y) → [0, 1]`. Pure function (not an
+/// RNG); kept local to the mock camera because it is the only synthetic
+/// texture source in production code.
+#[inline]
+fn noise_u8(x: i32, y: i32) -> f32 {
+    let mut n = (x.wrapping_mul(374_761_393) ^ y.wrapping_mul(668_265_263)) as u32;
+    n = (n ^ (n >> 13)).wrapping_mul(1_274_126_177);
+    ((n ^ (n >> 16)) & 0xff) as f32 / 255.0
+}
+
 /// Deterministic multi-octave value noise, translated by `shift` so
 /// consecutive frames differ like a slowly panning camera.
 fn synthetic(shift: f32) -> Frame {
     let (w, h) = (SYNTH_W as usize, SYNTH_H as usize);
-    let hash = ginger_rand::noise_u8;
+    let hash = noise_u8;
     let smooth = |fx: f32, fy: f32| {
         let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
         let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);

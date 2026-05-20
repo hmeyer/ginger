@@ -26,8 +26,8 @@
 //! sizes (it runs rarely, off the tracking core); a sparse solver is a
 //! later perf step if measured.
 
-use ginger_rand::Rng64;
 use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Vector3};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
 use crate::lie::{so3_exp, so3_log};
 
@@ -236,17 +236,17 @@ pub fn sim3_ransac(
             .filter(|(a, b)| (s.transform(a) - *b).norm() <= opt.thresh)
             .count()
     };
-    let mut rng = Rng64::new(opt.seed | 1);
+    let mut rng = SmallRng::seed_from_u64(opt.seed | 1);
     let mut best: Option<(usize, Sim3)> = None;
     for _ in 0..opt.iters {
-        let i = rng.upto(n);
-        let mut j = rng.upto(n);
+        let i = rng.random_range(0..n);
+        let mut j = rng.random_range(0..n);
         while j == i {
-            j = rng.upto(n);
+            j = rng.random_range(0..n);
         }
-        let mut k = rng.upto(n);
+        let mut k = rng.random_range(0..n);
         while k == i || k == j {
-            k = rng.upto(n);
+            k = rng.random_range(0..n);
         }
         let s3 = [src[i], src[j], src[k]];
         let d3 = [dst[i], dst[j], dst[k]];
@@ -504,10 +504,16 @@ mod tests {
 
     #[test]
     fn sim3_align_recovers_scaled_rigid() {
-        let mut r = Rng64::new(0xA11);
+        let mut r = SmallRng::seed_from_u64(0xA11);
         let truth = Sim3::new(2.3, rot(0.2, -0.4, 0.7), Vector3::new(1.0, -2.0, 0.5));
         let src: Vec<Vector3<f64>> = (0..30)
-            .map(|_| Vector3::new(r.f() * 4.0, r.f() * 3.0, r.f() * 5.0))
+            .map(|_| {
+                Vector3::new(
+                    r.random::<f64>() * 4.0,
+                    r.random::<f64>() * 3.0,
+                    r.random::<f64>() * 5.0,
+                )
+            })
             .collect();
         let dst: Vec<Vector3<f64>> = src.iter().map(|p| truth.transform(p)).collect();
         // Frobenius-norm rotation compare (clamp-free, unlike acos-based
@@ -525,7 +531,13 @@ mod tests {
         // Noisy: still close.
         let dst_n: Vec<Vector3<f64>> = dst
             .iter()
-            .map(|p| p + Vector3::new(r.f() - 0.5, r.f() - 0.5, r.f() - 0.5) * 0.02)
+            .map(|p| {
+                p + Vector3::new(
+                    r.random::<f64>() - 0.5,
+                    r.random::<f64>() - 0.5,
+                    r.random::<f64>() - 0.5,
+                ) * 0.02
+            })
             .collect();
         let en = sim3_align(&src, &dst_n).expect("aligned noisy");
         assert!((en.s - truth.s).abs() < 0.05);
@@ -615,15 +627,25 @@ mod tests {
 
     #[test]
     fn sim3_ransac_robust_to_outliers() {
-        let mut r = Rng64::new(0xC0FFEE);
+        let mut r = SmallRng::seed_from_u64(0xC0FFEE);
         let truth = Sim3::new(1.7, rot(-0.1, 0.3, 0.2), Vector3::new(-1.0, 2.0, 0.7));
         let src: Vec<Vector3<f64>> = (0..60)
-            .map(|_| Vector3::new(r.f() * 4.0, r.f() * 3.0, r.f() * 5.0))
+            .map(|_| {
+                Vector3::new(
+                    r.random::<f64>() * 4.0,
+                    r.random::<f64>() * 3.0,
+                    r.random::<f64>() * 5.0,
+                )
+            })
             .collect();
         let mut dst: Vec<Vector3<f64>> = src.iter().map(|p| truth.transform(p)).collect();
         // ~30% gross outliers.
         for d in dst.iter_mut().step_by(3) {
-            *d += Vector3::new(r.f() * 10.0 - 5.0, r.f() * 10.0 - 5.0, r.f() * 10.0 - 5.0);
+            *d += Vector3::new(
+                r.random::<f64>() * 10.0 - 5.0,
+                r.random::<f64>() * 10.0 - 5.0,
+                r.random::<f64>() * 10.0 - 5.0,
+            );
         }
         let rep = sim3_ransac(
             &src,

@@ -16,10 +16,20 @@
 
 use std::sync::OnceLock;
 
-use ginger_rand::Rng32;
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use rayon::prelude::*;
 
 use super::image::GrayImage;
+
+/// One sample of a standard normal via Box–Muller. Inlined (rather than
+/// pulling in `rand_distr`) — the BRIEF pattern is the only normal draw
+/// in the workspace.
+#[inline]
+fn standard_normal(rng: &mut SmallRng) -> f32 {
+    let u1 = rng.random::<f32>().max(1e-7);
+    let u2 = rng.random::<f32>();
+    (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+}
 
 /// Patch is `(2*PATCH_RADIUS+1)` square; orientation centroid and every
 /// (post-rotation) sample point live inside the disc of this radius.
@@ -40,17 +50,17 @@ pub type Descriptor = [u8; DESC_BYTES];
 type Pattern = [[i32; 4]; N_TESTS];
 
 fn build_pattern() -> Pattern {
-    let mut rng = Rng32::new(0x9E37_79B9);
+    let mut rng = SmallRng::seed_from_u64(0x9E37_79B9);
     let mut pat = [[0i32; 4]; N_TESTS];
     // G_II: first point ~N(0, s1²), second ~N(first, s2²).
     let s1 = PATCH_RADIUS as f32 / 3.0;
     let s2 = PATCH_RADIUS as f32 / 6.0;
     let r2 = (PATCH_RADIUS * PATCH_RADIUS) as f32;
-    let draw = |rng: &mut Rng32, cx: i32, cy: i32, sigma: f32| {
+    let draw = |rng: &mut SmallRng, cx: i32, cy: i32, sigma: f32| {
         // Reject outside the disc; clamp as a safety net so this can't spin.
         for _ in 0..32 {
-            let x = cx + (rng.gauss() * sigma).round() as i32;
-            let y = cy + (rng.gauss() * sigma).round() as i32;
+            let x = cx + (standard_normal(rng) * sigma).round() as i32;
+            let y = cy + (standard_normal(rng) * sigma).round() as i32;
             if (x * x + y * y) as f32 <= r2 {
                 return (x, y);
             }
@@ -215,9 +225,9 @@ mod tests {
 
     fn noise_image(w: usize, h: usize, seed: u32) -> GrayImage {
         let mut g = GrayImage::new(w, h);
-        let mut r = Rng32::new(seed | 1);
+        let mut r = SmallRng::seed_from_u64((seed | 1) as u64);
         for p in g.data.iter_mut() {
-            *p = (r.next_u32() & 0xff) as u8;
+            *p = r.random::<u8>();
         }
         g
     }
@@ -287,12 +297,12 @@ mod tests {
     fn matcher_recovers_noisy_correspondence() {
         // Build distinct descriptors, perturb a few bits, expect i↔i.
         let n = 40;
-        let mut rng = Rng32::new(12345);
+        let mut rng = SmallRng::seed_from_u64(12345);
         let a: Vec<Descriptor> = (0..n)
             .map(|_| {
                 let mut d = [0u8; DESC_BYTES];
                 for b in d.iter_mut() {
-                    *b = (rng.next_u32() & 0xff) as u8;
+                    *b = rng.random::<u8>();
                 }
                 d
             })

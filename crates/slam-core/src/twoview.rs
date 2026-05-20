@@ -17,8 +17,8 @@
 //! if the chosen one yields no valid pose. Triangulates the initial
 //! points.
 
-use ginger_rand::Rng64;
 use nalgebra::{DMatrix, Matrix3, Vector2, Vector3};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
 /// A calibrated correspondence: normalized image point in view 1 and 2.
 pub type Corr = (Vector2<f64>, Vector2<f64>);
@@ -30,13 +30,12 @@ type PoseCandidates = [Pose; 4];
 /// A pose plus the points it triangulates.
 type PoseWithPoints = (Matrix3<f64>, Vector3<f64>, Vec<Vector3<f64>>);
 
-/// `k` distinct indices in `[0, n)`. RANSAC sampling is seeded (via
-/// [`Rng64`]) so model selection and inlier sets are reproducible
-/// across runs (CI).
-fn sample(rng: &mut Rng64, n: usize, k: usize, out: &mut Vec<usize>) {
+/// `k` distinct indices in `[0, n)`. RANSAC sampling is seeded so
+/// model selection and inlier sets are reproducible across runs (CI).
+fn sample(rng: &mut SmallRng, n: usize, k: usize, out: &mut Vec<usize>) {
     out.clear();
     while out.len() < k {
-        let i = rng.below(n);
+        let i = rng.random_range(0..n);
         if !out.contains(&i) {
             out.push(i);
         }
@@ -375,7 +374,7 @@ pub fn initialize(corrs: &[Corr], opt: InitOptions) -> Option<TwoView> {
     let th_h = 5.991 * s2;
     let th_score = 5.991 * s2;
 
-    let mut rng = Rng64::new(opt.seed | 1);
+    let mut rng = SmallRng::seed_from_u64(opt.seed | 1);
     let mut idx = Vec::new();
 
     // ── RANSAC essential ──
@@ -470,15 +469,15 @@ mod tests {
     fn scene(n: usize, planar: bool, noise: f64) -> (Vec<Corr>, Matrix3<f64>, Vector3<f64>) {
         let r = *Rotation3::from_euler_angles(0.03, -0.12, 0.05).matrix();
         let t = Vector3::new(0.9, -0.15, 0.08); // sideways translation
-        let mut rng = Rng64::new(99);
+        let mut rng = SmallRng::seed_from_u64(99);
         let mut corrs = Vec::new();
         for i in 0..n {
-            let u = (rng.next_u64() as f64 / u64::MAX as f64) - 0.5;
-            let v = (rng.next_u64() as f64 / u64::MAX as f64) - 0.5;
+            let u = rng.random::<f64>() - 0.5;
+            let v = rng.random::<f64>() - 0.5;
             let z = if planar {
                 4.0 // single fronto-parallel plane
             } else {
-                2.5 + 3.0 * (rng.next_u64() as f64 / u64::MAX as f64)
+                2.5 + 3.0 * rng.random::<f64>()
             };
             let p = Vector3::new(u * z * 0.8, v * z * 0.8, z);
             let p2 = r * p + t;
@@ -488,8 +487,7 @@ mod tests {
             let mut a = Vector2::new(p.x / p.z, p.y / p.z);
             let mut b = Vector2::new(p2.x / p2.z, p2.y / p2.z);
             if noise > 0.0 {
-                let g =
-                    |rng: &mut Rng64| (rng.next_u64() as f64 / u64::MAX as f64 - 0.5) * 2.0 * noise;
+                let g = |rng: &mut SmallRng| (rng.random::<f64>() - 0.5) * 2.0 * noise;
                 a.x += g(&mut rng);
                 a.y += g(&mut rng);
                 b.x += g(&mut rng);
@@ -541,12 +539,9 @@ mod tests {
     fn essential_robust_to_noise_and_outliers() {
         let (mut corrs, r_gt, _) = scene(200, false, 0.0008);
         // 15% gross outliers (random garbage matches).
-        let mut rng = Rng64::new(7);
+        let mut rng = SmallRng::seed_from_u64(7);
         for k in 0..corrs.len() / 7 {
-            corrs[k * 7].1 = Vector2::new(
-                rng.next_u64() as f64 / u64::MAX as f64 - 0.5,
-                rng.next_u64() as f64 / u64::MAX as f64 - 0.5,
-            );
+            corrs[k * 7].1 = Vector2::new(rng.random::<f64>() - 0.5, rng.random::<f64>() - 0.5);
         }
         let tv = initialize(&corrs, InitOptions::default()).expect("init");
         assert!(rot_angle_deg(&tv.r, &r_gt) < 2.0, "R off under noise");

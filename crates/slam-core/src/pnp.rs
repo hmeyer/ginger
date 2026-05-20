@@ -21,8 +21,8 @@
 //! and its real roots taken as companion-matrix eigenvalues. Correctness
 //! is pinned by the exact-recovery unit test.
 
-use ginger_rand::Rng64;
 use nalgebra::{Complex, DMatrix, Isometry3, Matrix3, Rotation3, Translation3, Vector2, Vector3};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
 use crate::tracking::{Observation, track_pose};
 
@@ -242,19 +242,19 @@ pub fn pnp_ransac(obs: &[Observation], opt: PnpOptions) -> Option<PnpReport> {
     if n < 4 {
         return None;
     }
-    let mut rng = Rng64::new(opt.seed | 1);
+    let mut rng = SmallRng::seed_from_u64(opt.seed | 1);
     let mut best: Option<(usize, Isometry3<f64>)> = None;
 
     for _ in 0..opt.iters {
         // Three distinct correspondences.
-        let i = rng.upto(n);
-        let mut j = rng.upto(n);
+        let i = rng.random_range(0..n);
+        let mut j = rng.random_range(0..n);
         while j == i {
-            j = rng.upto(n);
+            j = rng.random_range(0..n);
         }
-        let mut k = rng.upto(n);
+        let mut k = rng.random_range(0..n);
         while k == i || k == j {
-            k = rng.upto(n);
+            k = rng.random_range(0..n);
         }
         let w = [obs[i].point, obs[j].point, obs[k].point];
         let z = [obs[i].obs, obs[j].obs, obs[k].obs];
@@ -320,9 +320,15 @@ mod tests {
     }
 
     fn cloud(n: usize, seed: u64) -> Vec<Vector3<f64>> {
-        let mut r = Rng64::new(seed | 1);
+        let mut r = SmallRng::seed_from_u64(seed | 1);
         (0..n)
-            .map(|_| Vector3::new((r.f() - 0.5) * 4.0, (r.f() - 0.5) * 3.0, 2.5 + r.f() * 5.0))
+            .map(|_| {
+                Vector3::new(
+                    (r.random::<f64>() - 0.5) * 4.0,
+                    (r.random::<f64>() - 0.5) * 3.0,
+                    2.5 + r.random::<f64>() * 5.0,
+                )
+            })
             .collect()
     }
 
@@ -356,13 +362,13 @@ mod tests {
     fn ransac_recovers_pose_with_outliers_and_noise() {
         let gt = iso(-0.05, 0.09, -0.03, -0.3, 0.15, 0.5);
         let pts = cloud(80, 42);
-        let mut r = Rng64::new(7);
+        let mut r = SmallRng::seed_from_u64(7);
         let mut obs: Vec<Observation> = pts
             .iter()
             .map(|&x| {
                 let mut z = project(&gt, &x);
-                z.x += (r.f() - 0.5) * 2.0 * 0.001; // mild pixel noise
-                z.y += (r.f() - 0.5) * 2.0 * 0.001;
+                z.x += (r.random::<f64>() - 0.5) * 2.0 * 0.001; // mild pixel noise
+                z.y += (r.random::<f64>() - 0.5) * 2.0 * 0.001;
                 Observation { point: x, obs: z }
             })
             .collect();

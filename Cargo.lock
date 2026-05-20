@@ -1038,13 +1038,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ginger-rand"
-version = "0.1.0"
-dependencies = [
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "ginger-rs"
 version = "0.1.0"
 dependencies = [
@@ -1054,7 +1047,6 @@ dependencies = [
  "env_logger",
  "futures",
  "ginger-fast",
- "ginger-rand",
  "ginger-slam-core",
  "libc",
  "libcamera",
@@ -1075,9 +1067,9 @@ dependencies = [
 name = "ginger-slam-core"
 version = "0.1.0"
 dependencies = [
- "ginger-rand",
  "nalgebra",
  "postcard",
+ "rand 0.10.1",
  "serde",
  "toml",
 ]

@@ -8,10 +8,13 @@ edition = "2024"
 #   cargo test  -p ginger-slam-core
 #   cargo check -p ginger-slam-core --target aarch64-unknown-linux-gnu
 [dependencies]
-# Workspace-internal, zero-dependency PRNG. "Dependency-light" means few
-# *external* crates, not duplicated internal code: the seeded xorshift
-# that is the headless-determinism gate lives in one place.
-ginger-rand = { path = "../rand" }
+# Seeded RNG for RANSAC, k-means++, and synthetic test fixtures.
+# `SmallRng` (Xoshiro256++) plus `Rng::random_range` (Lemire-debiased)
+# is reproducible within a build and statistically nicer than the
+# hand-rolled xorshift it replaced; cross-`rand`-version byte
+# stability is not promised, and per the test audit (see PLAN.md)
+# nothing in this crate's tests asserts on specific bit sequences.
+rand = "0.10"
 nalgebra = "0.34"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

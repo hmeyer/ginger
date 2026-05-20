@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fast", "crates/rand", "crates/slam-core"]
+members = [".", "crates/fast", "crates/slam-core"]
 resolver = "2"
 
 [package]
@@ -9,11 +9,13 @@ edition = "2024"
 
 [dependencies]
 ginger-fast = { path = "crates/fast" }
-ginger-rand = { path = "crates/rand" }
 ginger-slam-core = { path = "crates/slam-core" }
-# Ecosystem RNG: used by the buzzer/LED show (`SmallRng` seeded from
-# the wall clock) and incrementally by other call sites as the
-# ginger-rand → rand migration progresses (see PLAN.md).
+# Seeded RNG: `SmallRng` (Xoshiro256++) for the buzzer/LED show, the
+# BRIEF sampling pattern, and frontend test fixtures. Reproducible
+# within a build (same binary + same seed → same stream); cross-`rand`-
+# version byte stability is not promised, and per the test audit
+# (see PLAN.md) nothing in this codebase's tests asserts on specific
+# bit sequences.
 rand = "0.10"
 nalgebra = "0.34"
 rppal = "0.22"
