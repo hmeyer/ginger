@@ -8,18 +8,18 @@
 
 use std::time::SystemTime;
 
-use ginger_rand::Xs64;
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
 use crate::robot::car::Car;
 
 /// The buzzer/LED show's PRNG, seeded from the wall clock so it feels
 /// different every press (stream quality is irrelevant here).
-fn show_rng() -> Xs64 {
+fn show_rng() -> SmallRng {
     let seed = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x9E37_79B9_7F4A_7C15);
-    Xs64::seeded(seed)
+    SmallRng::seed_from_u64(seed)
 }
 
 /// HSV → RGB. `h` in degrees, `s`/`v` in `[0, 1]`.
@@ -41,8 +41,8 @@ fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
 }
 
 /// A pitch near the phrase's (drifting) centre, jittered within the band.
-fn band_freq(rng: &mut Xs64, centre: f32, lo: i32, hi: i32) -> i32 {
-    let j = (rng.unit() - 0.5) * (hi - lo) as f32 * 0.6;
+fn band_freq(rng: &mut SmallRng, centre: f32, lo: i32, hi: i32) -> i32 {
+    let j = (rng.random::<f32>() - 0.5) * (hi - lo) as f32 * 0.6;
     (centre + j).clamp(lo as f32, hi as f32) as i32
 }
 
@@ -183,22 +183,22 @@ pub(crate) fn play_emote(car: &mut Car) {
         kinds,
         pal,
         base_v,
-    } = moods[rng.range(0, 4) as usize];
-    let viz = rng.range(0, 2); // 0 scanner · 1 VU · 2 flood
+    } = moods[rng.random_range(0u64..=4) as usize];
+    let viz = rng.random_range(0u64..=2); // 0 scanner · 1 VU · 2 flood
     let span = (hi - lo) as f32;
     let norm = |f: i32| ((f - lo) as f32 / span).clamp(0.0, 1.0);
 
-    let segments = rng.range(4, 7);
+    let segments = rng.random_range(4u64..=7);
     let mut centre = match contour {
         c if c > 0 => lo as f32,
         c if c < 0 => hi as f32,
         _ => (lo + hi) as f32 / 2.0,
     };
     let drift = contour as f32 * span / segments as f32;
-    let dur = |rng: &mut Xs64, a: u64, b: u64| (rng.range(a, b) * tempo / 100).max(6);
+    let dur = |rng: &mut SmallRng, a: u64, b: u64| (rng.random_range(a..=b) * tempo / 100).max(6);
 
     for _ in 0..segments {
-        match kinds[rng.range(0, kinds.len() as u64 - 1) as usize] {
+        match kinds[rng.random_range(0..kinds.len() as u64) as usize] {
             // gliss: a pitch sweep — the scanner dot slides with it
             0 => {
                 let (f0, f1) = (
@@ -219,7 +219,7 @@ pub(crate) fn play_emote(car: &mut Car) {
                     band_freq(&mut rng, centre, lo, hi),
                     band_freq(&mut rng, centre, lo, hi),
                 );
-                for i in 0..rng.range(4, 8) {
+                for i in 0..rng.random_range(4u64..=8) {
                     let fr = if i.is_multiple_of(2) { a } else { b }.max(60);
                     light(car, &pal, viz, norm(fr), base_v);
                     car.buzzer.tone(fr as u32, dur(&mut rng, 16, 32));
@@ -239,8 +239,8 @@ pub(crate) fn play_emote(car: &mut Car) {
             // tight trill on two close pitches — strobes
             4 => {
                 let a = band_freq(&mut rng, centre, lo, hi);
-                let b = a + rng.range(120, 380) as i32;
-                for i in 0..rng.range(6, 12) {
+                let b = a + rng.random_range(120u64..=380) as i32;
+                for i in 0..rng.random_range(6u64..=12) {
                     let fr = if i.is_multiple_of(2) { a } else { b }.max(60);
                     light(car, &pal, viz, norm(fr), base_v);
                     car.buzzer.tone(fr as u32, dur(&mut rng, 9, 18));
@@ -248,7 +248,7 @@ pub(crate) fn play_emote(car: &mut Car) {
             }
             // short blips with little dark gaps
             _ => {
-                for _ in 0..rng.range(1, 3) {
+                for _ in 0..rng.random_range(1u64..=3) {
                     let fr = band_freq(&mut rng, centre, lo, hi).max(60);
                     light(car, &pal, viz, norm(fr), base_v);
                     car.buzzer.tone(fr as u32, dur(&mut rng, 22, 75));
@@ -260,7 +260,7 @@ pub(crate) fn play_emote(car: &mut Car) {
         }
         centre = (centre + drift).clamp(lo as f32, hi as f32);
         // A short dark pause between most segments.
-        if rng.range(0, 2) != 0 {
+        if rng.random_range(0u64..=2) != 0 {
             car.leds.set_all(0, 0, 0);
             car.leds.show().ok();
             car.buzzer.tone(0, dur(&mut rng, 25, 110));

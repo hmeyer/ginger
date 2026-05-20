@@ -275,11 +275,11 @@ mod tests {
     /// sides are scalar, so this still exercises the harness and the
     /// 4-wide block / remainder tiling math.
     mod resize_parity {
-        use ginger_rand::Xs64;
+        use rand::{Rng, SeedableRng, rngs::SmallRng};
 
         use super::*;
 
-        fn rand_img(rng: &mut Xs64, w: usize, h: usize) -> GrayImage {
+        fn rand_img(rng: &mut SmallRng, w: usize, h: usize) -> GrayImage {
             let mut g = GrayImage::new(w, h);
             for p in g.data.iter_mut() {
                 *p = (rng.next_u32() & 0xff) as u8;
@@ -289,7 +289,7 @@ mod tests {
 
         #[test]
         fn neon_matches_scalar() {
-            let mut rng = Xs64::seeded(0x0DEF_ACED_DEAD_BEEF);
+            let mut rng = SmallRng::seed_from_u64(0x0DEF_ACED_DEAD_BEEF);
             // Source sizes (some not multiples of 4) crossed with target
             // sizes: pyramid-like 1.2× steps plus tiny / odd targets to
             // stress the NEON tail and the gather bounds.

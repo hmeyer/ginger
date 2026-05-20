@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 rayon = "1"
 
-# Test-only: the deterministic image-fuzz fixtures use the shared PRNG.
-# Kept a dev-dependency so the crate's runtime dep surface stays minimal.
+# Test-only: the deterministic image-fuzz fixtures use `SmallRng`
+# (Xoshiro256++) seeded with a fixed `u64`, which is enough for the
+# scalar-vs-NEON parity tests. Kept a dev-dependency so the crate's
+# runtime dep surface stays minimal.
 [dev-dependencies]
-ginger-rand = { path = "../rand" }
+rand = "0.10"
