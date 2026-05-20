@@ -54,23 +54,25 @@ on the full DoD checklist from `CLAUDE.md` (`cargo test --workspace
 both `aarch64-unknown-linux-gnu` cross-checks, Playwright if WebUI
 touched).
 
-### Step 1 — Audit & classify every assertion that touches an RNG
+### Step 1 — Audit & classify every assertion that touches an RNG ✅
 
-Grep `assert_eq!` / `assert!` across `crates/slam-core/`, `src/slam/`,
-`crates/fast/`. Tag each as:
+**Done.** Full classification across `crates/slam-core/`,
+`crates/fast/`, `src/slam/`, `src/robot/emote.rs`, `src/camera/mock.rs`,
+and the examples. Result:
 
-- **invariant** — `n >= K`, `err < ε`, shape/structure checks. No
-  action needed.
-- **intra-build determinism** — `assert_eq!(run_a, run_b)` after
-  re-seeding. Preserved automatically. No action needed.
-- **byte-golden** — compares against a literal sequence, a hash, a
-  checked-in `.bin`. **These are the migration's target surface.**
+- **92 invariants** — tolerance / count / bound / structural checks.
+- **11 intra-build determinism** — two-run comparisons under the same
+  seed. Preserved automatically by any seeded RNG.
+- **0 byte-goldens.** No checked-in `.bin`, no `include_bytes!` of a
+  PRNG-derived artifact, no hard-coded expected sequence, no hash
+  comparison. `slam_vocab.bin` is a *runtime* file (loaded if present,
+  graceful fallback otherwise per `src/slam/place.rs:20`) — not a
+  test fixture.
 
-A first-pass grep suggests the byte-golden surface is small: roughly
-the `ginger-rand` internal determinism test, the BoW vocab artifact, the
-BRIEF pattern (if asserted on directly), and any frontend goldens.
-Output: the punch list, recorded in the Step 1 commit message body. No
-code change.
+This collapses the plan: **Steps 5 and 6 become near-no-ops** (nothing
+to re-bless, vocab artifact isn't asserted on). The PRNG swap proceeds
+without test surgery — every gate is on algorithmic behavior, not on
+bytes.
 
 ### Step 2 — Add `rand` deps and implement `RngCore` on existing streams
 
@@ -111,36 +113,18 @@ These have no checked-in goldens and no cross-version implications:
 
 Mark `Xs64` `#[deprecated]` once it has no callers; delete in Step 8.
 
-### Step 5 — Rewrite byte-goldens identified in Step 1 as invariants
+### Step 5 — Rewrite byte-goldens as invariants — **N/A (no goldens)**
 
-For each item on the Step 1 punch list:
+Step 1 found zero byte-goldens. Skipped. If future audits reveal one,
+this slot is reserved.
 
-- Exact inlier set → `inliers.len() >= N && reproj_err < ε`.
-- Vocab hash → cluster-separation / retrieval-accuracy property.
-- BRIEF pattern bytes → distribution property (mean radius,
-  per-quadrant balance, etc.).
-- Pick tolerances empirically: run the current algorithm 100× with
-  different seeds, choose ε so the 99th-percentile passes with
-  margin. Record the tolerance-selection script in the commit body
-  (CLAUDE.md style: explain *why* the number).
+### Step 6 — Decouple the BoW vocab from a specific PRNG — **N/A**
 
-DoD check: every test passes with the **unchanged** xorshift PRNGs
-**and** with `ChaCha8Rng` / `SmallRng` substituted on a scratch
-verification branch.
-
-### Step 6 — Decouple the BoW vocab from a specific PRNG
-
-`src/slam/place.rs` loads `slam_vocab.bin` if present and degrades
-gracefully otherwise.
-
-- Make the vocab a build artifact: regenerate from a fixed seed against
-  the training corpus, not a checked-in PRNG-pinned binary.
-- Or, if regeneration is expensive enough that the checked-in artifact
-  stays: stop asserting on its *bytes*, only on its *behavior* (top-1
-  retrieval accuracy on a held-out fixture set).
-
-DoD check: deleting `slam_vocab.bin` and rebuilding from scratch
-produces a vocab that passes the behavioral tests.
+`slam_vocab.bin` is a runtime artifact, not a test gate. No test
+compares its bytes; no `include_bytes!` ties code to a specific PRNG.
+The runtime fallback in `src/slam/place.rs` already handles its
+absence. Verify in Step 9 that regenerating it under the new PRNG
+still satisfies the runtime path; no migration work otherwise.
 
 ### Step 7 — Swap the PRNG implementation
 
