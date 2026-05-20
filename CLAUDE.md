@@ -87,7 +87,13 @@ non-decreasing. New behavior needs new tests in the same change.
 
 ## TODO / status tracking
 
-There is no separate plan file (PLAN.md was intentionally removed). The
-project's running TODO list lives in `README.md` ("SLAM status" →
-*Deferred* / *Performance / refinement passes*). Keep that section
+The project's running TODO list lives in `README.md` ("SLAM status" →
+*Deferred* / *Performance / refinement passes*); keep that section
 authoritative when finishing or adding work.
+
+A `PLAN.md` at the repo root is allowed for multi-step, multi-commit work
+that needs a sequenced, revertible roadmap (e.g. a workspace-wide
+migration). When present it owns the *sequencing and rationale* for the
+in-flight effort; `README.md` remains the canonical status board for the
+project as a whole. Delete `PLAN.md` when the migration it describes is
+done — it is not a permanent design doc.
