@@ -389,11 +389,11 @@ mod tests {
     /// sides are scalar, so this still exercises the harness and the
     /// row-tiling math.
     mod neon_parity {
-        use ginger_rand::Xs64;
+        use rand::{Rng, SeedableRng, rngs::SmallRng};
 
         use super::*;
 
-        fn rand_img(rng: &mut Xs64, w: usize, h: usize) -> GrayImage {
+        fn rand_img(rng: &mut SmallRng, w: usize, h: usize) -> GrayImage {
             let mut g = GrayImage::new(w, h);
             for p in g.data.iter_mut() {
                 *p = (rng.next_u32() & 0xff) as u8;
@@ -420,7 +420,7 @@ mod tests {
 
         #[test]
         fn neon_matches_scalar() {
-            let mut rng = Xs64::seeded(0x00C0_FFEE_1234_5678);
+            let mut rng = SmallRng::seed_from_u64(0x00C0_FFEE_1234_5678);
             // Mix of widths that are / aren't multiples of 16, plus a
             // tiny image, to stress the NEON tail and bounds math.
             for &(w, h) in &[

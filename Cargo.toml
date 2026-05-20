@@ -11,6 +11,10 @@ edition = "2024"
 ginger-fast = { path = "crates/fast" }
 ginger-rand = { path = "crates/rand" }
 ginger-slam-core = { path = "crates/slam-core" }
+# Ecosystem RNG: used by the buzzer/LED show (`SmallRng` seeded from
+# the wall clock) and incrementally by other call sites as the
+# ginger-rand → rand migration progresses (see PLAN.md).
+rand = "0.10"
 nalgebra = "0.34"
 rppal = "0.22"
 log = "0.4"
