@@ -3,10 +3,17 @@ name = "ginger-rand"
 version = "0.1.0"
 edition = "2024"
 
-# Zero dependencies on purpose: this is the single source of truth for
-# every *seeded, deterministic* random stream in the workspace (RANSAC,
-# k-means++ vocabulary, the BRIEF pattern, the buzzer/LED show, test
-# fixtures). It is the headless-determinism gate, so it must compile and
-# behave identically on the dev host, CI, and the aarch64 Pi target —
-# hence no external crates and no platform entropy.
+# `rand_core` is the trait surface (`RngCore`) only — no platform
+# entropy, no extra streams. The crate is an *adapter*: it exposes our
+# in-house seeded streams (xorshift64*, xorshift32, plain xorshift64) as
+# `RngCore` impls so consumers can use the `rand` ecosystem's
+# `Rng`/`SeedableRng`/`rand_distr` ergonomics on top, without dragging
+# any platform-dependent dep into the headless-determinism gate.
+#
+# The bit sequences produced by `Rng64`/`Rng32`/`Xs64` remain the
+# single source of truth for every *seeded, deterministic* random
+# stream in the workspace (RANSAC, k-means++ vocabulary, the BRIEF
+# pattern, the buzzer/LED show, test fixtures); the algorithms stay
+# byte-stable across this dep addition.
 [dependencies]
+rand_core = "0.10"

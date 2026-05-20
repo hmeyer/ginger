@@ -1,15 +1,19 @@
-//! Deterministic, dependency-free PRNGs — the single source of truth for
-//! every *seeded* random stream in the workspace.
+//! Deterministic seeded PRNGs — the single source of truth for every
+//! *seeded* random stream in the workspace, with [`rand_core::RngCore`]
+//! adapters so consumers can layer the `rand` ecosystem's
+//! `Rng` / `rand_distr` ergonomics on top.
 //!
-//! These exact bit sequences are load-bearing: RANSAC model selection
-//! and inlier sets, the k-means++ BoW vocabulary, and the fixed BRIEF
-//! sampling pattern are all pure functions of `(inputs, seed)`, and the
-//! headless test suite gates on the results. The algorithms and their
-//! constants must therefore stay byte-stable; changing one is a
-//! deliberate, test-re-blessing change, never an incidental cleanup.
+//! The bit sequences these types produce are load-bearing: RANSAC
+//! model selection and inlier sets, the k-means++ BoW vocabulary, and
+//! the fixed BRIEF sampling pattern are pure functions of
+//! `(inputs, seed)`. The headless test suite gates on *invariants*
+//! (counts, tolerances, structural shape) rather than literal bytes,
+//! but still relies on those streams being intra-build reproducible.
+//! Changing an algorithm/constant here is a deliberate behavior step,
+//! never an incidental cleanup.
 //!
-//! Three streams exist because three call sites genuinely need different
-//! shapes — do not "unify" them:
+//! Three streams exist because three call sites genuinely need
+//! different shapes — do not "unify" them:
 //!
 //! * [`Rng64`] — xorshift64\* (Vigna): the core stream for RANSAC /
 //!   k-means / numeric test fixtures.
@@ -19,6 +23,18 @@
 //!
 //! Plus [`noise_u8`], the integer value-noise hash behind the mock
 //! camera's synthetic frames.
+//!
+//! # `rand_core` adapter layer
+//!
+//! Each of [`Rng64`] / [`Rng32`] / [`Xs64`] implements
+//! [`rand_core::TryRng`] with `Error = Infallible`, which gives them
+//! blanket impls of [`rand_core::Rng`] (and the deprecated
+//! [`rand_core::RngCore`] alias) for free. Inherent methods take
+//! precedence in Rust's method resolution, so existing call sites
+//! (`rng.next_u64()`, `rng.f()`, `rng.upto(n)`, etc.) stay
+//! byte-identical; the trait impl is purely additive and lets new
+//! call sites pass `&mut rng` to any function bounded by `R: Rng`
+//! (or, via the `rand` crate, `R: rand::RngExt`).
 
 /// Vigna's xorshift64\* output multiplier.
 const MUL: u64 = 0x2545_F491_4F6C_DD1D;
@@ -89,6 +105,22 @@ impl Rng64 {
     }
 }
 
+impl rand_core::TryRng for Rng64 {
+    type Error = core::convert::Infallible;
+    #[inline]
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(Rng64::next_u64(self))
+    }
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok((Rng64::next_u64(self) >> 32) as u32)
+    }
+    #[inline]
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        rand_core::utils::fill_bytes_via_next_word(dst, || Ok(Rng64::next_u64(self)))
+    }
+}
+
 /// xorshift32 (Marsaglia 13/17/5). Only used to build the fixed BRIEF
 /// sampling pattern, so its sequence pins every descriptor in the map.
 pub struct Rng32(pub u32);
@@ -119,6 +151,22 @@ impl Rng32 {
         let u1 = self.unit().max(1e-7);
         let u2 = self.unit();
         (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    }
+}
+
+impl rand_core::TryRng for Rng32 {
+    type Error = core::convert::Infallible;
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(Rng32::next_u32(self))
+    }
+    #[inline]
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        rand_core::utils::next_u64_via_u32(self)
+    }
+    #[inline]
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        rand_core::utils::fill_bytes_via_next_word(dst, || Ok(Rng32::next_u32(self)))
     }
 }
 
@@ -158,6 +206,22 @@ impl Xs64 {
     #[inline]
     pub fn unit(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+impl rand_core::TryRng for Xs64 {
+    type Error = core::convert::Infallible;
+    #[inline]
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(Xs64::next_u64(self))
+    }
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(Xs64::next_u32(self))
+    }
+    #[inline]
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        rand_core::utils::fill_bytes_via_next_word(dst, || Ok(Xs64::next_u64(self)))
     }
 }
 
@@ -224,6 +288,34 @@ mod tests {
             let v = r.range(4, 7);
             assert!((4..=7).contains(&v));
             assert!((0.0..1.0).contains(&r.unit()));
+        }
+    }
+
+    #[test]
+    fn rng_trait_impls_match_inherent_methods() {
+        // The `rand_core::Rng` (auto-impl'd from our `TryRng` impl)
+        // must delegate to the inherent methods so existing call sites
+        // stay byte-identical. Inherent method resolution beats the
+        // trait, so this test guards the *trait* path against silent
+        // divergence.
+        use rand_core::Rng;
+
+        let mut a = Rng64::new(0xABCD_EF01_2345_6789);
+        let mut b = Rng64::new(0xABCD_EF01_2345_6789);
+        for _ in 0..256 {
+            assert_eq!(Rng64::next_u64(&mut a), Rng::next_u64(&mut b));
+        }
+
+        let mut a = Rng32::new(0xCAFE_BABE);
+        let mut b = Rng32::new(0xCAFE_BABE);
+        for _ in 0..256 {
+            assert_eq!(Rng32::next_u32(&mut a), Rng::next_u32(&mut b));
+        }
+
+        let mut a = Xs64::seeded(0xFEED_FACE_DEAD_BEEF);
+        let mut b = Xs64::seeded(0xFEED_FACE_DEAD_BEEF);
+        for _ in 0..256 {
+            assert_eq!(Xs64::next_u64(&mut a), Rng::next_u64(&mut b));
         }
     }
 
