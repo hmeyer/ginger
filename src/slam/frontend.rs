@@ -694,10 +694,10 @@ impl Frontend {
 /// directly.
 #[cfg(test)]
 mod pipeline_tests {
-    use ginger_rand::Rng64;
     use ginger_slam_core::camera::CameraModel;
     use ginger_slam_core::intrinsics::Intrinsics;
     use nalgebra::Isometry3;
+    use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
     use super::*;
 
@@ -709,18 +709,18 @@ mod pipeline_tests {
     /// matcher pairs them unambiguously, isolating pipeline behaviour
     /// from matcher robustness, which `brief` tests separately).
     fn scene(n: usize) -> (Vec<Vector3<f64>>, Vec<brief::Descriptor>) {
-        let mut r = Rng64::new(0x00AB_CDEF_1234_5678);
+        let mut r = SmallRng::seed_from_u64(0x00AB_CDEF_1234_5678);
         let mut pts = Vec::with_capacity(n);
         let mut ds = Vec::with_capacity(n);
         for _ in 0..n {
             pts.push(Vector3::new(
-                (r.f() - 0.5) * 6.0,
-                (r.f() - 0.5) * 4.0,
-                3.0 + r.f() * 6.0,
+                (r.random::<f64>() - 0.5) * 6.0,
+                (r.random::<f64>() - 0.5) * 4.0,
+                3.0 + r.random::<f64>() * 6.0,
             ));
             let mut d = [0u8; brief::DESC_BYTES];
             for b in d.iter_mut() {
-                *b = r.byte();
+                *b = r.random::<u8>();
             }
             ds.push(d);
         }
@@ -947,12 +947,12 @@ mod pipeline_tests {
         let traj = good.map.cameras.len();
 
         // A frame of pure garbage descriptors → no map matches.
-        let mut r = Rng64::new(0x99);
+        let mut r = SmallRng::seed_from_u64(0x99);
         let fd: Vec<brief::Descriptor> = (0..200)
             .map(|_| {
                 let mut d = [0u8; brief::DESC_BYTES];
                 for b in d.iter_mut() {
-                    *b = r.byte();
+                    *b = r.random::<u8>();
                 }
                 d
             })
@@ -1046,13 +1046,13 @@ mod pipeline_tests {
 
         // A run of pure-garbage frames → lost, and the map is *not*
         // corrupted while lost (points + trajectory frozen).
-        let mut r = Rng64::new(0x6105);
+        let mut r = SmallRng::seed_from_u64(0x6105);
         for _ in 0..4 {
             let fd: Vec<brief::Descriptor> = (0..200)
                 .map(|_| {
                     let mut d = [0u8; brief::DESC_BYTES];
                     for b in d.iter_mut() {
-                        *b = r.byte();
+                        *b = r.random::<u8>();
                     }
                     d
                 })

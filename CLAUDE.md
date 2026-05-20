@@ -64,13 +64,15 @@ non-decreasing. New behavior needs new tests in the same change.
   the module docstrings.
 - **Determinism** — replay/test paths must stay deterministic.
   Observation ordering in `local_ba`/`map` is load-bearing; preserve it.
-- **Shared primitives** — "dependency-light" means few *external*
-  crates, not duplicated *internal* code. Determinism-critical
-  primitives (the seeded PRNGs) live once in `crates/rand`
-  (`ginger-rand`) and are reused, never re-hand-rolled per file. Its
-  bit sequences gate the headless suite, the k-means BoW vocabulary and
-  the BRIEF pattern; changing an algorithm/constant there is a
-  deliberate, test-re-blessing change, never an incidental cleanup.
+- **Seeded RNGs** — use `rand::rngs::SmallRng` (Xoshiro256++) with
+  `SmallRng::seed_from_u64(seed)` for every reproducible stream
+  (RANSAC sampling, k-means++ BoW vocabulary, the BRIEF sampling
+  pattern, test fixtures). Within-build determinism (same binary +
+  same seed → same stream) is what replay and the headless suite
+  rely on; cross-`rand`-version byte stability is not promised and
+  nothing in the tests asserts on specific bit sequences (gates are
+  invariants: counts, tolerances, structural properties). Do not
+  re-introduce a hand-rolled PRNG.
 - **NEON discipline** — every SIMD path in `crates/fast` keeps a scalar
   reference and a `parity` test. Add NEON only at a measured hotspot.
 - **Comments** — explain *why*, not *what*. The codebase favors dense,
