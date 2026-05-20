@@ -142,8 +142,8 @@ pub fn track_pose(
 
 #[cfg(test)]
 mod tests {
-    use ginger_rand::Rng64;
     use nalgebra::{Rotation3, Translation3, UnitQuaternion};
+    use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
     use super::*;
 
@@ -155,11 +155,14 @@ mod tests {
     /// Deterministic point cloud + a ground-truth pose; project to
     /// calibrated observations.
     fn scene(n: usize, pose: &Isometry3<f64>) -> Vec<Observation> {
-        let mut r = Rng64::new(1234567);
+        let mut r = SmallRng::seed_from_u64(1234567);
         (0..n)
             .map(|_| {
-                let point =
-                    Vector3::new((r.f() - 0.5) * 4.0, (r.f() - 0.5) * 3.0, 2.0 + r.f() * 4.0);
+                let point = Vector3::new(
+                    (r.random::<f64>() - 0.5) * 4.0,
+                    (r.random::<f64>() - 0.5) * 3.0,
+                    2.0 + r.random::<f64>() * 4.0,
+                );
                 let pc = pose.rotation * point + pose.translation.vector;
                 Observation {
                     point,
