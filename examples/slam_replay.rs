@@ -1,5 +1,5 @@
 //! Deterministic offline replay of the SLAM frontend over a recorded /
-//! dataset frame sequence — the M2 regression harness.
+//! dataset frame sequence — the regression harness.
 //!
 //! Unlike `slam_bench` (timing on a synthetic frame), this runs the real
 //! `detect_features` + `match_descriptors` over an ordered `*.pgm`
@@ -10,8 +10,8 @@
 //!   cargo run --no-default-features --example slam_replay -- <frames-dir>
 //!
 //! `<frames-dir>` is a directory of `*.pgm` (lexicographically ordered),
-//! optionally with a sibling `slam.toml` (intrinsics, surfaced here;
-//! consumed for real by M3+).
+//! optionally with a sibling `slam.toml` (intrinsics, surfaced here and
+//! consumed by two-view init / tracking when present).
 
 use ginger_rs::slam::brief::{Descriptor, match_descriptors};
 use ginger_rs::slam::detect_features;
@@ -47,7 +47,7 @@ fn main() {
             i.hfov_deg(),
             i.verified
         ),
-        None => println!("  intrinsics: none (M3+ will require slam.toml)"),
+        None => println!("  intrinsics: none (slam.toml absent → rev 1.3 prior)"),
     }
 
     let mut prev: Option<Vec<Descriptor>> = None;

@@ -1,4 +1,4 @@
-//! M5 local-mapping thread: turn inserted keyframes into a growing,
+//! Local-mapping thread: turn inserted keyframes into a growing,
 //! locally bundle-adjusted map.
 //!
 //! Decoupled from per-frame tracking per the Pi-4 performance
@@ -18,14 +18,14 @@
 //! `Arc<Mutex<Map>>`; locks are kept short and never held across the
 //! Schur solve's heavy inner work beyond the (bounded, L1-resident)
 //! window — coarse-grained but adequate at Pi-class map sizes (a
-//! finer-grained tracking/mapping handoff is an M6 refinement).
+//! finer-grained tracking/mapping handoff is a deferred refinement).
 //!
-//! M6-2b: each ingested keyframe is also registered with the shared BoW
+//! Each ingested keyframe is also registered with the shared BoW
 //! [`PlaceDb`] (self-trains the vocabulary once enough keyframes exist)
 //! so relocalization / loop detection can query it.
 //!
-//! M6-2d: after local BA, the just-processed keyframe is tested for a
-//! **loop closure** — a BoW hit on an old, non-covisible keyframe,
+//! After local BA, the just-processed keyframe is tested for a **loop
+//! closure** — a BoW hit on an old, non-covisible keyframe,
 //! geometrically verified by a robust `Sim3` over descriptor-matched
 //! map points, then corrected by Essential-graph pose-graph
 //! optimization (origin gauge-fixed) with the map points dragged along.
@@ -64,7 +64,7 @@ const LOCAL_BA_ITERS: usize = 5;
 /// constrain BA) but are no longer matched for *new* point creation.
 const RAW_FEAT_KFS: usize = 12;
 
-// ── Loop closing (M6-2d) ─────────────────────────────────────────────
+// ── Loop closing ─────────────────────────────────────────────────────
 // Conservative: a *false* loop corrupts the whole map irreversibly, so
 // every gate favours a miss over a wrong closure.
 /// Top BoW candidates considered per keyframe.
@@ -114,10 +114,10 @@ pub struct LocalMapper {
     jobs: Receiver<KeyframeJob>,
     raw: HashMap<u32, RawKf>,
     recent: VecDeque<u32>,
-    /// Shared BoW place-recognition index (M6): every ingested keyframe
-    /// is registered so relocalization / loop detection can query it.
+    /// Shared BoW place-recognition index: every ingested keyframe is
+    /// registered so relocalization / loop detection can query it.
     place: Arc<Mutex<PlaceDb>>,
-    /// Loop-closure counter, surfaced by the frontend (M6-2d).
+    /// Loop-closure counter, surfaced by the frontend.
     loops: Arc<AtomicU64>,
 }
 
@@ -265,8 +265,8 @@ impl LocalMapper {
             }
         }
 
-        // M6-2d: a revisit detected here closes the loop + pose-graph
-        // corrects the map (rare; gated; off the tracking core).
+        // A revisit detected here closes the loop + pose-graph corrects
+        // the map (rare; gated; off the tracking core).
         self.try_close_loop(kf);
     }
 

@@ -1,4 +1,4 @@
-//! Map structure for local mapping (M5): keyframes, map points, the
+//! Map structure for local mapping: keyframes, map points, the
 //! covisibility graph + spanning tree, the keyframe-insertion policy,
 //! the local-BA window selector, and culling.
 //!

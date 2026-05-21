@@ -1,10 +1,10 @@
 //! Dense Levenberg–Marquardt with an optional Huber robustifier.
 //!
-//! This is the first solver to harden (M2 plan): motion-only BA in M4 is
-//! a small *dense* 6-DOF problem, so a well-tested dense LM is the right
-//! foundation before the block-sparse Schur structure arrives in M5. The
-//! sparsity is an algorithmic/layout change later; the numerics here do
-//! not change.
+//! Motion-only BA ([`crate::tracking`]) is a small *dense* 6-DOF
+//! problem, so a well-tested dense LM is the right foundation; the
+//! block-sparse Schur structure for local BA lives separately in
+//! [`crate::local_ba`] as an algorithmic/layout change on top — the
+//! numerics here do not change.
 //!
 //! Huber is applied per scalar residual via IRLS weighting
 //! (`w = 1` for `|r| <= delta`, else `sqrt(delta/|r|)`), which turns the

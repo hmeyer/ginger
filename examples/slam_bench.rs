@@ -116,8 +116,8 @@ fn main() {
     geometry_stages();
 }
 
-/// M2 math stages, on the same measured A/B loop as the frontend so
-/// `slam-core` changes (CameraModel, the LM solver) are tracked too.
+/// `slam-core` math stages, on the same measured A/B loop as the
+/// frontend so changes (CameraModel, the LM solver) are tracked too.
 fn geometry_stages() {
     use ginger_slam_core::camera::CameraModel;
     use ginger_slam_core::intrinsics::Intrinsics;
@@ -188,7 +188,7 @@ fn geometry_stages() {
     }
     let solve_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    println!("  ---- geometry (slam-core, M2) ----");
+    println!("  ---- geometry (slam-core) ----");
     println!("  project   {:>7.2}   <- 200k project∘unproject", proj_ms);
     println!(
         "  lm-solve  {:>7.3}   <- per solve ({conv}/{iters} conv)",

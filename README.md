@@ -93,9 +93,9 @@ gated by deterministic headless tests (`cargo test --workspace
   flagged `UNVERIFIED`). Not kalibr.
 - **Frame recorder** — dump live libcamera frames to `*.pgm` to feed
   the existing replay harness with real scenes. Real-scene init quality
-  (M3) and loop-closure efficacy (M6) are only verified on synthetic /
-  unit-test scenes until this lands; the synthetic harness can't
-  manufacture the drift a closing loop needs.
+  and loop-closure efficacy are only verified on synthetic / unit-test
+  scenes until this lands; the synthetic harness can't manufacture the
+  drift a closing loop needs.
 
 **Performance / refinement passes (measure first via `slam_bench`):**
 - Wire the BoW direct index into tracking/loop matching (still

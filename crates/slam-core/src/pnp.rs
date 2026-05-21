@@ -1,12 +1,12 @@
-//! P3P + RANSAC pose recovery (M6-1b): the camera pose `T_cw` from
-//! 3D↔2D correspondences, robust to a high outlier ratio.
+//! P3P + RANSAC pose recovery: the camera pose `T_cw` from 3D↔2D
+//! correspondences, robust to a high outlier ratio.
 //!
-//! This is the recovery solver M6 relocalization is built on: when
+//! This is the recovery solver relocalization is built on: when
 //! tracking is lost, BoW ([`crate::bow`]) shortlists candidate
 //! keyframes and descriptor matching yields map-point ↔ feature pairs —
 //! many of them wrong. P3P is the minimal solver (3 correspondences →
 //! up to 4 poses), wrapped in RANSAC so the inlier set drives a final
-//! pose; the same primitive verifies loop candidates later.
+//! pose; the same primitive verifies loop candidates.
 //!
 //! Camera-free; calibrated/normalized observations and `T_cw` (world →
 //! camera, `x_cam = R·X + t`) — the same contract as

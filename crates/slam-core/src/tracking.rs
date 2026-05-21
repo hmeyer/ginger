@@ -1,4 +1,4 @@
-//! Frame-to-frame tracking (M4): a constant-velocity motion model plus
+//! Frame-to-frame tracking: a constant-velocity motion model plus
 //! **motion-only bundle adjustment** — refine the 6-DOF camera pose that
 //! best reprojects known 3D map points onto their observed (calibrated)
 //! image points, robust to outliers.

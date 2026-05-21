@@ -40,8 +40,8 @@ const ANCHOR_RESET_MATCHES: usize = 25;
 const TRACK_MIN_MATCHES: usize = 15;
 const TRACK_MIN_INLIERS: usize = 10;
 
-/// Relocalization gates (M6-2c). Kept conservative — a false
-/// relocalization corrupts the trajectory, so favour staying lost.
+/// Relocalization gates. Kept conservative — a false relocalization
+/// corrupts the trajectory, so favour staying lost.
 const RELOC_MAX_CAND: usize = 5;
 const RELOC_COVIS: usize = 5;
 const RELOC_MAX_PTS: usize = 1500;
@@ -77,15 +77,15 @@ struct TrackState {
 
 /// Explicit pipeline state (replaces an implicit `Option` trio so
 /// illegal combinations are unrepresentable and transitions are
-/// obvious). M5/M6 extend this with `Lost` / `Relocalizing`.
+/// obvious).
 enum Stage {
     /// Pre-init: accumulating parallax against an optional anchor frame.
     Bootstrapping { anchor: Option<FrameFeatures> },
     /// Post-init: live tracking against the shared keyframe map.
     Tracking(TrackState),
-    /// Track lost (M6-2c): per frame, BoW-query the place DB and try to
-    /// recover the pose by PnP-RANSAC against candidate keyframes' map
-    /// points; on success resume [`Stage::Tracking`] with the saved
+    /// Track lost: per frame, BoW-query the place DB and try to recover
+    /// the pose by PnP-RANSAC against candidate keyframes' map points;
+    /// on success resume [`Stage::Tracking`] with the saved
     /// trajectory/map context. `since` counts frames spent lost.
     Lost { since: usize, track: TrackState },
 }
@@ -96,8 +96,8 @@ pub struct Frontend {
     intrinsics: Option<Intrinsics>,
     iview: IntrinsicsView,
     map: MapSnapshot,
-    /// Shared keyframe map (M5): written by tracking (keyframe inserts)
-    /// and the [`LocalMapper`] (new points + local BA); read by tracking
+    /// Shared keyframe map: written by tracking (keyframe inserts) and
+    /// the [`LocalMapper`] (new points + local BA); read by tracking
     /// each frame to re-find points and to publish.
     world: Arc<Mutex<Map>>,
     /// Keyframe handoff to the local mapper.
@@ -105,12 +105,12 @@ pub struct Frontend {
     /// The mapper, until [`Frontend::take_local_mapper`] moves it to its
     /// own thread (`run`); kept here so tests can pump it synchronously.
     mapper: Option<LocalMapper>,
-    /// Shared BoW place-recognition index (M6): the mapper fills it as
-    /// keyframes are inserted; relocalization (M6-2c) / loop detection
-    /// (M6-2d) query it. Held here so the tracking side can reach it.
+    /// Shared BoW place-recognition index: the mapper fills it as
+    /// keyframes are inserted; relocalization / loop detection query
+    /// it. Held here so the tracking side can reach it.
     place: Arc<Mutex<PlaceDb>>,
-    /// Loop closures applied by the mapper (M6-2d); surfaced in the HUD
-    /// status and observable for tests.
+    /// Loop closures applied by the mapper; surfaced in the HUD status
+    /// and observable for tests.
     loops: Arc<std::sync::atomic::AtomicU64>,
     /// Last `loops` value folded into the status line.
     last_loops: u64,
@@ -148,7 +148,7 @@ impl Frontend {
         }
     }
 
-    /// Loop closures applied so far (M6-2d) — test/observability hook.
+    /// Loop closures applied so far — test/observability hook.
     pub fn loop_closures(&self) -> u64 {
         self.loops.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -180,8 +180,8 @@ impl Frontend {
     }
 
     /// Place-recognition query against the BoW DB: best
-    /// `(keyframe id, score)` matches for these descriptors. Test/M6-2c
-    /// hook (no skip filter).
+    /// `(keyframe id, score)` matches for these descriptors.
+    /// Test/relocalization hook (no skip filter).
     pub fn place_query(&self, descs: &[brief::Descriptor], max: usize) -> Vec<(u32, f64)> {
         self.place.lock().unwrap().query(descs, max, |_| false)
     }
@@ -262,7 +262,7 @@ impl Frontend {
             self.stage = next.unwrap_or(stage);
         }
 
-        // Surface mapper loop closures (M6-2d) in the HUD: the corrected
+        // Surface mapper loop closures in the HUD: the corrected
         // keyframes/points are already in the published snapshot (the
         // map moved under us); annotate the status so the event shows.
         let lc = self.loops.load(std::sync::atomic::Ordering::Relaxed);
@@ -427,7 +427,7 @@ impl Frontend {
 
     /// `Stage::Tracking`: re-find map points, predict (constant
     /// velocity) + motion-only BA the pose, insert a keyframe per the
-    /// M5 policy, and publish. A weak/failed solve transitions to
+    /// keyframe policy, and publish. A weak/failed solve transitions to
     /// [`Stage::Lost`] without corrupting the map.
     fn track(
         &mut self,
@@ -489,11 +489,10 @@ impl Frontend {
                     }
                     st.frames_since_kf += 1;
                     let mut status = format!("tracking: {}/{} inliers", rep.n_inliers, obs.len());
-                    // Keyframe-insertion policy (M5): on a
-                    // healthy solve that has thinned vs the
-                    // reference or gone stale, promote this
-                    // frame to a keyframe (its tracked inliers
-                    // as observations) and hand it + its raw
+                    // Keyframe-insertion policy: on a healthy solve
+                    // that has thinned vs the reference or gone stale,
+                    // promote this frame to a keyframe (its tracked
+                    // inliers as observations) and hand it + its raw
                     // features to the local mapper.
                     if ginger_slam_core::map::needs_keyframe(
                         rep.n_inliers,
@@ -853,8 +852,8 @@ mod pipeline_tests {
         assert!(b.map.n_tracked >= TRACK_MIN_INLIERS as u32);
     }
 
-    /// M5: a longer sweep promotes keyframes and the local mapper grows
-    /// + locally-bundle-adjusts the map (the visible deliverable).
+    /// A longer sweep promotes keyframes and the local mapper grows +
+    /// locally-bundle-adjusts the map (the visible deliverable).
     #[test]
     fn local_mapping_grows_keyframes_and_points() {
         let (pts, ds) = scene(180);
@@ -977,9 +976,9 @@ mod pipeline_tests {
         assert_eq!(lost.map.cameras.len(), traj);
     }
 
-    /// M6-2b: a long enough sweep self-trains the BoW vocabulary and
-    /// fills the place-recognition DB; a query then maps a place back to
-    /// a keyframe near it (earlier place → earlier keyframe).
+    /// A long enough sweep self-trains the BoW vocabulary and fills the
+    /// place-recognition DB; a query then maps a place back to a
+    /// keyframe near it (earlier place → earlier keyframe).
     #[test]
     fn place_db_self_trains_and_recognizes_place() {
         let (pts, ds) = scene(220);
@@ -1020,9 +1019,8 @@ mod pipeline_tests {
         assert_eq!(fe.place_query(&q_start, 5), hit_start);
     }
 
-    /// M6-2c: garbage frames lose the track (no map corruption); a
-    /// recognizable frame then relocalizes via BoW + PnP-RANSAC and
-    /// tracking resumes.
+    /// Garbage frames lose the track (no map corruption); a recognizable
+    /// frame then relocalizes via BoW + PnP-RANSAC and tracking resumes.
     #[test]
     fn relocalizes_after_track_loss() {
         let (pts, ds) = scene(220);
@@ -1107,16 +1105,16 @@ mod pipeline_tests {
         assert!(cont.map.cameras.len() > traj);
     }
 
-    /// M6-2d: the conservative loop-closure gates must NOT misfire on
-    /// ordinary forward motion (a false loop corrupts the map
-    /// irreversibly) — and the wiring runs end-to-end, deterministically,
-    /// without corrupting the map. Closure *efficacy* on a genuinely
-    /// drifted loop is gated by the slam-core unit tests
+    /// The conservative loop-closure gates must NOT misfire on ordinary
+    /// forward motion (a false loop corrupts the map irreversibly) —
+    /// and the wiring runs end-to-end, deterministically, without
+    /// corrupting the map. Closure *efficacy* on a genuinely drifted
+    /// loop is gated by the slam-core unit tests
     /// (`sim3::optimize_pose_graph` / `sim3_ransac`); the synthetic
     /// harness (frame-stable descriptors + whole-map matching) shares
     /// points across a revisit so it can't manufacture the drift a
-    /// closing loop needs (a known synthetic-harness limit, like the M3
-    /// caveat).
+    /// closing loop needs (a known synthetic-harness limit, like the
+    /// two-view init caveat).
     #[test]
     fn loop_closing_gated_and_no_false_positive() {
         let run = || {

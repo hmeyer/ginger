@@ -120,10 +120,8 @@ async fn slam_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Top-down map (poses + points) for the WebUI canvas. **M2 stub:**
-/// Top-down map (two-view bootstrap) for the WebUI canvas: triangulated
-/// points + the two camera centres, or an init-status string while
-/// parallax accumulates.
+/// Top-down map for the WebUI canvas: keyframe poses + map points (or
+/// an init-status string while two-view bootstrap parallax accumulates).
 async fn slam_map(State(st): State<AppState>) -> impl IntoResponse {
     Json(st.map.read().unwrap().clone())
 }
