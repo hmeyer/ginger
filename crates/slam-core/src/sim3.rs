@@ -1,5 +1,5 @@
-//! Sim(3) similarity group + Essential-graph pose-graph optimization
-//! (M6-1c): the loop-closure correction stage.
+//! Sim(3) similarity group + Essential-graph pose-graph optimization:
+//! the loop-closure correction stage.
 //!
 //! Monocular SLAM has no metric scale and it *drifts*, so when a loop is
 //! detected the two ends of the trajectory disagree by a **similarity**
@@ -20,11 +20,9 @@
 //!   difference Jacobians, accept/reject, gauge-fixed), the same numeric
 //!   style as `local_ba`/`tracking`.
 //!
-//! Deferred to M6-2 wiring: building the edge set from [`crate::map`]'s
-//! spanning tree/covisibility and running this after a BoW + PnP/Sim3
-//! verified loop. Dense normal equations are adequate at keyframe-graph
-//! sizes (it runs rarely, off the tracking core); a sparse solver is a
-//! later perf step if measured.
+//! Dense normal equations are adequate at keyframe-graph sizes (it runs
+//! rarely, off the tracking core); a sparse solver is a later perf step
+//! if measured.
 
 use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Vector3};
 use rand::{RngExt, SeedableRng, rngs::SmallRng};

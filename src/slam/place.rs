@@ -1,5 +1,5 @@
-//! Place-recognition database wiring (M6-2b): the shared BoW index that
-//! relocalization (M6-2c) and loop detection (M6-2d) query.
+//! Place-recognition database wiring: the shared BoW index that
+//! relocalization and loop detection query.
 //!
 //! Owns the [`Vocabulary`] + a keyframe [`Database`]. The vocabulary is
 //! resolved like the `slam.toml` intrinsics prior: a shipped

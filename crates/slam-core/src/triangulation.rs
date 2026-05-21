@@ -1,13 +1,13 @@
-//! Gated two-view triangulation (M5-1c): turn a calibrated
-//! correspondence between two keyframes into a world point, *only* if it
-//! is geometrically trustworthy.
+//! Gated two-view triangulation: turn a calibrated correspondence
+//! between two keyframes into a world point, *only* if it is
+//! geometrically trustworthy.
 //!
 //! Camera-free; calibrated/normalized observations and `T_cw` poses
 //! (same contract as `twoview`/`tracking`/`local_ba`). The local mapper
-//! (M5-2) calls this for inter-keyframe correspondences that aren't yet
-//! map points; the gates (positive depth in *both* views, enough
-//! parallax, low symmetric reprojection error) keep degenerate /
-//! low-parallax matches out of the map.
+//! calls this for inter-keyframe correspondences that aren't yet map
+//! points; the gates (positive depth in *both* views, enough parallax,
+//! low symmetric reprojection error) keep degenerate / low-parallax
+//! matches out of the map.
 
 use nalgebra::{Isometry3, Matrix4, Vector2, Vector3};
 

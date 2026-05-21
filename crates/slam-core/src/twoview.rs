@@ -1,4 +1,4 @@
-//! Two-view monocular initialization geometry (M3).
+//! Two-view monocular initialization geometry.
 //!
 //! Camera-free and operating on **calibrated/normalized** image points
 //! (`x = X/Z, y = Y/Z`; the caller undistorts + unprojects pixels via

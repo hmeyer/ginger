@@ -1,11 +1,11 @@
-//! Bag-of-Words place recognition (M6-1a): a binary-descriptor visual
+//! Bag-of-Words place recognition: a binary-descriptor visual
 //! vocabulary + TF-IDF image vectors + an inverted-index database.
 //!
-//! This is the retrieval primitive M6 is built on — relocalization on
-//! track loss and loop detection both reduce to "given this image, which
-//! earlier keyframe is the same place?". Brute-force matching every
-//! keyframe is too slow on the Pi 4 once the map has hundreds of them;
-//! BoW turns it into a sparse vector compare over an inverted index.
+//! This is the retrieval primitive relocalization and loop detection are
+//! built on — both reduce to "given this image, which earlier keyframe
+//! is the same place?". Brute-force matching every keyframe is too slow
+//! on the Pi 4 once the map has hundreds of them; BoW turns it into a
+//! sparse vector compare over an inverted index.
 //!
 //! DBoW2-style and deliberately Pi-cheap (bitwise Hamming, no BLAS, no
 //! float-heavy clustering — binary BoW fits the ARMv8.0,
@@ -20,13 +20,8 @@
 //! [`BowVector`]; [`BowVector::score`] is the DBoW2 L1 similarity in
 //! `[0, 1]`. A [`Database`] keeps per-entry vectors + a word→entries
 //! inverted index so [`Database::query`] only scores keyframes that
-//! share a (rare) word.
-//!
-//! Scope of M6-1a: vocabulary, transform, scoring, database. The
-//! *direct index* (word→features, to accelerate the geometric
-//! verification that must follow any BoW hit) and on-disk vocabulary
-//! (de)serialization are deferred to the M6-2 wiring, where the
-//! frontend's guided-matching + asset-loading needs pin their shape.
+//! share a (rare) word, plus a *direct index* (word→features) that
+//! accelerates the geometric verification following a BoW hit.
 
 use std::collections::{HashMap, HashSet};
 

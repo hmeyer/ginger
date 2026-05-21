@@ -20,7 +20,7 @@ pub(crate) const INTRINSICS_PATH: &str = "slam.toml";
 
 /// Active camera intrinsics, surfaced to the WebUI so the calibration
 /// state (and the `UNVERIFIED` rev 1.3 prior) is visible, not buried in
-/// logs. This is M2's only user-facing output — M2 ships no SLAM yet.
+/// logs.
 #[derive(Clone, Serialize)]
 pub struct IntrinsicsView {
     pub fx: f32,
@@ -107,7 +107,7 @@ pub struct SlamSnapshot {
     pub points: Vec<FeaturePoint>,
     /// BRIEF correspondences to the previous frame's features.
     pub matches: Vec<Match>,
-    /// Active camera intrinsics + calibration state (M2 surface).
+    /// Active camera intrinsics + calibration state.
     pub intrinsics: IntrinsicsView,
 }
 

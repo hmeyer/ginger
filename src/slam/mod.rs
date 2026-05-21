@@ -1,10 +1,10 @@
-//! Visual SLAM frontend (ORB-SLAM-style), built up in milestones.
+//! Visual SLAM frontend (ORB-SLAM-style).
 //!
-//! **M6 (current): relocalization + loop closing.** A dedicated thread
-//! consumes the camera independently of the H.264/WebRTC path, builds a
-//! grayscale pyramid, runs FAST-9 per level (NMS + grid-spread cap),
-//! computes intensity-centroid orientation + a steered 256-bit BRIEF
-//! descriptor, and feeds the [`Frontend`] state machine:
+//! A dedicated thread consumes the camera independently of the
+//! H.264/WebRTC path, builds a grayscale pyramid, runs FAST-9 per level
+//! (NMS + grid-spread cap), computes intensity-centroid orientation + a
+//! steered 256-bit BRIEF descriptor, and feeds the [`Frontend`] state
+//! machine:
 //! accumulate parallax vs an anchor → two-view init
 //! ([`ginger_slam_core::twoview`]) → per-frame tracking
 //! (constant-velocity + motion-only BA, [`ginger_slam_core::tracking`])

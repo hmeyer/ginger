@@ -214,7 +214,7 @@ fn run_camera(
     let width = cfgs.get(0).unwrap().get_size().width;
     let height = cfgs.get(0).unwrap().get_size().height;
 
-    // SLAM M2: the intrinsics prior assumes this ViewFinder stream is a
+    // The SLAM intrinsics prior assumes this ViewFinder stream is a
     // full-FOV downscale (FOV-derivation is then resolution-agnostic),
     // not a center crop. Log the negotiated mode so that assumption is
     // visible/auditable; a crop would need fx/fy from the full-res

@@ -1,4 +1,4 @@
-//! Local bundle adjustment (M5-1b): jointly refine a window of keyframe
+//! Local bundle adjustment: jointly refine a window of keyframe
 //! poses + the map points they observe to minimise robust reprojection
 //! error.
 //!

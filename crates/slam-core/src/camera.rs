@@ -3,7 +3,8 @@
 //! `project` maps a point in the camera frame to a distorted pixel;
 //! `unproject` maps a pixel back to a unit bearing; `undistort_point`
 //! maps a distorted pixel to the ideal pinhole pixel it would have had
-//! with zero distortion (what M3+ geometry consumes). The distortion
+//! with zero distortion (what the calibrated geometry consumes). The
+//! distortion
 //! inverse has no closed form, so the two backward maps iterate
 //! (Newton-free fixed point — the standard OpenCV scheme); it converges
 //! in a handful of steps for sane lens coefficients.
