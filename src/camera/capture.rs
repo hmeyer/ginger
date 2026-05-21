@@ -50,38 +50,6 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
-impl Frame {
-    /// Convert YUYV to packed RGB (3 bytes per pixel, row-major).
-    pub fn to_rgb(&self) -> Vec<u8> {
-        let (w, h) = (self.width as usize, self.height as usize);
-        let mut rgb = vec![0u8; w * h * 3];
-        for (i, chunk) in self.data[..w * h * 2].chunks_exact(4).enumerate() {
-            let (y0, u, y1, v) = (
-                chunk[0] as i32,
-                chunk[1] as i32,
-                chunk[2] as i32,
-                chunk[3] as i32,
-            );
-            for (j, &y) in [y0, y1].iter().enumerate() {
-                let base = (i * 2 + j) * 3;
-                rgb[base] = (y + 1402 * (v - 128) / 1000).clamp(0, 255) as u8;
-                rgb[base + 1] =
-                    (y - 344 * (u - 128) / 1000 - 714 * (v - 128) / 1000).clamp(0, 255) as u8;
-                rgb[base + 2] = (y + 1772 * (u - 128) / 1000).clamp(0, 255) as u8;
-            }
-        }
-        rgb
-    }
-
-    /// Write a binary PPM file (viewable without any extra library).
-    pub fn save_ppm(&self, path: &str) -> std::io::Result<()> {
-        let header = format!("P6\n{} {}\n255\n", self.width, self.height);
-        let mut out = header.into_bytes();
-        out.extend_from_slice(&self.to_rgb());
-        std::fs::write(path, out)
-    }
-}
-
 // ── Internal shared state ─────────────────────────────────────────────────────
 
 pub(crate) struct FrameState {

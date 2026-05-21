@@ -36,8 +36,6 @@ pub struct PlaceDb {
     entry_kf: Vec<u32>,
     /// `(kf, descriptors)` buffered until the vocabulary exists.
     pending: Vec<(u32, Vec<Descriptor>)>,
-    /// True if the vocabulary was loaded from disk (vs self-trained).
-    shipped: bool,
 }
 
 impl Default for PlaceDb {
@@ -59,7 +57,6 @@ impl PlaceDb {
             );
         }
         Self {
-            shipped: vocab.is_some(),
             vocab,
             db: Database::new(),
             entry_kf: Vec::new(),
@@ -139,10 +136,5 @@ impl PlaceDb {
             .into_iter()
             .map(|m| (self.entry_kf[m.id as usize], m.score))
             .collect()
-    }
-
-    /// Whether the active vocabulary came from a shipped asset.
-    pub fn is_shipped(&self) -> bool {
-        self.shipped
     }
 }

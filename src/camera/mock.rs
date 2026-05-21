@@ -13,8 +13,7 @@
 //!   matching has real work (smoke / CI default).
 //!
 //! Frames are emitted as YUYV (luma in the even bytes, neutral 128
-//! chroma) so `gray_from_yuyv` recovers the luma exactly and `to_rgb`
-//! renders grayscale.
+//! chroma) so `gray_from_yuyv` recovers the luma exactly.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
