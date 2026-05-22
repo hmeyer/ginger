@@ -7,5 +7,12 @@ fn main() {
         .map(|o| String::from_utf8(o.stdout).unwrap_or_default())
         .unwrap_or_default();
     println!("cargo:rustc-env=BUILD_TIME={}", ts.trim());
-    // No rerun-if-changed → build script always runs → timestamp always fresh
+    // Force this script to rerun every build so the timestamp stays
+    // fresh. Cargo's no-directive default is "rerun on package file
+    // change", which fingerprints incremental builds and silently
+    // stales BUILD_TIME (the WebUI then shows the timestamp of the
+    // last build that *triggered* the script, not the current one).
+    // Pointing rerun-if-changed at a path that doesn't exist opts into
+    // "rerun every time" — the documented escape hatch.
+    println!("cargo:rerun-if-changed=build.rs.always-rerun");
 }
