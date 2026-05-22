@@ -158,6 +158,35 @@ After that, `cargo build --release` is all you need to deploy — the running se
 journalctl --user -u ginger -f
 ```
 
+## Deploying CI builds (no on-Pi compile)
+
+Compiling on the Pi is slow. The [`RPi build`](.github/workflows/rpi-build.yml)
+workflow builds the release binary on a GitHub-hosted arm64 runner on every
+push to `main` (or via *Run workflow*) and uploads it as a `ginger-aarch64`
+artifact. The build runs in a Debian Trixie container so glibc and the
+pinned libcamera version match the Pi — the artifact is a drop-in binary.
+
+The Pi pulls it with `scripts/pull-binary.sh`: it downloads the latest
+successful build, verifies its SHA-256, and atomically installs it to
+`target/release/ginger` — which the `ginger-watch.path` unit detects,
+restarting the service. `scripts/install-service.sh` also installs a
+`ginger-pull.timer` that runs the pull every 5 minutes.
+
+Artifacts require authentication even on a public repo, so this needs a
+GitHub token with `Actions: read` access to `hmeyer/ginger` (a
+fine-grained PAT, or a classic token with the `repo` scope):
+
+```bash
+mkdir -p ~/.config/ginger
+install -m600 /dev/stdin ~/.config/ginger/gh-token   # paste token, Ctrl-D
+systemctl --user enable --now ginger-pull.timer      # if install-service.sh ran before the token existed
+bash scripts/pull-binary.sh                          # or pull on demand
+```
+
+`pull-binary.sh` needs `jq` and `unzip` (`sudo apt install jq unzip`). When
+the Pi's libcamera is upgraded, bump `LIBCAMERA_VERSION` in the workflow to
+match `dpkg -l libcamera0.7` so the linked ABI stays correct.
+
 ## Web interface
 
 The `ginger` binary serves a mobile-first control UI on port 8080:
