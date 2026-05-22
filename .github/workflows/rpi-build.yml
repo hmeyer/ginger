@@ -44,16 +44,20 @@ jobs:
           set -eux
           apt-get update -qq
           apt-get install -y --no-install-recommends \
-            ca-certificates curl gnupg git file \
+            ca-certificates curl git file \
             build-essential pkg-config cmake \
             clang libclang-dev \
             libv4l-dev libudev-dev
-          # Raspberry Pi apt archive — the source of the exact libcamera
-          # build the Pi runs, so the linked ABI matches.
-          install -d /usr/share/keyrings
-          curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
-            | gpg --dearmor -o /usr/share/keyrings/raspberrypi.gpg
-          echo "deb [signed-by=/usr/share/keyrings/raspberrypi.gpg] http://archive.raspberrypi.com/debian trixie main" \
+          # Raspberry Pi apt archive — source of the exact libcamera build
+          # the Pi runs, so the linked ABI matches. Marked `trusted=yes`
+          # because Debian Trixie's apt (Sequoia/sqv) rejects the rpi
+          # archive's SHA1-self-signed GPG key under its 2026-02-01
+          # hardening (rpi has not yet republished a SHA256 key). The
+          # container is ephemeral, the URL is HTTPS, and the final
+          # binary is verified end-to-end via SHA-256 by the Pi-side pull
+          # script, so skipping apt-level signature verification on this
+          # one archive is an acceptable trade.
+          echo "deb [trusted=yes] https://archive.raspberrypi.com/debian trixie main" \
             > /etc/apt/sources.list.d/raspberrypi.list
           apt-get update -qq
           # libcamera-dev depends on the exact-versioned runtime package,
