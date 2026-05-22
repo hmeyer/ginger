@@ -44,9 +44,11 @@ pub struct AppState {
     pub map: Arc<RwLock<MapSnapshot>>,
 }
 
-/// Build the router and serve forever on `0.0.0.0:8080`.
-pub async fn serve(state: AppState) {
-    let app = Router::new()
+/// Build the axum router (all routes + shared state). Split out from
+/// [`serve`] so the handlers can be exercised in-process by tests
+/// (`tower`'s `oneshot`) with no socket or camera hardware.
+pub fn router(state: AppState) -> Router {
+    Router::new()
         .route("/", get(serve_html))
         .route("/api/sensors/stream", get(sensor_stream))
         .route("/api/slam/stream", get(slam_stream))
@@ -58,11 +60,14 @@ pub async fn serve(state: AppState) {
         .route("/api/tilt", post(tilt))
         .route("/api/emote", post(emote))
         .route("/api/sensors/config", post(sensor_config))
-        .with_state(state);
+        .with_state(state)
+}
 
+/// Build the router and serve forever on `0.0.0.0:8080`.
+pub async fn serve(state: AppState) {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("Listening on http://0.0.0.0:8080");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, router(state)).await.unwrap();
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -179,4 +184,77 @@ async fn emote(State(st): State<AppState>) -> StatusCode {
 async fn sensor_config(State(st): State<AppState>, Json(b): Json<SensorConfig>) -> StatusCode {
     st.cmd_tx.send(Command::SetSensors(b)).await.ok();
     StatusCode::OK
+}
+
+/// In-process HTTP tests: drive the real router + handlers via `tower`'s
+/// `oneshot` — no socket, no camera hardware. Gated to the mock-camera
+/// build (`libcamera` off) so `AppState` is constructible headless;
+/// that is the configuration `cargo test --no-default-features` uses.
+#[cfg(all(test, not(feature = "libcamera")))]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use tower::ServiceExt; // `oneshot`
+
+    use crate::camera::Camera;
+    use crate::slam::{MapSnapshot, SlamSnapshot};
+
+    /// Exercise the read + control endpoints end-to-end: real router,
+    /// real handlers, real JSON serialization.
+    #[tokio::test]
+    async fn api_endpoints_respond() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(32);
+        let state = AppState {
+            cmd_tx,
+            sensors: Arc::new(RwLock::new(SensorSnapshot::initial())),
+            camera: Arc::new(Camera::new().expect("mock camera")),
+            slam: Arc::new(RwLock::new(SlamSnapshot::initial())),
+            map: Arc::new(RwLock::new(MapSnapshot::initial())),
+        };
+        // Distinctive values so the assertions check real serialization,
+        // not just the `initial()` defaults.
+        *state.map.write().unwrap() = MapSnapshot {
+            status: "tracking: 30/40 inliers".into(),
+            n_keyframes: 9,
+            loop_closures: 3,
+            bow_ready: true,
+            bow_words: 512,
+            ..MapSnapshot::initial()
+        };
+        let app = router(state);
+
+        // GET /api/slam/map — the snapshot the WebUI #map-stat HUD reads,
+        // including the debug-HUD fields added for it.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/slam/map").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "tracking: 30/40 inliers");
+        assert_eq!(v["n_keyframes"], 9);
+        assert_eq!(v["loop_closures"], 3);
+        assert_eq!(v["bow_ready"], true);
+        assert_eq!(v["bow_words"], 512);
+
+        // POST /api/stop — 200, and a Stop command reached the supervisor.
+        let resp = app
+            .clone()
+            .oneshot(Request::post("/api/stop").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Command::Stop)));
+
+        // GET / — the WebUI document is served.
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }

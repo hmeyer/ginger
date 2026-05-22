@@ -37,6 +37,10 @@ webrtc = "0.17"
 v4l = "0.14"
 libc = "0.2.186"
 
+[dev-dependencies]
+# In-process HTTP testing of the axum router (`tower`'s `oneshot`).
+tower = "0.5"
+
 # `libcamera` is the only system-coupled dep; making it an opt-out
 # default feature lets CI / dev machines build and run the full crate
 # (server, slam frontend, replay harness) headless with a mock camera,
