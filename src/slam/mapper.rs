@@ -370,9 +370,14 @@ impl LocalMapper {
 
         // Snapshot the keyframe graph (poses as Sim3, parents, covis) +
         // the Essential-graph edges, then optimize off-lock.
-        let (old, mut poses, edges, n) = {
+        let (old, mut poses, edges, n, origin) = {
             let m = self.map.lock().unwrap();
             let n = m.alive_keyframes().map(|k| k.id).max().unwrap_or(0) as usize + 1;
+            // Gauge-fix the oldest *alive* keyframe. Normally id 0, but
+            // after a re-bootstrap the original origin is tombstoned and
+            // the live component starts at a higher id — fixing a dead
+            // vertex would leave that component gauge-free.
+            let origin = m.alive_keyframes().map(|k| k.id).min().unwrap_or(0) as usize;
             let mut poses = vec![Sim3::identity(); n];
             for k in m.alive_keyframes() {
                 poses[k.id as usize] = Self::iso_to_sim3(&k.pose);
@@ -407,9 +412,9 @@ impl LocalMapper {
                     .then(&poses[c as usize].inverse()),
                 weight: LOOP_EDGE_WEIGHT,
             });
-            (poses.clone(), poses, edges, n)
+            (poses.clone(), poses, edges, n, origin)
         };
-        optimize_pose_graph(&mut poses, &edges, 0, PoseGraphOptions::default());
+        optimize_pose_graph(&mut poses, &edges, origin, PoseGraphOptions::default());
 
         // Write back: corrected keyframe poses + map points dragged by
         // the Sim3 correction of a reference observing keyframe.

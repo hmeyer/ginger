@@ -108,6 +108,17 @@ impl PlaceDb {
         }
     }
 
+    /// Drop every indexed keyframe — the relocalization / loop-closure
+    /// candidate set — for a fresh mapping session. The vocabulary is
+    /// deliberately *kept*: a trained quantizer stays valid for the new
+    /// session (and lets it relocalize without re-training); only the
+    /// keyframe database and the pre-vocabulary buffer are cleared.
+    pub fn reset(&mut self) {
+        self.db = Database::new();
+        self.entry_kf.clear();
+        self.pending.clear();
+    }
+
     fn add(&mut self, kf: u32, descs: &[Descriptor]) {
         let bow = self.vocab.as_ref().unwrap().transform(descs);
         self.db.add(bow);

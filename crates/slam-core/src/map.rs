@@ -247,6 +247,25 @@ impl Map {
             }
         }
     }
+
+    /// Empty the map for a fresh mapping session *without reindexing*:
+    /// tombstone every keyframe and point so all ids handed out so far
+    /// stay permanently retired. New inserts continue the monotonic id
+    /// space, so any stale id still held elsewhere (e.g. the local
+    /// mapper's raw-feature cache, or a BoW database entry) can never
+    /// collide with a freshly-inserted entity. Used when a lost track
+    /// gives up and re-bootstraps from scratch.
+    pub fn reset(&mut self) {
+        for k in &mut self.keyframes {
+            k.alive = false;
+            k.obs.clear();
+            k.parent = None;
+        }
+        for p in &mut self.points {
+            p.alive = false;
+            p.obs.clear();
+        }
+    }
 }
 
 /// Keyframe-insertion policy (ORB-SLAM-style, pure): insert when
@@ -375,6 +394,25 @@ mod tests {
                 .is_none()
         );
         assert_eq!(m.n_points(), before);
+    }
+
+    #[test]
+    fn reset_tombstones_without_reindexing() {
+        let mut m = sample();
+        assert_eq!((m.n_keyframes(), m.n_points()), (4, 4));
+        m.reset();
+        // Everything retired: no live entity, no covisibility.
+        assert_eq!((m.n_keyframes(), m.n_points()), (0, 0));
+        assert!(m.alive_keyframes().next().is_none());
+        assert!(m.alive_points().next().is_none());
+        assert!(m.keyframe(0).is_none() && m.point(0).is_none());
+        // Ids stay monotonic: a fresh keyframe gets id 4, not 0, so a
+        // stale id 0 held elsewhere can never alias the new entity.
+        let kf = m.add_keyframe(iso(1.0), vec![]);
+        assert_eq!(kf, 4);
+        let p = m.add_point(Vector3::new(0.0, 0.0, 5.0), [9; 32], kf, 0);
+        assert_eq!(p, 4);
+        assert_eq!((m.n_keyframes(), m.n_points()), (1, 1));
     }
 
     #[test]
