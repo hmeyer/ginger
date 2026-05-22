@@ -152,6 +152,14 @@ pub struct MapSnapshot {
     pub tracking: bool,
     /// Map points matched+inlier in the latest tracked frame.
     pub n_tracked: u32,
+    /// Alive keyframe count (debug HUD).
+    pub n_keyframes: u32,
+    /// Loop closures applied so far (debug HUD).
+    pub loop_closures: u64,
+    /// BoW vocabulary is trained — relocalization can run (debug HUD).
+    pub bow_ready: bool,
+    /// BoW vocabulary word count, 0 until trained (debug HUD).
+    pub bow_words: u32,
 }
 
 impl MapSnapshot {
@@ -166,6 +174,10 @@ impl MapSnapshot {
             r_h: 0.0,
             tracking: false,
             n_tracked: 0,
+            n_keyframes: 0,
+            loop_closures: 0,
+            bow_ready: false,
+            bow_words: 0,
         }
     }
 }
@@ -199,6 +211,7 @@ pub(crate) fn publish_map(
     let n = traj.len();
     let start = n.saturating_sub(MAX_TRAJECTORY);
     let cameras: Vec<[f32; 2]> = traj[start..].iter().map(centre).collect();
+    let n_keyframes = keyframes.len() as u32;
     MapSnapshot {
         status,
         model: model.into(),
@@ -209,6 +222,12 @@ pub(crate) fn publish_map(
         r_h,
         tracking: true,
         n_tracked,
+        n_keyframes,
+        // Owned by `Frontend::on_frame` — refreshed every frame, incl.
+        // while Lost/Bootstrapping when this builder is not called.
+        loop_closures: 0,
+        bow_ready: false,
+        bow_words: 0,
     }
 }
 

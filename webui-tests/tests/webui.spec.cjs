@@ -38,6 +38,20 @@ async function mockApi(page) {
     if (url === '/api/map/png') {
       return route.fulfill({ status: 200, contentType: 'image/png', body: TINY_PNG });
     }
+    if (url === '/api/slam/map') {
+      // The top-down SLAM map snapshot that feeds the #map-stat HUD.
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          status: 'tracking: 28/40 inliers',
+          model: 'essential',
+          points: [], cameras: [], keyframes: [],
+          n_points: 120, r_h: 0.4, tracking: true, n_tracked: 28,
+          n_keyframes: 7, loop_closures: 2, bow_ready: true, bow_words: 256,
+        }),
+      });
+    }
 
     if (req.method() === 'POST') {
       let body = null;
@@ -67,6 +81,19 @@ async function dragTo(page, selector, fx, fy) {
 
 const knobTransform = (page, sel) =>
   page.locator(`${sel} .joy-knob`).evaluate((el) => el.style.transform);
+
+test('slam HUD: map-stat shows tracking state and map counters', async ({ page }) => {
+  await mockApi(page);
+  await page.goto('/');
+  // Polled from /api/slam/map and rendered before the per-mode
+  // early-returns, so it is visible regardless of the feature mode.
+  const stat = page.locator('#map-stat');
+  await expect(stat).toContainText('TRACK');
+  await expect(stat).toContainText('kf:7');
+  await expect(stat).toContainText('pt:120');
+  await expect(stat).toContainText('loop:2');
+  await expect(stat).toContainText('bow:256w');
+});
 
 test('layout: joysticks replace the D-pad and sliders', async ({ page }) => {
   await mockApi(page);

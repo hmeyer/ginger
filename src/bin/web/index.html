@@ -53,6 +53,7 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.05em}
   border-radius:4px;font-size:.7rem;padding:2px 4px;cursor:pointer
 }
 #feat-stat{font-family:monospace;color:var(--dim);white-space:pre;line-height:1.35}
+#map-stat{font-family:monospace;color:#9cf;white-space:pre;line-height:1.35}
 
 /* Sensor strip — mobile only */
 #sensor-strip{
@@ -178,6 +179,7 @@ footer{
       <option value="map">map (M3)</option>
     </select>
     <span id="feat-stat">—</span>
+    <span id="map-stat" title="SLAM state · keyframes · map points · loop closures · BoW vocab">—</span>
   </div>
 
   <!-- Sidebar (inside cam-wrap so it sits beside camera on desktop) -->
@@ -744,6 +746,7 @@ startStream();
   const ctx    = canvas.getContext('2d');
   const modeSel = document.getElementById('feat-mode');
   const stat   = document.getElementById('feat-stat');
+  const mapStat = document.getElementById('map-stat');
   const mapCanvas = document.getElementById('slam-map');
   const mctx   = mapCanvas.getContext('2d');
   let snap = null;
@@ -778,6 +781,24 @@ startStream();
     canvas.style.height = bh + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, bw, bh);
+
+    // Debug HUD: SLAM state badge + map counters from /api/slam/map.
+    // Updated before the per-mode early-returns so it shows in every
+    // mode. The badge is derived from the status string — the tracking
+    // bool alone is stale while a lost track tries to relocalize.
+    {
+      const md = mapData;
+      const s = (md && md.status) || '';
+      const badge = /lost/.test(s) ? 'LOST'
+        : /relocaliz/.test(s) ? 'RELOC'
+        : /tracking|keyframe/.test(s) ? 'TRACK'
+        : 'INIT';
+      const kf = (md && md.n_keyframes) || 0;
+      const mp = (md && md.n_points) || 0;
+      const lc = (md && md.loop_closures) || 0;
+      const bow = md && md.bow_ready ? ((md.bow_words || 0) + 'w') : 'no';
+      mapStat.textContent = `${badge} kf:${kf} pt:${mp} loop:${lc} bow:${bow}`;
+    }
 
     // Top-down (x, z) two-view bootstrap map from /api/slam/map.
     if (mode === 'map') {
