@@ -279,6 +279,16 @@ impl Frontend {
             self.map.status = format!("{} · loop closed (#{lc})", self.map.status);
         }
 
+        // Debug-HUD counters: refreshed every frame so they stay
+        // accurate while Lost/Bootstrapping, when `publish_map` (which
+        // owns the geometry fields) is not called.
+        self.map.loop_closures = lc;
+        {
+            let p = self.place.lock().unwrap();
+            self.map.bow_ready = p.is_ready();
+            self.map.bow_words = p.vocab_words() as u32;
+        }
+
         self.prev = Some((points.to_vec(), descs.to_vec()));
         FrameOut {
             matches,
@@ -428,7 +438,11 @@ impl Frontend {
         }
         if want_anchor && next.is_none() {
             *anchor = Some((points.to_vec(), descs.to_vec()));
-            self.map.status = "anchor set — translate sideways for parallax".into();
+            // Two-view init needs translational parallax. The car is
+            // differential-drive (no strafing), but driving forward
+            // still parallaxes every off-axis point — only pure
+            // rotation yields none, so that is what we ask for.
+            self.map.status = "anchor set — drive forward for parallax".into();
         }
         next
     }
@@ -918,6 +932,9 @@ mod pipeline_tests {
         assert!(n_pts > init_pts, "map did not grow: {init_pts} → {n_pts}");
         // Published snapshot stays consistent + finite.
         assert_eq!(out.map.n_points as usize, n_pts);
+        // Debug-HUD counters mirror the live map.
+        assert_eq!(out.map.n_keyframes as usize, n_kf, "HUD keyframe count");
+        assert_eq!(out.map.loop_closures, fe.loop_closures(), "HUD loop count");
         assert!(out.map.keyframes.len() >= 3);
         assert!(
             out.map
@@ -1019,12 +1036,17 @@ mod pipeline_tests {
         let (pts, ds) = scene(220);
         let cam = cam_model();
         let mut fe = Frontend::new();
+        let mut tail = None;
         for i in 0..64 {
             let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.07));
-            step(&mut fe, &fp, &fd);
+            tail = Some(step(&mut fe, &fp, &fd));
         }
         let (ready, indexed) = fe.place_stats();
         assert!(ready, "vocabulary never self-trained");
+        // Debug-HUD BoW fields reflect the self-trained vocabulary.
+        let out = tail.unwrap();
+        assert!(out.map.bow_ready, "HUD bow_ready false after self-train");
+        assert!(out.map.bow_words > 0, "HUD bow_words zero after self-train");
         let (n_kf, _) = fe.map_stats();
         assert!(n_kf >= 6, "too few keyframes: {n_kf}");
         // Every alive keyframe is indexed (added in kf order, none culled).

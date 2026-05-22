@@ -69,6 +69,11 @@ impl PlaceDb {
         self.vocab.is_some()
     }
 
+    /// Word count of the trained vocabulary; 0 until one exists.
+    pub fn vocab_words(&self) -> usize {
+        self.vocab.as_ref().map_or(0, |v| v.len())
+    }
+
     /// Number of keyframes indexed in the database.
     pub fn len(&self) -> usize {
         self.db.len()
