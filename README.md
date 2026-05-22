@@ -81,7 +81,8 @@ scripts/
 The full monocular ORB-SLAM pipeline is implemented and on `main`:
 detection → two-view bootstrap → live 6-DoF tracking → decoupled local
 mapping (keyframes, triangulation, block-sparse Schur local BA) → BoW
-relocalization on track loss → BoW + Sim3 loop detection →
+relocalization on track loss (re-bootstrapping a fresh session if
+recovery keeps failing) → BoW + Sim3 loop detection →
 Essential-graph pose-graph correction, surfaced on the WebUI top-down
 canvas (trajectory + keyframes + points, snapping on loop closure) and
 gated by deterministic headless tests (`cargo test --workspace

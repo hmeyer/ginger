@@ -26,6 +26,10 @@ const COLLISION_STOP_CM: f32 = 30.0;
 const COLLISION_CLEAR_CM: f32 = 38.0;
 const POLL_PERIOD: Duration = Duration::from_millis(80);
 const DEAD_MAN_TIMEOUT: Duration = Duration::from_millis(500);
+// Battery-voltage low-pass: the raw ADC reading swings several percent
+// per poll from motor-load sag + ADC noise. At the ~12 Hz poll this
+// gives a ~1.5 s time constant — enough to settle the reported value.
+const BATT_EWMA_ALPHA: f32 = 0.05;
 
 // ── Pure safety helpers ───────────────────────────────────────────────────────
 
@@ -82,6 +86,11 @@ pub fn run(mut cmd_rx: mpsc::Receiver<Command>, sensors: Arc<RwLock<SensorSnapsh
     let mut obstacle_lock = false;
     // Previous US reading for TTC estimation
     let mut prev_us: Option<(f32, Instant)> = None;
+    // Low-pass-filtered battery voltage + the last percentage logged.
+    // The poll runs ~12×/s and the raw reading is noisy, so we filter
+    // the voltage and log only when the integer percentage changes.
+    let mut batt_v_ewma: Option<f32> = None;
+    let mut last_batt_pct: Option<u8> = None;
     // Last commanded bracket angles, mirrored into the snapshot so the
     // web UI can keep its camera joystick in sync.
     let mut cur_pan: f32 = 90.0;
@@ -139,7 +148,15 @@ pub fn run(mut cmd_rx: mpsc::Receiver<Command>, sensors: Arc<RwLock<SensorSnapsh
         }
 
         // ── Normal sensor poll ────────────────────────────────────────────────
-        let battery_v = car.battery_v().unwrap_or(0.0);
+        // Low-pass the noisy battery reading; skip failed reads so a
+        // transient zero can't yank the filtered average down.
+        if let Ok(v) = car.battery_v() {
+            batt_v_ewma = Some(match batt_v_ewma {
+                Some(prev) => prev + BATT_EWMA_ALPHA * (v - prev),
+                None => v,
+            });
+        }
+        let battery_v = batt_v_ewma.unwrap_or(0.0);
         let (light_left, light_right) = if config.light {
             car.light()
                 .map(|(l, r)| (Some(l), Some(r)))
@@ -190,7 +207,13 @@ pub fn run(mut cmd_rx: mpsc::Receiver<Command>, sensors: Arc<RwLock<SensorSnapsh
         // longer estimates forward travel to auto-center it here.
 
         let battery_pct = battery_pct(battery_v);
-        info!("bat: {battery_v:.3} V  {battery_pct}%");
+        // Battery drains slowly; log only when the integer percentage
+        // moves so the journal stays readable (still catches every
+        // meaningful change). The live value is always in the snapshot.
+        if last_batt_pct != Some(battery_pct) {
+            info!("bat: {battery_v:.3} V  {battery_pct}%");
+            last_batt_pct = Some(battery_pct);
+        }
         *sensors.write().unwrap() = SensorSnapshot {
             battery_v,
             battery_pct,

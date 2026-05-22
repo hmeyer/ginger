@@ -47,6 +47,14 @@ const RELOC_COVIS: usize = 5;
 const RELOC_MAX_PTS: usize = 1500;
 const RELOC_MIN_INLIERS: usize = 15;
 
+/// A lost track that has not relocalized within this many frames gives
+/// up: the map is discarded and a fresh session is re-bootstrapped. This
+/// is also the *only* exit when the track was lost before the BoW
+/// vocabulary self-trained (fewer than `place::N_VOCAB_KF` keyframes
+/// existed) — without a vocabulary every relocalization query is empty,
+/// so staying `Lost` would hang in "relocalizing…" forever.
+const RELOC_MAX_FRAMES: usize = 30;
+
 /// Per-frame output of [`Frontend::on_frame`]: overlay match lines, the
 /// current intrinsics view + map snapshot, and the overlay-match wall
 /// time (ms) for the HUD `matching` stage.
@@ -339,7 +347,7 @@ impl Frontend {
                         // local mapper does not re-create them.
                         let mut a_assigned = vec![None; apts.len()];
                         let mut b_assigned = vec![None; points.len()];
-                        let (n, kf1) = {
+                        let (n, kf0, kf1) = {
                             let mut w = self.world.lock().unwrap();
                             let kf0 = w.add_keyframe(Isometry3::identity(), Vec::new());
                             let kf1 = w.add_keyframe(pose2, Vec::new());
@@ -366,10 +374,10 @@ impl Frontend {
                                     pi += 1;
                                 }
                             }
-                            (n, kf1)
+                            (n, kf0, kf1)
                         };
                         let _ = self.jobs.send(KeyframeJob {
-                            kf_id: 0,
+                            kf_id: kf0,
                             cam,
                             pts: apts.clone(),
                             descs: adesc.clone(),
@@ -678,10 +686,37 @@ impl Frontend {
                 )
             };
             next = Some(Stage::Tracking(tr));
+        } else if *since > RELOC_MAX_FRAMES {
+            // Recovery against the current map is not happening — and if
+            // the vocabulary never self-trained it never can. Discard
+            // the map and re-bootstrap a fresh session rather than hang
+            // in `Lost` forever.
+            warn!(
+                "slam: relocalization failed for {} frames — discarding \
+                 map, re-bootstrapping",
+                *since
+            );
+            self.reset_world();
+            self.map.status = format!(
+                "relocalization gave up after {} frames — re-initializing",
+                *since
+            );
+            next = Some(Stage::Bootstrapping { anchor: None });
         } else {
             self.map.status = format!("relocalizing… (lost {} frames)", *since);
         }
         next
+    }
+
+    /// Discard the current map for a fresh mapping session: tombstone
+    /// the shared [`Map`] and clear the BoW keyframe database, then reset
+    /// the published snapshot. Keyframe ids stay monotonic
+    /// ([`Map::reset`]), so the local mapper's stale raw-feature cache
+    /// cannot alias the re-bootstrapped map and is left to evict itself.
+    fn reset_world(&mut self) {
+        self.world.lock().unwrap().reset();
+        self.place.lock().unwrap().reset();
+        self.map = MapSnapshot::initial();
     }
 }
 
@@ -1103,6 +1138,80 @@ mod pipeline_tests {
             cont.map.status
         );
         assert!(cont.map.cameras.len() > traj);
+    }
+
+    /// A track lost *before* the BoW vocabulary self-trains (too few
+    /// keyframes) can never relocalize — there is no vocabulary to
+    /// query. Rather than hang in `Lost` forever, the frontend gives up
+    /// after `RELOC_MAX_FRAMES` and re-bootstraps a fresh session.
+    #[test]
+    fn unrecoverable_loss_rebootstraps_fresh_session() {
+        let (pts, ds) = scene(240);
+        let cam = cam_model();
+        let mut fe = Frontend::new();
+
+        // Initialize, then stop the moment tracking goes live — so few
+        // keyframes exist that the vocabulary cannot self-train.
+        let mut inited = false;
+        for i in 0..16 {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.08));
+            if step(&mut fe, &fp, &fd).map.tracking {
+                inited = true;
+                break;
+            }
+        }
+        assert!(inited, "never initialized");
+        let (ready, _) = fe.place_stats();
+        assert!(!ready, "precondition: vocabulary not yet self-trained");
+
+        // Garbage frames: the track is lost and stays lost — without a
+        // vocabulary relocalization is structurally impossible. The
+        // frontend must give up and announce a re-initialization.
+        let mut r = SmallRng::seed_from_u64(0x0BAD_F00D);
+        let mut gave_up = false;
+        for _ in 0..(RELOC_MAX_FRAMES + 8) {
+            let fd: Vec<brief::Descriptor> = (0..200)
+                .map(|_| {
+                    let mut d = [0u8; brief::DESC_BYTES];
+                    for b in d.iter_mut() {
+                        *b = r.random::<u8>();
+                    }
+                    d
+                })
+                .collect();
+            let fp: Vec<FeaturePoint> = (0..200)
+                .map(|i| FeaturePoint {
+                    x: (i % W) as u16,
+                    y: (i % H) as u16,
+                    level: 0,
+                    score: 1,
+                    angle: 0.0,
+                })
+                .collect();
+            let out = step(&mut fe, &fp, &fd);
+            if out.map.status.contains("re-initializing") {
+                // The map was discarded — snapshot back to a clean slate.
+                assert!(!out.map.tracking, "still 'tracking' after give-up");
+                assert!(out.map.cameras.is_empty() && out.map.points.is_empty());
+                gave_up = true;
+                break;
+            }
+        }
+        assert!(gave_up, "never re-bootstrapped after an unrecoverable loss");
+
+        // A fresh sideways sweep re-initializes from scratch and
+        // tracking resumes — the relocalizing deadlock is gone.
+        let mut reinit = false;
+        for i in 0..16 {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.08));
+            let out = step(&mut fe, &fp, &fd);
+            if out.map.tracking {
+                assert!(out.map.n_points > 20, "thin re-init: {}", out.map.n_points);
+                reinit = true;
+                break;
+            }
+        }
+        assert!(reinit, "did not re-initialize after re-bootstrap");
     }
 
     /// The conservative loop-closure gates must NOT misfire on ordinary
