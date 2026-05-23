@@ -181,6 +181,16 @@ pub struct MapSnapshot {
     /// signal for "the anchor keeps getting thrown away before
     /// parallax can grow".
     pub boot_anchor_resets: u32,
+    // ── Tracking-loss diagnostics ─────────────────────────────────────────
+    /// Last-known reason tracking went `Stage::Lost` (e.g.
+    /// "only 9 map matches", "weak 4/13 inliers", "solve failed").
+    /// Sticky across the Lost/relocalizing window — the relocalize
+    /// status string normally overwrites the loss reason within one
+    /// frame, hiding it from a polling debug client.
+    pub last_lost_reason: String,
+    /// Cumulative count of times tracking has been lost since the
+    /// process started.
+    pub n_lost: u32,
 }
 
 impl MapSnapshot {
@@ -204,6 +214,8 @@ impl MapSnapshot {
             boot_min_disp_px: 0.0,
             boot_anchor_age: 0,
             boot_anchor_resets: 0,
+            last_lost_reason: String::new(),
+            n_lost: 0,
         }
     }
 }
@@ -260,6 +272,10 @@ pub(crate) fn publish_map(
         boot_min_disp_px: 0.0,
         boot_anchor_age: 0,
         boot_anchor_resets: 0,
+        // Loss diagnostics are owned by `Frontend::on_frame` and not
+        // touched by this builder — leave them empty / zero.
+        last_lost_reason: String::new(),
+        n_lost: 0,
     }
 }
 

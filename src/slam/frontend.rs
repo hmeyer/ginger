@@ -143,6 +143,14 @@ pub struct Frontend {
     loops: Arc<std::sync::atomic::AtomicU64>,
     /// Last `loops` value folded into the status line.
     last_loops: u64,
+    /// Last reason tracking went `Stage::Lost`. Persisted across the
+    /// Lost/relocalizing window (which otherwise overwrites the
+    /// transient loss message in `map.status` within one frame), so a
+    /// polling debug client can read why we lost without racing the
+    /// frame loop.
+    last_lost_reason: String,
+    /// Cumulative tracking losses since process start (debug HUD).
+    n_lost: u32,
 }
 
 impl Default for Frontend {
@@ -174,6 +182,8 @@ impl Frontend {
             place,
             loops,
             last_loops: 0,
+            last_lost_reason: String::new(),
+            n_lost: 0,
         }
     }
 
@@ -304,6 +314,8 @@ impl Frontend {
         // accurate while Lost/Bootstrapping, when `publish_map` (which
         // owns the geometry fields) is not called.
         self.map.loop_closures = lc;
+        self.map.last_lost_reason = self.last_lost_reason.clone();
+        self.map.n_lost = self.n_lost;
         {
             let p = self.place.lock().unwrap();
             self.map.bow_ready = p.is_ready();
@@ -600,18 +612,20 @@ impl Frontend {
                     };
                 }
                 Some(rep) => {
-                    self.map.status = format!(
-                        "tracking lost: weak {}/{} inliers — relocalizing",
-                        rep.n_inliers,
-                        obs.len()
-                    );
+                    let reason = format!("weak {}/{} inliers", rep.n_inliers, obs.len());
+                    self.map.status = format!("tracking lost: {reason} — relocalizing");
+                    self.last_lost_reason = reason;
+                    self.n_lost += 1;
                     next = Some(Stage::Lost {
                         since: 0,
                         track: st.clone(),
                     });
                 }
                 None => {
-                    self.map.status = "tracking lost (solve failed) — relocalizing".into();
+                    let reason = "solve failed".to_string();
+                    self.map.status = format!("tracking lost: {reason} — relocalizing");
+                    self.last_lost_reason = reason;
+                    self.n_lost += 1;
                     next = Some(Stage::Lost {
                         since: 0,
                         track: st.clone(),
@@ -619,10 +633,10 @@ impl Frontend {
                 }
             }
         } else {
-            self.map.status = format!(
-                "tracking lost: only {} map matches — relocalizing",
-                mm.len()
-            );
+            let reason = format!("only {} map matches", mm.len());
+            self.map.status = format!("tracking lost: {reason} — relocalizing");
+            self.last_lost_reason = reason;
+            self.n_lost += 1;
             next = Some(Stage::Lost {
                 since: 0,
                 track: st.clone(),
