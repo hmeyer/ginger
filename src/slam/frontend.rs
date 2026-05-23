@@ -31,9 +31,30 @@ use super::snapshot::{
 // frame, and enough median pixel parallax (fraction of image width) so
 // the geometry is well-conditioned. Below the floor the anchor is stale
 // (scene changed) and is reset to the current frame.
+//
+// Values tuned 2026-05-23 from a live forward-drive bootstrap trace
+// (see `/tmp/slam-trace.csv` in the SLAM debug session). Two issues
+// the prior values (0.04 / 25) made unfixable on this hardware:
+//
+// * **Parallax gate**: a 1-second forward pulse (~25 cm) at 35% duty
+//   produces a median disparity of only ~20–26 px against a same-
+//   session anchor. The old 0.04 × 800 = 32 px gate was unreachable in
+//   any single pulse, and longer pulses run into the second issue
+//   below before the gate can be crossed. 0.025 (20 px) is well within
+//   the well-conditioned range the literature uses for monocular init
+//   and is reached reliably in the trace.
+// * **Anchor dead zone**: as the car drives forward, descriptor
+//   matches against the anchor decay from ~325 down through ~80; once
+//   below INIT_MIN_MATCHES the parallax branch can no longer run, but
+//   with the floor at 25 the anchor stayed alive for seconds in a
+//   useless mid-range — *exactly* during the motion that was supposed
+//   to trigger init. Raising the floor to half of INIT_MIN_MATCHES
+//   forces a fresh anchor as soon as the match quality dips out of
+//   the parallax-measurable range, so the next pulse re-anchors and
+//   accumulates parallax against a frame that still correlates well.
 const INIT_MIN_MATCHES: usize = 80;
-const INIT_MIN_DISP_FRAC: f32 = 0.04;
-const ANCHOR_RESET_MATCHES: usize = 25;
+const INIT_MIN_DISP_FRAC: f32 = 0.025;
+const ANCHOR_RESET_MATCHES: usize = 40;
 
 // Tracking gates: min map-point matches to attempt a pose solve, and
 // min reprojection inliers for the refined pose to be trusted.
