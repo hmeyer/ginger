@@ -36,6 +36,9 @@ rayon = "1"
 webrtc = "0.17"
 v4l = "0.14"
 libc = "0.2.186"
+# Tiny pure-Rust JPEG encoder for /api/camera/frame (debug stills).
+# Pure-Rust → no system libjpeg dep, works in the CI container as-is.
+jpeg-encoder = "0.6"
 
 [dev-dependencies]
 # In-process HTTP testing of the axum router (`tower`'s `oneshot`).

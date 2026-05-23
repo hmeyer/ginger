@@ -12,7 +12,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -22,6 +22,7 @@ use axum::{
 };
 use futures::Stream;
 use log::warn;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -53,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sensors/stream", get(sensor_stream))
         .route("/api/slam/stream", get(slam_stream))
         .route("/api/slam/map", get(slam_map))
+        .route("/api/camera/frame", get(camera_frame))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -129,6 +131,72 @@ async fn slam_stream(
 /// an init-status string while two-view bootstrap parallax accumulates).
 async fn slam_map(State(st): State<AppState>) -> impl IntoResponse {
     Json(st.map.read().unwrap().clone())
+}
+
+// ── Camera frame still ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CameraFrameParams {
+    /// Output width in pixels (height follows source aspect ratio).
+    #[serde(default = "default_frame_w")]
+    w: u32,
+    /// JPEG quality 1..=100.
+    #[serde(default = "default_frame_q")]
+    q: u8,
+}
+fn default_frame_w() -> u32 {
+    320
+}
+fn default_frame_q() -> u8 {
+    70
+}
+
+/// Single grayscale JPEG of the most recent camera frame. Sized for
+/// debug/diagnostic use (a few KB at default 320 px) — answers "is the
+/// path clear?" without negotiating WebRTC. Pulls the Y plane straight
+/// out of YUYV with nearest-neighbor downscale; no extra camera load.
+async fn camera_frame(State(st): State<AppState>, Query(p): Query<CameraFrameParams>) -> Response {
+    let Some(frame) = st.camera.try_frame() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            "camera frame not ready",
+        )
+            .into_response();
+    };
+    let w_out = p.w.clamp(16, frame.width);
+    let h_out = ((w_out as u64 * frame.height as u64) / frame.width as u64).max(1) as u32;
+    let q = p.q.clamp(10, 100);
+
+    // Y plane lives at even bytes within the YUYV row (Y0 U Y1 V repeats).
+    let stride = (frame.width as usize) * 2;
+    let mut gray = vec![0u8; (w_out as usize) * (h_out as usize)];
+    for y in 0..h_out {
+        let y_src = ((y as u64 * frame.height as u64) / h_out as u64) as usize;
+        let row_in = y_src * stride;
+        let row_out = (y as usize) * (w_out as usize);
+        for x in 0..w_out {
+            let x_src = ((x as u64 * frame.width as u64) / w_out as u64) as usize;
+            gray[row_out + x as usize] = frame.data[row_in + x_src * 2];
+        }
+    }
+
+    let mut buf = Vec::with_capacity(gray.len() / 2);
+    if let Err(e) = jpeg_encoder::Encoder::new(&mut buf, q).encode(
+        &gray,
+        w_out as u16,
+        h_out as u16,
+        jpeg_encoder::ColorType::Luma,
+    ) {
+        warn!("camera_frame: jpeg encode failed: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("jpeg encode: {e}"),
+        )
+            .into_response();
+    }
+
+    ([(header::CONTENT_TYPE, "image/jpeg")], buf).into_response()
 }
 
 // ── WebRTC signalling ─────────────────────────────────────────────────────────
@@ -252,9 +320,40 @@ mod tests {
 
         // GET / — the WebUI document is served.
         let resp = app
+            .clone()
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET /api/camera/frame — returns a tiny JPEG of the mock frame.
+        // We assert content-type + SOI/EOI markers; not bit-exact bytes
+        // because the encoder output can shift across versions, but the
+        // JPEG container framing is stable.
+        let resp = app
+            .oneshot(
+                Request::get("/api/camera/frame?w=64&q=70")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/jpeg"),
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.len() > 4, "jpeg body too short: {} bytes", body.len());
+        assert_eq!(&body[..2], &[0xff, 0xd8], "missing JPEG SOI marker");
+        assert_eq!(
+            &body[body.len() - 2..],
+            &[0xff, 0xd9],
+            "missing JPEG EOI marker"
+        );
     }
 }

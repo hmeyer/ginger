@@ -229,6 +229,16 @@ Features:
 
 The UI is mobile-first: on phones it stacks camera → scrollable sensor strip → footer controls. On screens ≥ 700 px it switches to a camera + sidebar layout.
 
+### Diagnostic endpoints
+
+- `GET /api/camera/frame?w=320&q=70` → single grayscale JPEG of the
+  most recent frame (~5 KB at defaults). Useful for headless "is the
+  path clear?" checks without negotiating WebRTC. `w` clamps to the
+  source width; `q` is JPEG quality 10..100. Returns 503 with
+  `Retry-After: 1` before the first frame.
+- `GET /api/slam/map` → JSON snapshot: tracking state, init/parallax
+  status string, keyframe and map-point counts, BoW state.
+
 ## Camera
 
 The `Camera` struct runs a background thread that continuously captures YUYV frames from the OV5647. Frames are published behind an `Arc` — callers either poll or block:

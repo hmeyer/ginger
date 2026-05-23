@@ -133,6 +133,14 @@ impl Camera {
         self.shared.0.lock().unwrap().frame.clone().unwrap()
     }
 
+    /// Like [`get_frame`], but returns `None` if no frame has been
+    /// captured yet instead of panicking. Used by handlers that want
+    /// to answer with a 503 during the (tiny) window before the first
+    /// capture, rather than crash the request.
+    pub fn try_frame(&self) -> Option<Arc<Frame>> {
+        self.shared.0.lock().unwrap().frame.clone()
+    }
+
     /// Block until the next new frame arrives, then return it.
     pub fn wait_frame(&self) -> Arc<Frame> {
         let (lock, cvar) = &*self.shared;
