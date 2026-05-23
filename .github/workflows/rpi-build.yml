@@ -25,12 +25,10 @@ env:
   # OS Trixie). The deployed binary dynamically links libcamera, whose
   # ABI / soname is version-specific, so the build must link the *same*
   # build the Pi runs. Keep this equal to `dpkg -l libcamera0.7` on the
-  # Pi; bump it (and redeploy) whenever the Pi's libcamera is upgraded.
-  #
-  # If this exact version has rotated out of the Raspberry Pi apt pool the
-  # install step fails loudly — bump the pin to the Pi's current version
-  # (or `apt full-upgrade` the Pi to a version still in the pool).
-  LIBCAMERA_VERSION: 0.7.0+rpt20260205-1
+  # Pi; bump it (and `sudo apt full-upgrade` the Pi) whenever the rpi
+  # apt pool rotates — it drops dated builds quickly, so the Pi and this
+  # pin must move together or the install step below 404s.
+  LIBCAMERA_VERSION: 0.7.1+rpt20260429-1
 
 jobs:
   build:
