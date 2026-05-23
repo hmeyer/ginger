@@ -817,21 +817,41 @@ impl Frontend {
             };
             next = Some(Stage::Tracking(tr));
         } else if *since > RELOC_MAX_FRAMES {
-            // Recovery against the current map is not happening — and if
-            // the vocabulary never self-trained it never can. Discard
-            // the map and re-bootstrap a fresh session rather than hang
-            // in `Lost` forever.
-            warn!(
-                "slam: relocalization failed for {} frames — discarding \
-                 map, re-bootstrapping",
-                *since
-            );
-            self.reset_world();
-            self.map.status = format!(
-                "relocalization gave up after {} frames — re-initializing",
-                *since
-            );
-            next = Some(Stage::Bootstrapping { anchor: None });
+            // Two regimes:
+            //
+            // * **Vocabulary never trained** (< N_VOCAB_KF keyframes
+            //   reached before the loss): every BoW query is empty, so
+            //   no amount of waiting can recover. Discard the map and
+            //   re-bootstrap a fresh session rather than hang in `Lost`
+            //   forever.
+            // * **Vocabulary is trained**: the keyframes + place DB are
+            //   a real, usable map. The user may have swung the camera
+            //   into unmapped scenery (the failure mode the 2026-05-23
+            //   trace surfaced: a 36° turn after a 5-keyframe init).
+            //   Destroying the map here is exactly the bug the user
+            //   reported. Stay `Lost` and keep querying — if the camera
+            //   ever swings back into view, reloc picks it up; if not,
+            //   the loss is at least *visible* to the operator instead
+            //   of silently erasing minutes of mapping.
+            let bow_ready = self.place.lock().unwrap().is_ready();
+            if bow_ready {
+                self.map.status = format!(
+                    "relocalizing… (lost {} frames, map preserved — swing camera back to mapped area)",
+                    *since
+                );
+            } else {
+                warn!(
+                    "slam: relocalization failed for {} frames (no vocabulary) \
+                     — discarding map, re-bootstrapping",
+                    *since
+                );
+                self.reset_world();
+                self.map.status = format!(
+                    "relocalization gave up after {} frames — re-initializing",
+                    *since
+                );
+                next = Some(Stage::Bootstrapping { anchor: None });
+            }
         } else {
             self.map.status = format!("relocalizing… (lost {} frames)", *since);
         }
