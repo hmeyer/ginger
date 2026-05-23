@@ -356,6 +356,20 @@ impl Frontend {
             self.map.bow_ready = p.is_ready();
             self.map.bow_words = p.vocab_words() as u32;
         }
+        // Tracking-loss timer: surface the frame count + the active
+        // give-up budget while `Stage::Lost` so the WebUI can render a
+        // countdown to re-bootstrap. Zero when not lost.
+        (self.map.lost_frames, self.map.lost_budget_frames) = match &self.stage {
+            Stage::Lost { since, .. } => {
+                let budget = if self.map.bow_ready {
+                    RELOC_MAX_FRAMES_BOW
+                } else {
+                    RELOC_MAX_FRAMES
+                };
+                (*since as u32, budget as u32)
+            }
+            _ => (0, 0),
+        };
 
         self.prev = Some((points.to_vec(), descs.to_vec()));
         FrameOut {
@@ -1456,6 +1470,86 @@ mod pipeline_tests {
             }
         }
         assert!(reinit, "did not re-initialize after re-bootstrap");
+    }
+
+    /// While `Stage::Lost`, the snapshot must expose a frame-budget the
+    /// WebUI can render as a countdown to re-bootstrap, and it must zero
+    /// out once the map is discarded and a fresh session begins.
+    #[test]
+    fn reboot_timer_surfaces_while_lost_and_clears_after_giveup() {
+        let (pts, ds) = scene(240);
+        let cam = cam_model();
+        let mut fe = Frontend::new();
+
+        // Bring tracking live. While Tracking, the timer must be zero.
+        let mut inited = false;
+        let mut last = None;
+        for i in 0..16 {
+            let (fp, fd) = frame(&pts, &ds, &cam, &pose(i as f64 * 0.08));
+            let out = step(&mut fe, &fp, &fd);
+            last = Some(out.map.clone());
+            if out.map.tracking {
+                inited = true;
+                break;
+            }
+        }
+        assert!(inited, "never initialized");
+        let m = last.unwrap();
+        assert_eq!(m.lost_frames, 0, "timer should be zero while tracking");
+        assert_eq!(m.lost_budget_frames, 0);
+
+        // Garbage frames push past the soft-lost grace into Lost; the
+        // timer should be live and racing the budget. Budget matches the
+        // no-BoW timeout (vocabulary did not self-train this fast).
+        let mut r = SmallRng::seed_from_u64(0xCAFEBABE);
+        let mut saw_live_timer = false;
+        let mut saw_giveup = false;
+        for _ in 0..(RELOC_MAX_FRAMES + 8) {
+            let fd: Vec<brief::Descriptor> = (0..200)
+                .map(|_| {
+                    let mut d = [0u8; brief::DESC_BYTES];
+                    for b in d.iter_mut() {
+                        *b = r.random::<u8>();
+                    }
+                    d
+                })
+                .collect();
+            let fp: Vec<FeaturePoint> = (0..200)
+                .map(|i| FeaturePoint {
+                    x: (i % W) as u16,
+                    y: (i % H) as u16,
+                    level: 0,
+                    score: 1,
+                    angle: 0.0,
+                })
+                .collect();
+            let out = step(&mut fe, &fp, &fd);
+            if out.map.lost_frames > 0 {
+                assert!(
+                    out.map.lost_budget_frames >= out.map.lost_frames,
+                    "budget {} should not be below elapsed {}",
+                    out.map.lost_budget_frames,
+                    out.map.lost_frames,
+                );
+                assert_eq!(
+                    out.map.lost_budget_frames, RELOC_MAX_FRAMES as u32,
+                    "no-BoW lost should race the short budget",
+                );
+                saw_live_timer = true;
+            }
+            if out.map.status.contains("re-initializing") {
+                // Once the map is discarded the timer clears.
+                assert_eq!(
+                    out.map.lost_frames, 0,
+                    "timer should clear after re-bootstrap",
+                );
+                assert_eq!(out.map.lost_budget_frames, 0);
+                saw_giveup = true;
+                break;
+            }
+        }
+        assert!(saw_live_timer, "lost timer never surfaced while lost");
+        assert!(saw_giveup, "never re-bootstrapped");
     }
 
     /// The conservative loop-closure gates must NOT misfire on ordinary

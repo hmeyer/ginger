@@ -191,6 +191,16 @@ pub struct MapSnapshot {
     /// Cumulative count of times tracking has been lost since the
     /// process started.
     pub n_lost: u32,
+    /// Frames the frontend has been in `Stage::Lost` (zero otherwise).
+    /// Surfaced so the WebUI can render a "time-until-re-bootstrap"
+    /// countdown while relocalization is attempting recovery.
+    pub lost_frames: u32,
+    /// Active relocalization-give-up budget in frames (zero when not
+    /// `Lost`). Equals `RELOC_MAX_FRAMES` while the BoW vocabulary is
+    /// untrained, `RELOC_MAX_FRAMES_BOW` once trained — the value
+    /// `lost_frames` is racing against before the map is discarded
+    /// and a fresh session is bootstrapped.
+    pub lost_budget_frames: u32,
 }
 
 impl MapSnapshot {
@@ -216,6 +226,8 @@ impl MapSnapshot {
             boot_anchor_resets: 0,
             last_lost_reason: String::new(),
             n_lost: 0,
+            lost_frames: 0,
+            lost_budget_frames: 0,
         }
     }
 }
@@ -276,6 +288,8 @@ pub(crate) fn publish_map(
         // touched by this builder — leave them empty / zero.
         last_lost_reason: String::new(),
         n_lost: 0,
+        lost_frames: 0,
+        lost_budget_frames: 0,
     }
 }
 

@@ -797,7 +797,20 @@ startStream();
       const mp = (md && md.n_points) || 0;
       const lc = (md && md.loop_closures) || 0;
       const bow = md && md.bow_ready ? ((md.bow_words || 0) + 'w') : 'no';
-      mapStat.textContent = `${badge} kf:${kf} pt:${mp} loop:${lc} bow:${bow}`;
+      // While the frontend is `Stage::Lost`, append a countdown to the
+      // re-bootstrap deadline: frames spent lost / budget, plus an
+      // estimated seconds-remaining using the live frontend fps (falls
+      // back to 7.5 fps nominal before the stream warms up).
+      const lf = (md && md.lost_frames) || 0;
+      const bud = (md && md.lost_budget_frames) || 0;
+      let timer = '';
+      if (lf > 0 && bud > 0) {
+        const rem = Math.max(0, bud - lf);
+        const fps = (snap && snap.fps > 0.1) ? snap.fps : 7.5;
+        const secs = (rem / fps).toFixed(1);
+        timer = ` reboot:${lf}/${bud} (≈${secs}s)`;
+      }
+      mapStat.textContent = `${badge} kf:${kf} pt:${mp} loop:${lc} bow:${bow}${timer}`;
     }
 
     // Top-down (x, z) two-view bootstrap map from /api/slam/map.
