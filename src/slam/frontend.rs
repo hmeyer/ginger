@@ -729,10 +729,25 @@ impl Frontend {
             .unwrap()
             .query(descs, RELOC_MAX_CAND, |_| false);
         // Gather candidate map points (pos + descriptor) from
-        // the candidate keyframes + their covisible
-        // neighbours, bounded.
+        // the candidate keyframes + their covisible neighbours,
+        // bounded. When BoW has no candidates (vocabulary not yet
+        // self-trained, or just no covisible match for this view),
+        // fall back to *all* alive map points — for a thin-map
+        // session that was just lost, brute-force PnP-RANSAC against
+        // the full map gives a real chance to recover, instead of
+        // burning the timeout staring at an empty candidate set.
         let (cpos, cdesc) = if cands.is_empty() {
-            (Vec::new(), Vec::new())
+            let w = self.world.lock().unwrap();
+            let mut cpos: Vec<Vector3<f64>> = Vec::new();
+            let mut cdesc: Vec<brief::Descriptor> = Vec::new();
+            for p in w.alive_points() {
+                cpos.push(p.pos);
+                cdesc.push(p.desc);
+                if cpos.len() >= RELOC_MAX_PTS {
+                    break;
+                }
+            }
+            (cpos, cdesc)
         } else {
             let w = self.world.lock().unwrap();
             let mut seen = std::collections::HashSet::new();
@@ -817,57 +832,23 @@ impl Frontend {
             };
             next = Some(Stage::Tracking(tr));
         } else if *since > RELOC_MAX_FRAMES {
-            // Two regimes:
-            //
-            // * **Vocabulary never trained** (< N_VOCAB_KF keyframes
-            //   reached before the loss): every BoW query is empty, so
-            //   no amount of waiting can recover. Discard the map and
-            //   re-bootstrap a fresh session rather than hang in `Lost`
-            //   forever.
-            // * **Vocabulary is trained**: the keyframes + place DB are
-            //   a real, usable map. The user may have swung the camera
-            //   into unmapped scenery (the failure mode the 2026-05-23
-            //   trace surfaced: a 36° turn after a 5-keyframe init).
-            //   Destroying the map here is exactly the bug the user
-            //   reported. Stay `Lost` and keep querying — if the camera
-            //   ever swings back into view, reloc picks it up; if not,
-            //   the loss is at least *visible* to the operator instead
-            //   of silently erasing minutes of mapping.
-            let bow_ready = self.place.lock().unwrap().is_ready();
-            if bow_ready {
-                self.map.status = format!(
-                    "relocalizing… (lost {} frames, map preserved — swing camera back to mapped area)",
-                    *since
-                );
-            } else {
-                warn!(
-                    "slam: relocalization failed for {} frames (no vocabulary) \
-                     — discarding map, re-bootstrapping",
-                    *since
-                );
-                self.reset_world();
-                self.map.status = format!(
-                    "relocalization gave up after {} frames — re-initializing",
-                    *since
-                );
-                next = Some(Stage::Bootstrapping { anchor: None });
-            }
+            // The map has cost a real amount of driving to build —
+            // don't silently destroy it after a fixed timeout. With
+            // the no-BoW fallback above, relocalization can attempt
+            // recovery against the full alive-map every frame, so the
+            // moment the camera swings back into mapped scenery the
+            // user gets their session back. While truly lost, the
+            // status message tells the operator what's happening so
+            // they can choose to drive back or restart the service
+            // (`systemctl --user restart ginger.service`).
+            self.map.status = format!(
+                "lost {} frames — map preserved ({} kf, {} pts); swing camera back to mapped area or restart service",
+                *since, self.map.n_keyframes, self.map.n_points
+            );
         } else {
             self.map.status = format!("relocalizing… (lost {} frames)", *since);
         }
         next
-    }
-
-    /// Discard the current map for a fresh mapping session: tombstone
-    /// the shared [`Map`] and clear the BoW keyframe database, then reset
-    /// the published snapshot. Keyframe ids stay monotonic
-    /// ([`Map::reset`]), so the local mapper's stale raw-feature cache
-    /// cannot alias the re-bootstrapped map and is left to evict itself.
-    fn reset_world(&mut self) {
-        self.world.lock().unwrap().reset();
-        self.place.lock().unwrap().reset();
-        self.map = MapSnapshot::initial();
-        self.consecutive_track_fails = 0;
     }
 }
 
