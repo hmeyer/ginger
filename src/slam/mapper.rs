@@ -416,27 +416,12 @@ impl LocalMapper {
         };
         optimize_pose_graph(&mut poses, &edges, origin, PoseGraphOptions::default());
 
-        // Write back: corrected keyframe poses + map points dragged by
-        // the Sim3 correction of a reference observing keyframe.
-        {
+        let applied = {
             let mut m = self.map.lock().unwrap();
-            let live: Vec<u32> = m.alive_keyframes().map(|k| k.id).collect();
-            for id in &live {
-                m.set_keyframe_pose(*id, Self::sim3_to_iso(&poses[*id as usize]));
-            }
-            let mut moved: Vec<(u32, Vector3<f64>)> = Vec::new();
-            for p in m.alive_points() {
-                if let Some(&(rk, _)) = p.obs.iter().min_by_key(|&&(k, _)| k) {
-                    let rk = rk as usize;
-                    if rk < n {
-                        let g = poses[rk].inverse().then(&old[rk]);
-                        moved.push((p.id, g.transform(&p.pos)));
-                    }
-                }
-            }
-            for (pid, pos) in moved {
-                m.set_point_pos(pid, pos);
-            }
+            apply_loop_correction(&mut m, kf, c, origin, n, &poses, &old)
+        };
+        if !applied {
+            return;
         }
         self.loops.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -507,5 +492,157 @@ impl LocalMapper {
             }
         }
         links.len()
+    }
+}
+
+/// Write loop-closure-corrected poses and dragged points back to the
+/// shared map. Returns `true` if applied, `false` if the writeback was
+/// aborted because the map changed underneath us.
+///
+/// The pose-graph optimization runs off-lock for throughput, so by the
+/// time we re-take the lock the map may have been **reset**
+/// (`Frontend::reset_world()` tombstones every keyframe on re-bootstrap)
+/// or **grown** (tracking inserted new keyframes whose ids weren't in
+/// `poses`). Either case used to panic at `poses[id]`; now:
+///
+/// * Map reset → gauge-fix `origin` is no longer alive → abort.
+///   A missed loop closure is harmless; the fresh session will close
+///   its own loops.
+/// * Map grew → `poses.get(id)` silently skips the new ids; their poses
+///   are left untouched and the next loop closure will sweep them in.
+fn apply_loop_correction(
+    m: &mut Map,
+    kf: u32,
+    c: u32,
+    origin: usize,
+    n: usize,
+    poses: &[Sim3],
+    old: &[Sim3],
+) -> bool {
+    if m.keyframe(origin as u32).is_none() {
+        info!(
+            "slam: loop closure kf{kf} ↔ kf{c} aborted on writeback — \
+             map reset under us"
+        );
+        return false;
+    }
+    let live: Vec<u32> = m.alive_keyframes().map(|k| k.id).collect();
+    for id in &live {
+        if let Some(s) = poses.get(*id as usize) {
+            m.set_keyframe_pose(*id, LocalMapper::sim3_to_iso(s));
+        }
+    }
+    let mut moved: Vec<(u32, Vector3<f64>)> = Vec::new();
+    for p in m.alive_points() {
+        if let Some(&(rk, _)) = p.obs.iter().min_by_key(|&&(k, _)| k) {
+            let rk = rk as usize;
+            if rk < n {
+                let g = poses[rk].inverse().then(&old[rk]);
+                moved.push((p.id, g.transform(&p.pos)));
+            }
+        }
+    }
+    for (pid, pos) in moved {
+        m.set_point_pos(pid, pos);
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::Rotation3;
+
+    fn iso(tx: f64) -> Isometry3<f64> {
+        Isometry3::translation(tx, 0.0, 0.0)
+    }
+
+    fn snapshot_poses(m: &Map) -> (Vec<Sim3>, usize, usize) {
+        let n = m.alive_keyframes().map(|k| k.id).max().unwrap_or(0) as usize + 1;
+        let origin = m.alive_keyframes().map(|k| k.id).min().unwrap_or(0) as usize;
+        let mut poses = vec![Sim3::identity(); n];
+        for k in m.alive_keyframes() {
+            poses[k.id as usize] = LocalMapper::iso_to_sim3(&k.pose);
+        }
+        (poses, n, origin)
+    }
+
+    /// Happy path: snapshot poses, perturb them as if the optimization
+    /// shifted them, write back — every alive keyframe gets its
+    /// corrected pose.
+    #[test]
+    fn writeback_applies_corrected_poses() {
+        let mut m = Map::new();
+        let k0 = m.add_keyframe(iso(0.0), vec![]);
+        let k1 = m.add_keyframe(iso(1.0), vec![]);
+        let k2 = m.add_keyframe(iso(2.0), vec![]);
+        let (mut poses, n, origin) = snapshot_poses(&m);
+        // "Optimization": shift every pose by 10 m.
+        let old = poses.clone();
+        for p in &mut poses {
+            *p = Sim3::new(
+                1.0,
+                Rotation3::identity(),
+                p.t + Vector3::new(10.0, 0.0, 0.0),
+            );
+        }
+        assert!(apply_loop_correction(
+            &mut m, k2, k0, origin, n, &poses, &old
+        ));
+        for (id, expected_x) in [(k0, 10.0), (k1, 11.0), (k2, 12.0)] {
+            let got = m.keyframe(id).unwrap().pose.translation.x;
+            assert!(
+                (got - expected_x).abs() < 1e-9,
+                "kf{id}: {got} != {expected_x}"
+            );
+        }
+    }
+
+    /// Regression for the live panic at `mapper.rs:425` (2026-05-23,
+    /// 21:50:16): tracking inserted new keyframes while pose-graph
+    /// optimization ran off-lock; their ids are ≥ n so `poses[id]` was
+    /// OOB. The writeback must skip them, not panic.
+    #[test]
+    fn writeback_skips_keyframes_added_during_optimization() {
+        let mut m = Map::new();
+        let k0 = m.add_keyframe(iso(0.0), vec![]);
+        let k1 = m.add_keyframe(iso(1.0), vec![]);
+        let (poses, n, origin) = snapshot_poses(&m);
+        assert_eq!(n, 2);
+        // Tracking inserted two more keyframes off-lock.
+        let k2 = m.add_keyframe(iso(2.0), vec![]);
+        let k3 = m.add_keyframe(iso(3.0), vec![]);
+        let old = poses.clone();
+        // Must not panic, even though alive ids {k2, k3} are >= n.
+        assert!(apply_loop_correction(
+            &mut m, k1, k0, origin, n, &poses, &old
+        ));
+        // Late keyframes are left untouched.
+        assert_eq!(m.keyframe(k2).unwrap().pose.translation.x, 2.0);
+        assert_eq!(m.keyframe(k3).unwrap().pose.translation.x, 3.0);
+    }
+
+    /// Regression for the cascading failure: the frontend's
+    /// `reset_world()` ran while loop closure was optimizing. The
+    /// gauge-fix origin is now dead; if we proceed, we'd clobber the
+    /// fresh re-bootstrap with stale corrections. Bail instead.
+    #[test]
+    fn writeback_bails_when_map_was_reset() {
+        let mut m = Map::new();
+        let k0 = m.add_keyframe(iso(0.0), vec![]);
+        let k1 = m.add_keyframe(iso(1.0), vec![]);
+        let (poses, n, origin) = snapshot_poses(&m);
+        let old = poses.clone();
+        // Frontend gave up relocalizing and re-bootstrapped while we
+        // were optimizing.
+        m.reset();
+        let k2 = m.add_keyframe(iso(42.0), vec![]);
+        // Origin (k0) is tombstoned → writeback aborts.
+        assert!(!apply_loop_correction(
+            &mut m, k1, k0, origin, n, &poses, &old
+        ));
+        // Fresh bootstrap keyframe is left exactly where the new
+        // session put it.
+        assert_eq!(m.keyframe(k2).unwrap().pose.translation.x, 42.0);
     }
 }
