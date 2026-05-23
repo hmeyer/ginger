@@ -699,6 +699,7 @@ impl Frontend {
         // Budget exhausted: this is a real loss.
         self.consecutive_track_fails = 0;
         self.map.status = format!("tracking lost: {reason} — relocalizing");
+        self.map.tracking = false;
         self.last_lost_reason = reason;
         self.n_lost += 1;
         Some(Stage::Lost {
@@ -845,8 +846,10 @@ impl Frontend {
                 "lost {} frames — map preserved ({} kf, {} pts); swing camera back to mapped area or restart service",
                 *since, self.map.n_keyframes, self.map.n_points
             );
+            self.map.tracking = false;
         } else {
             self.map.status = format!("relocalizing… (lost {} frames)", *since);
+            self.map.tracking = false;
         }
         next
     }
