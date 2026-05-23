@@ -88,15 +88,38 @@ canvas (trajectory + keyframes + points, snapping on loop closure) and
 gated by deterministic headless tests (`cargo test --workspace
 --no-default-features`).
 
+**Verified on real hardware (2026-05-23):** two-view bootstrap +
+tracking, end-to-end on the Pi from forward-only driving. The
+diagnostic fields on `GET /api/slam/map` (`boot_matches`,
+`boot_median_disp_px`, `boot_min_disp_px`, `boot_anchor_age`,
+`boot_anchor_resets`, `last_lost_reason`, `n_lost`) drove three
+re-tunings the synthetic suite never could have surfaced:
+
+- `INIT_MIN_DISP_FRAC: 0.04 → 0.025` — pure forward motion on a
+  differential-drive base produces ~20-26 px median parallax per
+  ~25 cm pulse against a same-session anchor; the old 4% gate
+  (32 px on an 800 px frame) was unreachable in a single drive.
+- `ANCHOR_RESET_MATCHES: 25 → 40` — BRIEF matches against the
+  anchor decay through (25, 80) as the scene shifts; below
+  `INIT_MIN_MATCHES` parallax can no longer be measured, but the
+  old floor of 25 kept the anchor alive uselessly in that gap.
+- Tracking accept condition no longer requires `rep.converged`
+  (the shared LM optimizer uses `gradient_tol = 1e-10`, calibrated
+  for offline BA — motion-only BA is "practically correct" with
+  tens of inliers long before that gradient norm).
+
+After all three: sustained tracking through forward + backward
+motion, BoW vocabulary self-trains, relocalization recovers from
+single-frame losses without re-bootstrapping. Synthetic test count
+unchanged; new behavior is on top of the same code paths.
+
 **Deferred — need the physical robot + target in one session:**
 - **Proper camera calibration** — an offline OpenCV ChArUco tool
   emitting a verified `slam.toml` (today: the rev 1.3 FOV-derived prior,
   flagged `UNVERIFIED`). Not kalibr.
 - **Frame recorder** — dump live libcamera frames to `*.pgm` to feed
-  the existing replay harness with real scenes. Real-scene init quality
-  and loop-closure efficacy are only verified on synthetic / unit-test
-  scenes until this lands; the synthetic harness can't manufacture the
-  drift a closing loop needs.
+  the existing replay harness with real scenes. Loop-closure efficacy
+  is still synthetic-only.
 
 **Performance / refinement passes (measure first via `slam_bench`):**
 - Wire the BoW direct index into tracking/loop matching (still
@@ -237,7 +260,13 @@ The UI is mobile-first: on phones it stacks camera → scrollable sensor strip �
   source width; `q` is JPEG quality 10..100. Returns 503 with
   `Retry-After: 1` before the first frame.
 - `GET /api/slam/map` → JSON snapshot: tracking state, init/parallax
-  status string, keyframe and map-point counts, BoW state.
+  status string, keyframe and map-point counts, BoW state. Also
+  carries per-frame bootstrap diagnostics (`boot_matches`,
+  `boot_median_disp_px`, `boot_min_disp_px`, `boot_anchor_age`,
+  `boot_anchor_resets`) populated while pre-init, and sticky
+  tracking-loss telemetry (`last_lost_reason`, `n_lost`) that
+  survives the relocalize window so a poller can see *why* tracking
+  failed without racing the frame loop.
 
 ## Camera
 
