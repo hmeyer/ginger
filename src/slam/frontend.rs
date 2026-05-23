@@ -810,7 +810,20 @@ impl Frontend {
             // resumed tracking stage.
             self.consecutive_track_fails = 0;
             let mut tr = track.clone();
+            // Zero out the constant-velocity prediction across the
+            // lost window: the trajectory ends with bad shaky/predict
+            // poses, so `(prev, rep.pose)` would carry a huge spurious
+            // velocity into the next frame's predict — which is
+            // exactly what triggered the immediate re-failure observed
+            // in the live trace (track → shaky → lost → reloc → instant
+            // shaky → lost cycle, 31 losses in 30 s, n_kf stuck at 24).
+            // Force the next CV predict to "no motion" by aligning the
+            // last two trajectory entries to the recovered pose.
             tr.trajectory.push(rep.pose);
+            let n = tr.trajectory.len();
+            if n >= 2 {
+                tr.trajectory[n - 2] = rep.pose;
+            }
             if tr.trajectory.len() > MAX_TRAJECTORY * 2 {
                 let drop = tr.trajectory.len() - MAX_TRAJECTORY;
                 tr.trajectory.drain(0..drop);
