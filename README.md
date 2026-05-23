@@ -185,15 +185,27 @@ forward → reverse → left-turn) now lands at 60+ keyframes / 700+
 points with single-digit losses, each one self-recovering via reloc
 instead of wiping the session.
 
+**Verified intrinsics** (2026-05-23): the rev 1.3 FOV-derived prior is
+replaced by a real ChArUco calibration of this Pi's OV5647 v1.3 lens
+via `scripts/calib/{capture,calibrate}.py` — `rpicam-still` at the
+SLAM resolution → OpenCV `CharucoDetector` → `cv2.calibrateCamera`
+(default 5-term Brown-Conrady model). Result: `fx=739.12 fy=738.85
+cx=391.11 cy=297.37`, HFOV 56.8° (vs 53.5° spec sheet — the real lens
+is ~7% wider, so SLAM had been quoting distances ~7% too short). 35
+frames, RMS 0.289 px, two independent runs converged to 0.1% on fx.
+`slam.toml` now flags `verified=true`; the WebUI `UNVERIFIED` badge is
+gone.
+
 **Deferred — need the physical robot + target in one session:**
-- **Proper camera calibration** — an offline OpenCV ChArUco tool
-  emitting a verified `slam.toml` (today: the rev 1.3 FOV-derived prior,
-  flagged `UNVERIFIED`). Not kalibr.
 - **Frame recorder** — dump live libcamera frames to `*.pgm` to feed
   the existing replay harness with real scenes. Loop-closure efficacy
   is still synthetic-only.
 
 **Performance / refinement passes (measure first via `slam_bench`):**
+- Re-evaluate the 8 px tracking inlier gate (`frontend.rs:616`).
+  Widened 5 → 8 px on 2026-05-23 to absorb FOV-prior reprojection
+  noise; with verified intrinsics now in place, refines should be
+  tighter and the gate may retighten to ~5–6 px.
 - Wire the BoW direct index into tracking/loop matching (still
   brute-force descriptor matching against the whole map).
 - Post-loop global bundle adjustment (loop closure currently only

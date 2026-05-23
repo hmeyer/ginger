@@ -603,16 +603,18 @@ impl Frontend {
                 .collect();
             let huber = 2.0 / fx;
             // Inlier reprojection-error gate (calibrated units, ≈ px/fx).
-            // Widened 5 → 8 px on 2026-05-23: the original 5 px gate is
+            // Widened 5 → 8 px on 2026-05-23: the original 5 px gate was
             // tight for descriptor-matched correspondences on the Pi
-            // camera (FOV-prior intrinsics, ~UNVERIFIED), and a refine
+            // camera against the then-FOV-prior intrinsics, and a refine
             // that converges to a *good enough* pose was missing the
             // inlier count by counting too few of its agreeing matches.
-            // 8 px ≈ 1% of image width — still well inside the noise
-            // floor of a well-conditioned solve, but lenient enough
-            // that a 30/45 inlier configuration doesn't get reported
-            // as 4/45 just because the threshold cuts inside the
-            // measurement spread.
+            // A ChArUco calibration landed later the same day (intrinsics
+            // now flag `verified=true`); with the tighter intrinsics this
+            // gate may retighten toward 5–6 px. 8 px ≈ 1% of image width
+            // — still well inside the noise floor of a well-conditioned
+            // solve, but lenient enough that a 30/45 inlier configuration
+            // doesn't get reported as 4/45 just because the threshold
+            // cuts inside the measurement spread.
             let thr = 8.0 / fx;
             match tracking::track_pose(&obs, &predict, huber, thr) {
                 // Trust the inlier count, not the formal `converged` flag.
