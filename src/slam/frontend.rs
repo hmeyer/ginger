@@ -97,6 +97,14 @@ const RELOC_MIN_INLIERS: usize = 15;
 /// the user reported.
 const RELOC_MAX_FRAMES: usize = 90;
 
+/// Extended timeout when BoW *is* ready: a substantial mapped session
+/// is worth waiting for, so give the user up to ~60 s at 7.5 fps to
+/// swing the camera back into mapped scenery before declaring the
+/// session unrecoverable and re-bootstrapping. Without this upper
+/// bound the system silently stays Lost forever (the failure the
+/// user reported on 2026-05-23 after 1510 frames / 3.3 minutes).
+const RELOC_MAX_FRAMES_BOW: usize = 450;
+
 /// Per-frame output of [`Frontend::on_frame`]: overlay match lines, the
 /// current intrinsics view + map snapshot, and the overlay-match wall
 /// time (ms) for the HUD `matching` stage.
@@ -850,25 +858,73 @@ impl Frontend {
             };
             next = Some(Stage::Tracking(tr));
         } else if *since > RELOC_MAX_FRAMES {
-            // The map has cost a real amount of driving to build —
-            // don't silently destroy it after a fixed timeout. With
-            // the no-BoW fallback above, relocalization can attempt
-            // recovery against the full alive-map every frame, so the
-            // moment the camera swings back into mapped scenery the
-            // user gets their session back. While truly lost, the
-            // status message tells the operator what's happening so
-            // they can choose to drive back or restart the service
-            // (`systemctl --user restart ginger.service`).
-            self.map.status = format!(
-                "lost {} frames — map preserved ({} kf, {} pts); swing camera back to mapped area or restart service",
-                *since, self.map.n_keyframes, self.map.n_points
-            );
-            self.map.tracking = false;
+            // Two regimes (restored 2026-05-23 after "stuck Lost for
+            // 3.3 minutes with 2 keyframes" was reported):
+            //
+            // * **BoW vocabulary not trained** (< N_VOCAB_KF=6
+            //   keyframes ever existed): the map is a thin
+            //   bootstrap-area patch, the full-map reloc fallback
+            //   can't match against it once the camera turns away,
+            //   and the user has no way out. Destroy the map,
+            //   re-bootstrap. The user gets a fresh session
+            //   wherever they ended up.
+            //
+            // * **BoW vocabulary trained**: the map is a real
+            //   session worth preserving. Keep it for a longer
+            //   recovery window (RELOC_MAX_FRAMES_BOW ≈ 60 s) so
+            //   the user can swing back; only auto-rebootstrap
+            //   after that, since "stuck for a minute" is worse
+            //   than "lose the map".
+            let bow_ready = self.place.lock().unwrap().is_ready();
+            if !bow_ready {
+                warn!(
+                    "slam: relocalization stuck for {} frames (no vocabulary, \
+                     {} kf, {} pts) — discarding thin map, re-bootstrapping",
+                    *since, self.map.n_keyframes, self.map.n_points
+                );
+                self.reset_world();
+                self.map.status = format!(
+                    "relocalization gave up after {} frames — re-initializing",
+                    *since
+                );
+                self.map.tracking = false;
+                next = Some(Stage::Bootstrapping { anchor: None });
+            } else if *since > RELOC_MAX_FRAMES_BOW {
+                warn!(
+                    "slam: relocalization stuck for {} frames with BoW ready \
+                     ({} kf, {} pts) — discarding, re-bootstrapping",
+                    *since, self.map.n_keyframes, self.map.n_points
+                );
+                self.reset_world();
+                self.map.status = format!(
+                    "relocalization gave up after {} frames — re-initializing",
+                    *since
+                );
+                self.map.tracking = false;
+                next = Some(Stage::Bootstrapping { anchor: None });
+            } else {
+                self.map.status = format!(
+                    "lost {} frames — map preserved ({} kf, {} pts); swing camera back to mapped area",
+                    *since, self.map.n_keyframes, self.map.n_points
+                );
+                self.map.tracking = false;
+            }
         } else {
             self.map.status = format!("relocalizing… (lost {} frames)", *since);
             self.map.tracking = false;
         }
         next
+    }
+
+    /// Discard the current map and clear BoW + snapshot so a fresh
+    /// `Stage::Bootstrapping` starts from a clean slate. Called only
+    /// from the relocalize give-up path now that the map is otherwise
+    /// preserved indefinitely.
+    fn reset_world(&mut self) {
+        self.world.lock().unwrap().reset();
+        self.place.lock().unwrap().reset();
+        self.map = MapSnapshot::initial();
+        self.consecutive_track_fails = 0;
     }
 }
 
