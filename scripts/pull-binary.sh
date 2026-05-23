@@ -9,11 +9,19 @@
 #   * a fine-grained PAT scoped to hmeyer/ginger with `Actions: read`, or
 #   * a classic token with the `repo` scope.
 # Provide it via the GINGER_GH_TOKEN env var, or write it (chmod 600) to
-# ~/.config/ginger/gh-token.
+# ~/.config/ginger/gh-token, or — easiest on a dev Pi — just be logged
+# in with the `gh` CLI (`gh auth login`); this script will fall through
+# to `gh auth token` automatically.
 #
 # Installing the binary triggers the ginger-watch.path unit, which
-# restarts the service. Run on a schedule via the ginger-pull.timer unit
-# (see scripts/install-service.sh), or by hand.
+# restarts the service. Invoked in a 10s loop by scripts/pull-burst.sh
+# (which `make deploy` kicks off after a `git push`), or by hand.
+#
+# Exit codes:
+#   0   installed a new binary
+#   10  no new artifact yet (idempotent no-op — burst loop should retry)
+#   11  no token / not configured (burst loop should give up)
+#   1   any other error (handled by `set -e` / die)
 set -euo pipefail
 
 REPO="hmeyer/ginger"
@@ -35,16 +43,21 @@ for cmd in curl jq unzip sha256sum; do
     || die "missing required command: $cmd  (install with: sudo apt install jq unzip)"
 done
 
-# Resolve the GitHub token. A missing token is a no-op (exit 0), not a
-# failure, so the polling timer does not spam systemd with failed units
-# before the token has been configured.
+# Resolve the GitHub token. Order: env var, then $TOKEN_FILE, then the
+# logged-in `gh` CLI (if installed) — reusing the existing developer
+# login avoids managing a second PAT. A missing token is a no-op
+# (exit 0), not a failure, so the polling timer does not spam systemd
+# with failed units before any token has been configured.
 TOKEN="${GINGER_GH_TOKEN:-}"
 if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
   TOKEN="$(tr -d ' \t\r\n' < "$TOKEN_FILE")"
 fi
+if [ -z "$TOKEN" ] && command -v gh >/dev/null 2>&1; then
+  TOKEN="$(gh auth token 2>/dev/null | tr -d ' \t\r\n' || true)"
+fi
 if [ -z "$TOKEN" ]; then
-  log "no GitHub token found — set GINGER_GH_TOKEN or write $TOKEN_FILE (chmod 600). Skipping."
-  exit 0
+  log "no GitHub token found — set GINGER_GH_TOKEN, write $TOKEN_FILE (chmod 600), or run 'gh auth login'."
+  exit 11
 fi
 
 gh_api() {
@@ -66,7 +79,7 @@ artifact_id="$(gh_api "$API/repos/$REPO/actions/runs/$run_id/artifacts" \
 
 if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "$artifact_id" ]; then
   log "artifact $artifact_id already deployed — up to date"
-  exit 0
+  exit 10
 fi
 
 tmp="$(mktemp -d)"

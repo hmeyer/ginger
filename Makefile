@@ -1,6 +1,6 @@
 CARGO ?= cargo
 
-.PHONY: all build check fmt fmt-check clippy audit lint install-hooks
+.PHONY: all build check fmt fmt-check clippy audit lint install-hooks deploy
 
 all: build
 
@@ -29,3 +29,8 @@ install-hooks:
 	cp scripts/pre-commit .git/hooks/pre-commit
 	chmod +x .git/hooks/pre-commit
 	@echo "pre-commit hook installed"
+
+# Push to GitHub and kick the Pi-side burst pull (see scripts/deploy.sh).
+# Extra args go through to `git push`: `make deploy ARGS="--force-with-lease"`.
+deploy:
+	./scripts/deploy.sh $(ARGS)

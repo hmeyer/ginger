@@ -166,26 +166,44 @@ push to `main` (or via *Run workflow*) and uploads it as a `ginger-aarch64`
 artifact. The build runs in a Debian Trixie container so glibc and the
 pinned libcamera version match the Pi — the artifact is a drop-in binary.
 
-The Pi pulls it with `scripts/pull-binary.sh`: it downloads the latest
-successful build, verifies its SHA-256, and atomically installs it to
-`target/release/ginger` — which the `ginger-watch.path` unit detects,
-restarting the service. `scripts/install-service.sh` also installs a
-`ginger-pull.timer` that runs the pull every 5 minutes.
-
-Artifacts require authentication even on a public repo, so this needs a
-GitHub token with `Actions: read` access to `hmeyer/ginger` (a
-fine-grained PAT, or a classic token with the `repo` scope):
+The Pi-side deploy is trigger-driven, not polled:
 
 ```bash
-mkdir -p ~/.config/ginger
-install -m600 /dev/stdin ~/.config/ginger/gh-token   # paste token, Ctrl-D
-systemctl --user enable --now ginger-pull.timer      # if install-service.sh ran before the token existed
-bash scripts/pull-binary.sh                          # or pull on demand
+make deploy        # = git push + start the burst pull
 ```
 
-`pull-binary.sh` needs `jq` and `unzip` (`sudo apt install jq unzip`). When
-the Pi's libcamera is upgraded, bump `LIBCAMERA_VERSION` in the workflow to
-match `dpkg -l libcamera0.7` so the linked ABI stays correct.
+`scripts/deploy.sh` pushes (any extra args are forwarded — e.g.
+`make deploy ARGS="--force-with-lease"`), then `restart`s
+`ginger-pull.service`, which runs `scripts/pull-burst.sh`: a 10s loop
+that calls `pull-binary.sh` until CI finishes and a new artifact is up
+(typically ~3 min), or for at most 15 min. Each pull verifies the
+artifact's SHA-256 and atomically replaces `target/release/ginger`;
+`ginger-watch.path` then restarts `ginger.service`. There is no
+recurring timer — the service is idle between deploys.
+
+Watch a deploy land:
+
+```bash
+journalctl --user -u ginger-pull -f
+```
+
+GitHub Actions artifacts require auth even on a public repo. The
+simplest setup is to be logged in with `gh`:
+
+```bash
+gh auth login    # one-time; pull-binary.sh falls through to `gh auth token`
+```
+
+Or write a PAT with `Actions: read` to `~/.config/ginger/gh-token`
+(chmod 600), or export `GINGER_GH_TOKEN`. Without any of those,
+`make deploy` still pushes but the burst exits with `rc=11`.
+
+`pull-binary.sh` needs `jq` and `unzip` (`sudo apt install jq unzip`).
+When the Pi's libcamera is upgraded, bump `LIBCAMERA_VERSION` in the
+workflow to match `dpkg -l libcamera0.7` so the linked ABI stays
+correct. A merge made via the GitHub web UI won't auto-deploy (no local
+push to wrap) — run `systemctl --user restart ginger-pull.service` by
+hand, or `make deploy` the next time you push.
 
 ## Web interface
 

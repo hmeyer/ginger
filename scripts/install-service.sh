@@ -49,60 +49,49 @@ Type=oneshot
 ExecStart=systemctl --user restart ginger.service
 EOF
 
-# ── ginger-pull.service — fetch the latest CI-built binary ───────────────────
+# ── ginger-pull.service — burst-poll GitHub Actions for a new build ─────────
+# Started by `make deploy` (scripts/deploy.sh) after a push to main.
+# Polls every 10s for up to 15 min, installs the new binary as soon as
+# CI finishes, then exits. Idle (no recurring timer) between deploys.
 cat > "$UNIT_DIR/ginger-pull.service" << 'EOF'
 [Unit]
-Description=Fetch the latest ginger binary from GitHub Actions
+Description=Burst-poll GitHub Actions for a new ginger build
 
 [Service]
 Type=oneshot
-ExecStart=%h/ginger/scripts/pull-binary.sh
+ExecStart=%h/ginger/scripts/pull-burst.sh
 EOF
 
-# ── ginger-pull.timer — poll GitHub Actions for new builds ───────────────────
-cat > "$UNIT_DIR/ginger-pull.timer" << 'EOF'
-[Unit]
-Description=Poll GitHub Actions for new ginger builds
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+# Retire any previous polling timer from earlier installs of this script.
+systemctl --user disable --now ginger-pull.timer 2>/dev/null || true
+rm -f "$UNIT_DIR/ginger-pull.timer"
 
 systemctl --user daemon-reload
 systemctl --user enable --now ginger.service
 systemctl --user enable --now ginger-watch.path
 
-# The pull timer needs a GitHub token (Actions: read) to download
-# artifacts. Enable it only once the token is configured, so it does not
-# poll-and-fail before then.
-TOKEN_FILE="$HOME/.config/ginger/gh-token"
-pull_enabled=0
-if [ -n "${GINGER_GH_TOKEN:-}" ] || [ -r "$TOKEN_FILE" ]; then
-  systemctl --user enable --now ginger-pull.timer
-  pull_enabled=1
-fi
-
 # Allow user services to run at boot without an active login session.
 loginctl enable-linger "$USER"
+
+TOKEN_FILE="$HOME/.config/ginger/gh-token"
+token_ok=0
+if [ -n "${GINGER_GH_TOKEN:-}" ] \
+    || [ -r "$TOKEN_FILE" ] \
+    || { command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; }; then
+  token_ok=1
+fi
 
 echo ""
 echo "Installed. Ginger will:"
 echo "  • start automatically at boot"
 echo "  • restart within seconds whenever target/release/ginger is rebuilt"
-if [ "$pull_enabled" -eq 1 ]; then
-  echo "  • poll GitHub Actions every 5 min and self-update to new CI builds"
-else
+echo "  • pull a fresh CI build whenever you run 'make deploy'"
+if [ "$token_ok" -ne 1 ]; then
   echo ""
-  echo "Auto-update timer installed but NOT started — no GitHub token found."
-  echo "Create a token with 'Actions: read' access to hmeyer/ginger, then:"
-  echo "  mkdir -p ~/.config/ginger"
-  echo "  install -m600 /dev/stdin ~/.config/ginger/gh-token   # paste token, Ctrl-D"
-  echo "  systemctl --user enable --now ginger-pull.timer"
+  echo "Heads up: no GitHub token detected. 'make deploy' will push fine,"
+  echo "but the burst service will exit with rc=11 until you either:"
+  echo "  • run 'gh auth login'  (pull-binary.sh will reuse that token), or"
+  echo "  • write a PAT with 'Actions: read' to ~/.config/ginger/gh-token (chmod 600)"
 fi
 echo ""
 systemctl --user status ginger.service --no-pager || true

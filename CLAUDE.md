@@ -27,8 +27,10 @@ cargo check -p ginger-slam-core --target aarch64-unknown-linux-gnu  # Pi cross-c
 cargo check -p ginger-fast      --target aarch64-unknown-linux-gnu
 ```
 
-Always build/run release on the Pi (`cargo build --release`); debug is
-10–20× slower for JPEG encoding.
+Prefer **not** to compile on the Pi — see *Deploying to the Pi* below.
+If you do build on it (offline iteration, no network), always build
+release: `cargo build --release`. Debug is 10–20× slower for JPEG
+encoding.
 
 ### The libcamera feature gate
 
@@ -38,6 +40,30 @@ dep. On a dev machine / CI / this environment, work
 **full** SLAM pipeline headless. The Pi build stays a plain
 `cargo build --release` (feature on by default). Never make code paths
 that only compile with libcamera; keep the mock path first-class.
+
+## Deploying to the Pi
+
+The Pi is too slow to compile on; ship a CI-built binary instead.
+
+```bash
+make deploy                                # = git push + start the burst pull
+make deploy ARGS="--force-with-lease"      # extra args forwarded to git push
+journalctl --user -u ginger-pull -f        # watch a deploy land
+```
+
+`scripts/deploy.sh` pushes, then `restart`s `ginger-pull.service` —
+`scripts/pull-burst.sh`, a 10s loop that polls GitHub Actions until the
+new `ginger-aarch64` artifact is up (~3 min), verifies its SHA-256,
+atomically replaces `target/release/ginger`, and exits. The
+`ginger-watch.path` unit detects the binary swap and restarts
+`ginger.service`. No recurring timer — the service is idle between
+deploys; merges done via the GitHub web UI need a manual
+`systemctl --user restart ginger-pull.service`.
+
+Auth: `gh auth login` is enough (`pull-binary.sh` falls through to
+`gh auth token`); see *Deploying CI builds* in `README.md` for PAT /
+env-var alternatives. Exit codes: `0`=installed, `10`=no new artifact
+yet, `11`=no token. Deploys only fire from `main`.
 
 ## Definition of done for a change
 
@@ -86,6 +112,8 @@ non-decreasing. New behavior needs new tests in the same change.
   descriptive message; push with `git push -u origin <branch>`.
 - Do not create a PR unless explicitly asked.
 - Pre-commit hook runs `make lint`; never bypass with `--no-verify`.
+- Publishing to `main` on the Pi: use `make deploy` (not bare `git push`)
+  so the CI build is auto-pulled — see *Deploying to the Pi*.
 
 ## TODO / status tracking
 
