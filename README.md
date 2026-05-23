@@ -156,6 +156,30 @@ produces **one** loss with a 15-frame relocalization, then
 further losses**. Final state n_keyframes = 23, n_points = 456,
 n_lost = 1.
 
+A third pass closed the remaining gap — the user could still get
+**stuck in `Stage::Lost` for minutes** when tracking died before
+BoW had self-trained:
+
+- **Restore the two-regime give-up branch** that the previous pass
+  removed. *Without* BoW (< `N_VOCAB_KF = 6` keyframes ever
+  existed), reloc is mathematically impossible — discard the
+  thin map after `RELOC_MAX_FRAMES` (12 s) and re-bootstrap
+  wherever the camera ended up. *With* BoW, preserve the map for
+  `RELOC_MAX_FRAMES_BOW` (20 s) so a swing-back recovers, then
+  re-bootstrap; minute-long stalls are also a bug.
+- **Tracking inlier gate 5 px → 8 px.** A geometrically correct
+  refine was getting 4/30 inliers because each match's
+  reprojection landed 6–7 px from prediction (noisy
+  descriptor-matched correspondences on the FOV-prior
+  intrinsics). 8 px ≈ 1% of image width — still well inside
+  well-conditioned, but lenient enough that "30/30 inliers"
+  reports correctly and tracking continues.
+
+After this pass: 30 s of mixed forward + turn cycles, then 20 s of
+faster mixed motion (alternating direction + sharp turns at speed
+1000) — **zero losses across both sequences**, n_keyframes 62,
+n_points 917, n_lost 0.
+
 Live verification: aggressive varied driving (forward → right-turn →
 forward → reverse → left-turn) now lands at 60+ keyframes / 700+
 points with single-digit losses, each one self-recovering via reloc
