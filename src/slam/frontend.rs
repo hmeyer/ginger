@@ -61,6 +61,15 @@ const ANCHOR_RESET_MATCHES: usize = 40;
 const TRACK_MIN_MATCHES: usize = 15;
 const TRACK_MIN_INLIERS: usize = 10;
 
+/// Consecutive frames a weak tracking solve can be tolerated before
+/// declaring `Stage::Lost`. The constant-velocity prediction can be
+/// briefly wrong on motion onsets (e.g. the right-turn-after-forward
+/// transition that triggered the failure in the 2026-05-23 trace),
+/// producing a single frame of 5/37 inliers before the next refine
+/// settles. Riding through 1–2 such frames with the predicted pose
+/// keeps the map alive instead of destroying it on a transient.
+const SOFT_LOST_MAX: usize = 3;
+
 /// Relocalization gates. Kept conservative — a false relocalization
 /// corrupts the trajectory, so favour staying lost.
 const RELOC_MAX_CAND: usize = 5;
@@ -74,7 +83,15 @@ const RELOC_MIN_INLIERS: usize = 15;
 /// vocabulary self-trained (fewer than `place::N_VOCAB_KF` keyframes
 /// existed) — without a vocabulary every relocalization query is empty,
 /// so staying `Lost` would hang in "relocalizing…" forever.
-const RELOC_MAX_FRAMES: usize = 30;
+///
+/// Bumped 2026-05-23 from 30 to 90 (≈12 s at 7.5 fps): with the soft-
+/// lost grace period added, the system stays in `Tracking` longer on
+/// transient failures, so when we *do* reach `Lost` it tends to be a
+/// real "drove past the mapped area" scenario where the user needs a
+/// few seconds to swing back into view. 30 frames (~4 s) was too tight
+/// for that, and prematurely-destroyed maps were exactly the failure
+/// the user reported.
+const RELOC_MAX_FRAMES: usize = 90;
 
 /// Per-frame output of [`Frontend::on_frame`]: overlay match lines, the
 /// current intrinsics view + map snapshot, and the overlay-match wall
@@ -151,6 +168,10 @@ pub struct Frontend {
     last_lost_reason: String,
     /// Cumulative tracking losses since process start (debug HUD).
     n_lost: u32,
+    /// Consecutive frames the tracking solve has been weak (inliers
+    /// below `TRACK_MIN_INLIERS`). Reset on a healthy solve; promotes
+    /// to `Stage::Lost` once it exceeds `SOFT_LOST_MAX`.
+    consecutive_track_fails: usize,
 }
 
 impl Default for Frontend {
@@ -184,6 +205,7 @@ impl Frontend {
             last_loops: 0,
             last_lost_reason: String::new(),
             n_lost: 0,
+            consecutive_track_fails: 0,
         }
     }
 
@@ -532,6 +554,15 @@ impl Frontend {
         } else {
             brief::match_descriptors(&idesc, descs)
         };
+        // Hoisted out of the match-count branch so soft-lost failures
+        // can still push a predicted pose to keep the trajectory
+        // contiguous and the const-velocity model warm.
+        let np = st.trajectory.len();
+        let predict = if np >= 2 {
+            tracking::constant_velocity(&st.trajectory[np - 2], &st.trajectory[np - 1])
+        } else {
+            st.trajectory[np - 1]
+        };
         if mm.len() >= TRACK_MIN_MATCHES {
             let obs: Vec<Observation> = mm
                 .iter()
@@ -543,12 +574,6 @@ impl Frontend {
                     }
                 })
                 .collect();
-            let np = st.trajectory.len();
-            let predict = if np >= 2 {
-                tracking::constant_velocity(&st.trajectory[np - 2], &st.trajectory[np - 1])
-            } else {
-                st.trajectory[np - 1]
-            };
             let huber = 2.0 / fx;
             let thr = 5.0 / fx;
             match tracking::track_pose(&obs, &predict, huber, thr) {
@@ -562,6 +587,8 @@ impl Frontend {
                 // 49/57 inliers, t≈3.4s post-init) showed tracking being
                 // killed precisely there.
                 Some(rep) if rep.n_inliers >= TRACK_MIN_INLIERS => {
+                    // Healthy solve — reset the soft-lost counter.
+                    self.consecutive_track_fails = 0;
                     st.trajectory.push(rep.pose);
                     if st.trajectory.len() > MAX_TRAJECTORY * 2 {
                         let drop = st.trajectory.len() - MAX_TRAJECTORY;
@@ -622,36 +649,62 @@ impl Frontend {
                 }
                 Some(rep) => {
                     let reason = format!("weak {}/{} inliers", rep.n_inliers, obs.len());
-                    self.map.status = format!("tracking lost: {reason} — relocalizing");
-                    self.last_lost_reason = reason;
-                    self.n_lost += 1;
-                    next = Some(Stage::Lost {
-                        since: 0,
-                        track: st.clone(),
-                    });
+                    next = self.handle_track_fail(st, predict, reason, rep.n_inliers as u32);
                 }
                 None => {
-                    let reason = "solve failed".to_string();
-                    self.map.status = format!("tracking lost: {reason} — relocalizing");
-                    self.last_lost_reason = reason;
-                    self.n_lost += 1;
-                    next = Some(Stage::Lost {
-                        since: 0,
-                        track: st.clone(),
-                    });
+                    next = self.handle_track_fail(st, predict, "solve failed".into(), 0);
                 }
             }
         } else {
             let reason = format!("only {} map matches", mm.len());
-            self.map.status = format!("tracking lost: {reason} — relocalizing");
-            self.last_lost_reason = reason;
-            self.n_lost += 1;
-            next = Some(Stage::Lost {
-                since: 0,
-                track: st.clone(),
-            });
+            next = self.handle_track_fail(st, predict, reason, 0);
         }
         next
+    }
+
+    /// Soft-lost grace period: a single bad tracking frame (e.g. the
+    /// motion-onset frame when the const-velocity prediction is briefly
+    /// wrong) used to immediately promote to `Stage::Lost`, where 30
+    /// frames of failed relocalization would destroy the entire map.
+    /// Allow up to [`SOFT_LOST_MAX`] consecutive bad frames before
+    /// committing to that — push the predicted pose to keep the
+    /// trajectory contiguous and the const-velocity model warm, but
+    /// don't touch the keyframe machinery. Returns `Some(Lost)` once
+    /// the run of bad frames exceeds the budget; `None` keeps the
+    /// current `Tracking` stage.
+    fn handle_track_fail(
+        &mut self,
+        st: &mut TrackState,
+        predict: Isometry3<f64>,
+        reason: String,
+        n_inliers: u32,
+    ) -> Option<Stage> {
+        self.consecutive_track_fails += 1;
+        if self.consecutive_track_fails <= SOFT_LOST_MAX {
+            st.trajectory.push(predict);
+            if st.trajectory.len() > MAX_TRAJECTORY * 2 {
+                let drop = st.trajectory.len() - MAX_TRAJECTORY;
+                st.trajectory.drain(0..drop);
+            }
+            let status = format!(
+                "tracking shaky: {reason} (predicting, {}/{} skips)",
+                self.consecutive_track_fails, SOFT_LOST_MAX
+            );
+            self.map = {
+                let w = self.world.lock().unwrap();
+                publish_map(&w, &st.trajectory, &st.model, st.r_h, status, n_inliers)
+            };
+            return None;
+        }
+        // Budget exhausted: this is a real loss.
+        self.consecutive_track_fails = 0;
+        self.map.status = format!("tracking lost: {reason} — relocalizing");
+        self.last_lost_reason = reason;
+        self.n_lost += 1;
+        Some(Stage::Lost {
+            since: 0,
+            track: st.clone(),
+        })
     }
 
     /// `Stage::Lost`: BoW-query the place DB, gather candidate map
@@ -737,6 +790,9 @@ impl Frontend {
         }
 
         if let Some(rep) = report {
+            // Reloc succeeded — clear the soft-lost counter for the
+            // resumed tracking stage.
+            self.consecutive_track_fails = 0;
             let mut tr = track.clone();
             tr.trajectory.push(rep.pose);
             if tr.trajectory.len() > MAX_TRAJECTORY * 2 {
@@ -791,6 +847,7 @@ impl Frontend {
         self.world.lock().unwrap().reset();
         self.place.lock().unwrap().reset();
         self.map = MapSnapshot::initial();
+        self.consecutive_track_fails = 0;
     }
 }
 
@@ -1055,9 +1112,8 @@ mod pipeline_tests {
         };
         assert!(good.map.tracking, "precondition: tracking");
         let n_pts = good.map.n_points;
-        let traj = good.map.cameras.len();
 
-        // A frame of pure garbage descriptors → no map matches.
+        // Build a frame of pure garbage descriptors → no map matches.
         let mut r = SmallRng::seed_from_u64(0x99);
         let fd: Vec<brief::Descriptor> = (0..200)
             .map(|_| {
@@ -1077,15 +1133,32 @@ mod pipeline_tests {
                 angle: 0.0,
             })
             .collect();
+
+        // Soft-lost grace period: the first SOFT_LOST_MAX bad frames
+        // keep tracking alive (status reads "shaky", trajectory keeps
+        // extending with predicted poses) — covering the motion-onset
+        // case where one bad refine shouldn't destroy the map. The
+        // (SOFT_LOST_MAX + 1)th tips to Stage::Lost.
+        for i in 0..SOFT_LOST_MAX {
+            let shaky = fe.on_frame(&fp, &fd, W, H);
+            assert!(
+                shaky.map.status.contains("shaky") || shaky.map.status.contains("predicting"),
+                "frame {i}: expected shaky status, got: {}",
+                shaky.map.status
+            );
+            assert_eq!(
+                shaky.map.n_points, n_pts,
+                "map points corrupted at frame {i}"
+            );
+        }
         let lost = fe.on_frame(&fp, &fd, W, H);
         assert!(
             lost.map.status.contains("lost"),
-            "status: {}",
+            "expected lost after grace period, got: {}",
             lost.map.status
         );
-        // Map not corrupted: points unchanged, trajectory not extended.
+        // Map not corrupted by the bad-frame burst.
         assert_eq!(lost.map.n_points, n_pts);
-        assert_eq!(lost.map.cameras.len(), traj);
     }
 
     /// A long enough sweep self-trains the BoW vocabulary and fills the
