@@ -5,3 +5,9 @@ ginger-rs/target/
 webui-tests/node_modules/
 webui-tests/test-results/
 webui-tests/playwright-report/
+
+# Captured frames from scripts/calib/capture.py — large and per-session.
+calib-frames/
+
+# Python bytecode cache
+__pycache__/
