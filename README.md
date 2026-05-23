@@ -113,6 +113,41 @@ motion, BoW vocabulary self-trains, relocalization recovers from
 single-frame losses without re-bootstrapping. Synthetic test count
 unchanged; new behavior is on top of the same code paths.
 
+A second pass tackled the **"map keeps dying when I drive around"**
+failure (sharp turns at thin-map state):
+
+- **Soft-lost grace period** (`SOFT_LOST_MAX = 3`): the const-
+  velocity prediction is briefly wrong at motion onsets
+  (forward → turn, idle → motion); a single 5/37-inliers refine
+  would immediately go `Stage::Lost`, then 30 frames of failed
+  reloc would destroy the entire map. Ride through up to 3
+  consecutive bad refines in `Stage::Tracking` by pushing the
+  predicted pose; only commit to Lost on the 4th.
+- **Full-map reloc fallback**: when the BoW place query returns no
+  candidates (vocabulary not yet trained, or no covisible match
+  for this view), feed PnP-RANSAC every alive map point rather
+  than the empty candidate set. Thin-map sessions can now recover
+  from a Lost transition before BoW exists.
+- **Never auto-destroy the map**: the previous "give up after 90
+  frames and re-bootstrap" branch was deleted. The map costs real
+  driving to build, and the full-map reloc fallback keeps trying
+  forever — if the camera ever swings back into mapped scenery,
+  the session resumes; if not, the status surfaces it. Explicit
+  reset is `systemctl --user restart ginger.service`.
+- **Zero CV velocity after reloc**: a successful relocalization
+  pushes `rep.pose` to a trajectory whose tail is the soft-lost
+  predict poses — the next constant-velocity prediction therefore
+  carried a huge spurious velocity across the lost window and
+  immediately re-failed the refine. After pushing the recovered
+  pose, overwrite `trajectory[n-2]` with the same value so the
+  next CV predict resolves to "no motion" — the safest prior when
+  we have no honest motion estimate across the gap.
+
+Live verification: aggressive varied driving (forward → right-turn →
+forward → reverse → left-turn) now lands at 60+ keyframes / 700+
+points with single-digit losses, each one self-recovering via reloc
+instead of wiping the session.
+
 **Deferred — need the physical robot + target in one session:**
 - **Proper camera calibration** — an offline OpenCV ChArUco tool
   emitting a verified `slam.toml` (today: the rev 1.3 FOV-derived prior,
