@@ -98,12 +98,13 @@ const RELOC_MIN_INLIERS: usize = 15;
 const RELOC_MAX_FRAMES: usize = 90;
 
 /// Extended timeout when BoW *is* ready: a substantial mapped session
-/// is worth waiting for, so give the user up to ~60 s at 7.5 fps to
-/// swing the camera back into mapped scenery before declaring the
-/// session unrecoverable and re-bootstrapping. Without this upper
-/// bound the system silently stays Lost forever (the failure the
-/// user reported on 2026-05-23 after 1510 frames / 3.3 minutes).
-const RELOC_MAX_FRAMES_BOW: usize = 450;
+/// is worth a short wait, so give the user ~20 s at 7.5 fps to swing
+/// the camera back into mapped scenery before re-bootstrapping. The
+/// previous 60 s value felt like "stuck" during normal driving — by
+/// 20 s the user has either driven back to mapped scenery (reloc
+/// recovers) or they've moved on enough that a fresh bootstrap from
+/// the current view is the right call.
+const RELOC_MAX_FRAMES_BOW: usize = 150;
 
 /// Per-frame output of [`Frontend::on_frame`]: overlay match lines, the
 /// current intrinsics view + map snapshot, and the overlay-match wall
@@ -587,7 +588,18 @@ impl Frontend {
                 })
                 .collect();
             let huber = 2.0 / fx;
-            let thr = 5.0 / fx;
+            // Inlier reprojection-error gate (calibrated units, ≈ px/fx).
+            // Widened 5 → 8 px on 2026-05-23: the original 5 px gate is
+            // tight for descriptor-matched correspondences on the Pi
+            // camera (FOV-prior intrinsics, ~UNVERIFIED), and a refine
+            // that converges to a *good enough* pose was missing the
+            // inlier count by counting too few of its agreeing matches.
+            // 8 px ≈ 1% of image width — still well inside the noise
+            // floor of a well-conditioned solve, but lenient enough
+            // that a 30/45 inlier configuration doesn't get reported
+            // as 4/45 just because the threshold cuts inside the
+            // measurement spread.
+            let thr = 8.0 / fx;
             match tracking::track_pose(&obs, &predict, huber, thr) {
                 // Trust the inlier count, not the formal `converged` flag.
                 // The shared LM in slam-core uses a very tight
