@@ -142,6 +142,19 @@ failure (sharp turns at thin-map state):
   pose, overwrite `trajectory[n-2]` with the same value so the
   next CV predict resolves to "no motion" — the safest prior when
   we have no honest motion estimate across the gap.
+- `TRACK_MIN_INLIERS: 10 → 6` — post-reloc refines consistently
+  landed at 6–9 inliers (the motion-only BA settles slowly the
+  first frame after reloc) and were being thrown out, looping
+  back to Lost. PnP-RANSAC already trusts a 15-inlier pose at
+  `RELOC_MIN_INLIERS`; 6 self-consistent observations on the
+  immediate next refine is not a coincidence.
+
+End-to-end after the second pass: 14 s of aggressive varied
+driving (forward → right turn → forward → reverse → left turn)
+produces **one** loss with a 15-frame relocalization, then
+**continuous tracking through the rest of the sequence with zero
+further losses**. Final state n_keyframes = 23, n_points = 456,
+n_lost = 1.
 
 Live verification: aggressive varied driving (forward → right-turn →
 forward → reverse → left-turn) now lands at 60+ keyframes / 700+
