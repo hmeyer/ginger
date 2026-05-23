@@ -552,7 +552,16 @@ impl Frontend {
             let huber = 2.0 / fx;
             let thr = 5.0 / fx;
             match tracking::track_pose(&obs, &predict, huber, thr) {
-                Some(rep) if rep.converged && rep.n_inliers >= TRACK_MIN_INLIERS => {
+                // Trust the inlier count, not the formal `converged` flag.
+                // The shared LM in slam-core uses a very tight
+                // `gradient_tol = 1e-10` (good for offline BA); motion-only
+                // tracking-frame BA reaches "good enough" long before that,
+                // so a high inlier ratio with `converged == false` means the
+                // pose is practically correct, just not at the tolerance LM
+                // declares formal convergence at. Live trace (n_lost=1 with
+                // 49/57 inliers, t≈3.4s post-init) showed tracking being
+                // killed precisely there.
+                Some(rep) if rep.n_inliers >= TRACK_MIN_INLIERS => {
                     st.trajectory.push(rep.pose);
                     if st.trajectory.len() > MAX_TRAJECTORY * 2 {
                         let drop = st.trajectory.len() - MAX_TRAJECTORY;
