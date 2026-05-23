@@ -312,8 +312,21 @@ impl Frontend {
     ) -> Option<Stage> {
         let mut next: Option<Stage> = None;
         let mut want_anchor = false;
+        // Debug telemetry surfaced via `/api/slam/map`; reset each frame
+        // and re-populated below so a poller sees the live values per
+        // frame. `boot_min_disp_px` is the (constant) parallax gate.
+        self.map.boot_min_disp_px = width as f32 * INIT_MIN_DISP_FRAC;
+        self.map.boot_matches = 0;
+        self.map.boot_median_disp_px = 0.0;
+        if anchor.is_some() {
+            // Anchor survived another frame — age it.
+            self.map.boot_anchor_age = self.map.boot_anchor_age.saturating_add(1);
+        } else {
+            self.map.boot_anchor_age = 0;
+        }
         if let Some((apts, adesc)) = anchor.as_ref() {
             let mm = brief::match_descriptors(adesc, descs);
+            self.map.boot_matches = mm.len() as u32;
             if mm.len() >= INIT_MIN_MATCHES {
                 let mut disp: Vec<f32> = mm
                     .iter()
@@ -328,6 +341,7 @@ impl Frontend {
                 disp.sort_by(|x, y| x.partial_cmp(y).unwrap());
                 let med = disp[disp.len() / 2];
                 let min_disp = width as f32 * INIT_MIN_DISP_FRAC;
+                self.map.boot_median_disp_px = med;
                 if med >= min_disp {
                     let corrs: Vec<twoview::Corr> = mm
                         .iter()
@@ -443,6 +457,8 @@ impl Frontend {
             // still parallaxes every off-axis point — only pure
             // rotation yields none, so that is what we ask for.
             self.map.status = "anchor set — drive forward for parallax".into();
+            self.map.boot_anchor_age = 0;
+            self.map.boot_anchor_resets = self.map.boot_anchor_resets.saturating_add(1);
         }
         next
     }

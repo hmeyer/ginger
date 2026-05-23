@@ -160,6 +160,27 @@ pub struct MapSnapshot {
     pub bow_ready: bool,
     /// BoW vocabulary word count, 0 until trained (debug HUD).
     pub bow_words: u32,
+    // ── Two-view bootstrap diagnostics ────────────────────────────────────
+    // Populated only while the frontend is in `Stage::Bootstrapping`
+    // (when `tracking == false`); zeros once tracking is live. Captured
+    // here rather than logged so a debug client can poll `/api/slam/map`
+    // at high rate and watch the curves while jogging the car around.
+    /// Matches between the current frame and the active anchor (0 if no
+    /// anchor yet).
+    pub boot_matches: u32,
+    /// Median pixel disparity of those matches (0 if no anchor / no
+    /// matches yet).
+    pub boot_median_disp_px: f32,
+    /// Parallax threshold the bootstrap is gated on
+    /// (`width * INIT_MIN_DISP_FRAC`).
+    pub boot_min_disp_px: f32,
+    /// Frames the current anchor has been alive for (resets to 0 each
+    /// time the anchor is replaced).
+    pub boot_anchor_age: u32,
+    /// Cumulative anchor resets since the process started — a quick
+    /// signal for "the anchor keeps getting thrown away before
+    /// parallax can grow".
+    pub boot_anchor_resets: u32,
 }
 
 impl MapSnapshot {
@@ -178,6 +199,11 @@ impl MapSnapshot {
             loop_closures: 0,
             bow_ready: false,
             bow_words: 0,
+            boot_matches: 0,
+            boot_median_disp_px: 0.0,
+            boot_min_disp_px: 0.0,
+            boot_anchor_age: 0,
+            boot_anchor_resets: 0,
         }
     }
 }
@@ -228,6 +254,12 @@ pub(crate) fn publish_map(
         loop_closures: 0,
         bow_ready: false,
         bow_words: 0,
+        // Bootstrap diagnostics are only meaningful pre-init; zero here.
+        boot_matches: 0,
+        boot_median_disp_px: 0.0,
+        boot_min_disp_px: 0.0,
+        boot_anchor_age: 0,
+        boot_anchor_resets: 0,
     }
 }
 
