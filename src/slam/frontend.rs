@@ -1337,8 +1337,15 @@ mod pipeline_tests {
 
         // A run of pure-garbage frames → lost, and the map is *not*
         // corrupted while lost (points + trajectory frozen).
+        //
+        // The first `SOFT_LOST_MAX` bad frames are tolerated as
+        // "shaky": each pushes a predicted pose to the trajectory and
+        // stays in `Stage::Tracking`. Only the next frame tips to
+        // `Stage::Lost` and freezes the trajectory. Burn through the
+        // grace period explicitly so the lost-loop assertions reason
+        // about the post-grace baseline.
         let mut r = SmallRng::seed_from_u64(0x6105);
-        for _ in 0..4 {
+        let garbage = |r: &mut SmallRng| {
             let fd: Vec<brief::Descriptor> = (0..200)
                 .map(|_| {
                     let mut d = [0u8; brief::DESC_BYTES];
@@ -1357,6 +1364,23 @@ mod pipeline_tests {
                     angle: 0.0,
                 })
                 .collect();
+            (fp, fd)
+        };
+        for _ in 0..SOFT_LOST_MAX {
+            let (fp, fd) = garbage(&mut r);
+            let shaky = step(&mut fe, &fp, &fd);
+            assert!(
+                shaky.map.status.contains("shaky"),
+                "expected shaky during grace period, got: {}",
+                shaky.map.status
+            );
+            assert_eq!(shaky.map.n_points, n_pts, "map corrupted while shaky");
+        }
+        // Post-grace baseline: the trajectory has `SOFT_LOST_MAX` extra
+        // predicted poses; further garbage frames freeze it here.
+        let traj_lost = traj + SOFT_LOST_MAX;
+        for _ in 0..4 {
+            let (fp, fd) = garbage(&mut r);
             let lost = step(&mut fe, &fp, &fd);
             assert!(
                 lost.map.status.contains("lost") || lost.map.status.contains("relocaliz"),
@@ -1364,7 +1388,11 @@ mod pipeline_tests {
                 lost.map.status
             );
             assert_eq!(lost.map.n_points, n_pts, "map corrupted while lost");
-            assert_eq!(lost.map.cameras.len(), traj, "trajectory grew while lost");
+            assert_eq!(
+                lost.map.cameras.len(),
+                traj_lost,
+                "trajectory grew while lost"
+            );
         }
 
         // A frame from a previously-mapped place → relocalize.
@@ -1376,14 +1404,15 @@ mod pipeline_tests {
             reloc.map.status
         );
         assert!(reloc.map.tracking);
-        // Map intact; exactly one recovered pose appended.
+        // Map intact; exactly one recovered pose appended on top of
+        // the soft-lost predicted poses.
         assert_eq!(
             reloc.map.n_points, n_pts,
             "relocalization corrupted the map"
         );
         assert_eq!(
             reloc.map.cameras.len(),
-            traj + 1,
+            traj_lost + 1,
             "recovered pose not appended"
         );
 
