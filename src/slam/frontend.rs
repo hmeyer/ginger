@@ -58,8 +58,12 @@ const ANCHOR_RESET_MATCHES: usize = 40;
 
 // Tracking gates: min map-point matches to attempt a pose solve, and
 // min reprojection inliers for the refined pose to be trusted.
+// `TRACK_MIN_INLIERS` was 10; lowered to 6 (2026-05-23) because live
+// post-reloc cycles consistently landed at 6–9 inliers and were being
+// thrown out, even though the pose was usable. A continuously usable
+// 6-inlier pose beats a perfectly-conditioned-but-never-running 10.
 const TRACK_MIN_MATCHES: usize = 15;
-const TRACK_MIN_INLIERS: usize = 10;
+const TRACK_MIN_INLIERS: usize = 6;
 
 /// Consecutive frames a weak tracking solve can be tolerated before
 /// declaring `Stage::Lost`. The constant-velocity prediction can be
