@@ -68,6 +68,32 @@ frozen snapshot, so it might or might not be representative.
 
 ## Progress log (cont.)
 
+**2026-05-24 — session 5 (Claude + Ginger) — iterating toward room exploration**
+
+Goal: get to "explore the room without losing tracking" by iterating
+tuning levers on top of the IMU-predict baseline. Each iter = code
+change → deploy → drive-test → record outcome → commit + push.
+
+* **Iter 1: TRACK_MIN_INLIERS 6 → 4** (`4251096`). **Partial win.**
+  Multi-pulse forward + gentle-curve exploration (forward 1300×0.4s
+  → gentle right arc 1000/600 × 0.5s → forward → gentle left arc
+  600/1000 × 0.5s → forward, all with 1.2s pauses between) **survived
+  end-to-end with zero LOST events.** Map grew 14 kf / 560 pts →
+  48 kf / 2041 pts, inliers ranged 67–162. This is the cleanest
+  sustained-tracking trace in the project so far.
+
+  *Failure boundary, still:* a sharper in-place turn (3× ±700 for 0.6s,
+  diff=1400, ~90° total) lost tracking with `weak 1/131 inliers`. The
+  IMU predict positioned the tracker correctly but the descriptor
+  matches were mostly to features at the *previous* orientation — they
+  matched, but didn't reproject. Same map-coverage failure mode as
+  session 4, just at a higher rotation budget than before.
+
+  *Working envelope* with iter 1 active: forward pulses up to
+  1500 × 0.5s, curves at differential ≤ 600, in-place spins still
+  not safe past ~30°. **This is enough to explore a room incrementally
+  — turning corners requires a forward+curve combo, not a stop-spin.**
+
 **2026-05-24 — session 4 (Claude + Ginger) — Stages 3+4 done, validated**
 
 * **Stage 3 (auto-bias on boot)** shipped (`b037d77`). Bias FSM in
