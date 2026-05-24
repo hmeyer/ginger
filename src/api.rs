@@ -33,6 +33,21 @@ pub struct SensorSnapshot {
     pub gain: f32,
     pub brightness: f32,
     pub luma: u8,
+    /// IMU gyro vector in deg/s (IMU body frame). `None` when the BMI160
+    /// wasn't reachable at boot — same gate as `/api/imu/sample` 503.
+    pub imu_gyro_dps: Option<[f32; 3]>,
+    /// IMU accelerometer vector in m/s² (IMU body frame, gravity included).
+    pub imu_accel_mps2: Option<[f32; 3]>,
+    /// Achieved polling rate (EWMA). Should sit ~200 Hz; sagging means
+    /// the I²C bus is busy (PCA9685/ADS7830 contention).
+    pub imu_rate_hz: Option<f32>,
+    /// Signed ms gap between latest camera frame arrival and latest IMU
+    /// sample, on the same monotonic clock: `frame_ago_ms − sample_ago_ms`.
+    /// Positive = frame is older (typical with a 200 Hz IMU and ~10 Hz
+    /// camera, so this should sit in roughly `[0, camera_period_ms]`).
+    /// A steady drift here would break Stage 4's gyro pre-integration —
+    /// this is the canary surfaced in the WebUI.
+    pub imu_frame_sync_ms: Option<f32>,
 }
 
 impl SensorSnapshot {
@@ -54,6 +69,10 @@ impl SensorSnapshot {
             gain: 8.0,
             brightness: 0.0,
             luma: 0,
+            imu_gyro_dps: None,
+            imu_accel_mps2: None,
+            imu_rate_hz: None,
+            imu_frame_sync_ms: None,
         }
     }
 }

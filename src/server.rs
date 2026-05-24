@@ -101,6 +101,23 @@ async fn sensor_stream(
                 snap.brightness = exp.current_brightness;
                 snap.luma = exp.current_luma;
             }
+            // IMU read-out + sync canary. Compute camera_age and
+            // sample_age from the *same* `now` snapshot so the WebUI's
+            // sync-gap number can't pick up jitter from two separate
+            // Instant::now() calls.
+            if let Some(imu) = st.imu.as_ref() {
+                snap.imu_rate_hz = Some(imu.rate_hz());
+                if let Some(s) = imu.latest() {
+                    snap.imu_gyro_dps = Some(s.raw.gyro_dps());
+                    snap.imu_accel_mps2 = Some(s.raw.accel_mps2());
+                    let now = std::time::Instant::now();
+                    let sample_age = now.duration_since(s.t_read).as_secs_f32() * 1000.0;
+                    if let Some(f) = st.camera.try_frame() {
+                        let frame_age = now.duration_since(f.t_capture).as_secs_f32() * 1000.0;
+                        snap.imu_frame_sync_ms = Some(frame_age - sample_age);
+                    }
+                }
+            }
             let json = serde_json::to_string(&snap).unwrap();
             yield Ok::<Event, Infallible>(Event::default().data(json));
         }

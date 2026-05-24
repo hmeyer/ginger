@@ -227,6 +227,14 @@ footer{
       <div class="row"><span class="val" id="v-us">—</span><span style="color:var(--dim2)">cm</span></div>
       <div class="row"><span class="lbl" style="min-width:32px">TTC</span><span class="val" id="v-ttc">—</span><span style="color:var(--dim2);font-size:.8rem">s</span></div>
     </div>
+    <div class="card" id="imu-card" title="BMI160 IMU — gyro and accelerometer in the IMU body frame">
+      <div class="card-title">IMU <span id="v-imu-rate" style="color:var(--dim2);font-size:.7rem;font-weight:normal;margin-left:4px">—</span></div>
+      <div class="row"><span class="lbl" style="min-width:32px">gyro</span><span class="val" id="v-imu-gyro">—</span><span style="color:var(--dim2);font-size:.75rem">°/s</span></div>
+      <div class="row"><span class="lbl" style="min-width:32px">accel</span><span class="val" id="v-imu-accel">—</span><span style="color:var(--dim2);font-size:.75rem">m/s²</span></div>
+      <div class="row" title="Frame-to-sample monotonic-clock gap. Should sit near zero (or up to one camera period) and stay stable; a steady drift means the camera and IMU clocks have diverged.">
+        <span class="lbl" style="min-width:32px">sync</span><span class="val" id="v-imu-sync">—</span><span style="color:var(--dim2);font-size:.75rem">ms</span>
+      </div>
+    </div>
   </aside>
 </div>
 
@@ -275,6 +283,15 @@ footer{
       <div class="dot" id="ir-c-m"></div>
       <div class="dot" id="ir-r-m"></div>
     </div>
+  </div>
+  <div class="sv-sep"></div>
+  <div class="sv" title="BMI160 IMU — |gyro| in °/s and frame↔sample sync gap in ms">
+    <span class="lbl">IMU</span>
+    <span class="val" id="v-imu-gyro-m">—</span>
+    <span class="unit">°/s</span>
+    <span class="lbl" style="margin-left:4px">Δt</span>
+    <span class="val" id="v-imu-sync-m">—</span>
+    <span class="unit">ms</span>
   </div>
 </div>
 
@@ -633,6 +650,35 @@ sse.onmessage = e => {
     document.getElementById('ir-r-m').className = 'dot' + (d.ir[2] ? ' on' : '');
   } else {
     ['ir-l-m','ir-c-m','ir-r-m'].forEach(id => document.getElementById(id).className = 'dot');
+  }
+
+  // IMU. All four fields are null when the BMI160 isn't on the bus — in
+  // that case the card stays at "—" rather than mixing fresh and stale.
+  const v3 = (a, n) => a ? a.map(x => x.toFixed(n)).join(' ') : '—';
+  document.getElementById('v-imu-gyro').textContent  = v3(d.imu_gyro_dps, 1);
+  document.getElementById('v-imu-accel').textContent = v3(d.imu_accel_mps2, 2);
+  document.getElementById('v-imu-rate').textContent  = d.imu_rate_hz != null ? d.imu_rate_hz.toFixed(0) + ' Hz' : '—';
+  // Sync canary: colour green if the gap stays inside one camera period
+  // (~100 ms at 10 fps), amber if it slips past, red if growing fast.
+  // Sign is preserved in the readout so a negative gap (IMU sample older
+  // than the latest frame, which shouldn't happen) is visible.
+  {
+    const g = d.imu_frame_sync_ms;
+    const txt = g != null ? (g >= 0 ? '+' : '') + g.toFixed(0) : '—';
+    const a = g == null ? null : Math.abs(g);
+    const col = a == null ? '' : a < 110 ? 'var(--ok)' : a < 300 ? 'var(--warn)' : 'var(--err)';
+    const el = document.getElementById('v-imu-sync');
+    el.textContent = txt;
+    el.style.color = col;
+  }
+  // Mobile strip summary: |gyro| magnitude (one number, easier on the eye
+  // than three) and the sync-gap.
+  {
+    const a = d.imu_gyro_dps;
+    const mag = a ? Math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]) : null;
+    document.getElementById('v-imu-gyro-m').textContent = mag != null ? mag.toFixed(0) : '—';
+    const g = d.imu_frame_sync_ms;
+    document.getElementById('v-imu-sync-m').textContent = g != null ? g.toFixed(0) : '—';
   }
 };
 
