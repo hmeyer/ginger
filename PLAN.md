@@ -43,26 +43,45 @@ wrong, or the matches are mostly wrong correspondences, or the gate is
 too tight for this descriptor noise. But that diagnosis came from a
 frozen snapshot, so it might or might not be representative.
 
-## Tomorrow's loop
+## Progress log
 
-1. **Confirm the fix is live and the SLAM threads stay up under load.**
-   `git pull` on the Pi (already auto-deployed by `ginger-pull`), open
-   `/api/slam/map`, drive forward, then back, then turn. The snapshot
-   must keep updating (look at the keyframes growing); `n_lost`
-   increment is fine, a *frozen* snapshot is the regression. Check
-   `journalctl --user-unit=ginger | grep panic` is empty.
+**2026-05-24 — session 1 (Claude + Ginger)**
 
-2. **Drive in ≤ 1 s pulses** through the kitchen, *checking the camera
-   view* (`/api/camera/frame`) between pulses. The current trace had
-   a 1 s forward pulse at ~35 % of the WebUI joystick range producing
-   only ~20–26 px disparity — that's the cadence the gates are tuned
-   for. In raw `/api/drive` PWM terms (the field the HTTP body actually
-   carries, range ±4095, WebUI full-stick = 2000) that's roughly
-   `left=right=700`. Pulses that are too long or too aggressive cause
-   motion blur and that's a separate failure mode we are not trying
-   to solve yet.
+* **Step 1 — fix is live and threads stay up: DONE.** Verified the
+  panic-fix binary by polling `/api/slam/map` at ~3 Hz across two
+  drive sessions (156 + 606 ticks, **0 frozen snapshots**). Service
+  PID stayed put; no panic strings. Bootstrap succeeded during the
+  test (kf 0 → 383 across the run), inlier ratios 60–95 %.
+* **Step 2 — drive-in-pulses cadence: PARTIALLY DONE.** Did short
+  forward / back / turn pulses in the middle of the living room
+  (drying-rack + basket ~1 m on either side). `n_lost` stayed at 2
+  the entire time — *no new LOST events triggered*. Real translation
+  needed `duty≈1500` (≈0.7 s pulses ≈40 cm); 35-raw didn't move the
+  wheels at all. That gotcha is now documented in `CLAUDE.md` and the
+  step-2 wording above.
+* **Step 3 — diagnose first reproducible LOST: BLOCKED.** No LOST
+  reproduced in this session. The "0/64 weak inliers" pattern from
+  the original journal trace looks more and more like the
+  frozen-snapshot artifact: when the threads are actually alive and
+  the robot moves at a sane cadence, tracking is healthy. The next
+  session needs *deliberately adversarial* driving — see *Next* below.
 
-3. **Diagnose the first reproducible LOST and ship a targeted fix.**
+## Next
+
+1. **Move around enough to actually lose tracking.** Easy cases ruled
+   out by session 1: gentle pulses in a textured scene. Try, in order:
+   * Sustained ≥ 2 s forward at `duty≈1800` — pushes the const-velocity
+     predict harder and increases motion blur on this rolling-shutter
+     sensor.
+   * Fast in-place spins (`±1800` for 1+ s) — pure rotation gives no
+     parallax, breaks any tracker that relies on translation.
+   * Drive into a low-texture area (a blank-ish wall, the dark area
+     under the laundry rack) — match supply collapses, reproj gate
+     starves.
+   * U-turn so the camera *leaves* the mapped region — forces
+     relocalization-from-cold; this is where the original bug bit.
+
+2. **Diagnose the first reproducible LOST and ship a targeted fix.**
    Likely candidates, in rough order of suspicion:
 
    * **CV-prediction blow-up on motion onset / direction change.**
@@ -84,9 +103,12 @@ frozen snapshot, so it might or might not be representative.
    Intrinsics are no longer a suspect: the verified ChArUco calibration
    (`slam.toml`, rms 0.289 px) landed on `main` ahead of this work.
 
-4. **Stop only when a multi-minute kitchen exploration session reports
-   no `lost: true` snapshots.** Save the live `/api/slam/map` snapshot
-   that proves it, so the success criterion is verifiable.
+3. **Success criterion (revised).** The goal is no longer just "no
+   `lost: true` snapshots" — it's that the robot can *explore the
+   room using tracking*: drive across the floor, around the basket,
+   under the rack, return to the start, and the resulting map covers
+   that path without re-bootstrapping. Save the `/api/slam/map`
+   snapshot from such a session.
 
 ## Workflow
 
