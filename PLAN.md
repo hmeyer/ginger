@@ -66,22 +66,71 @@ frozen snapshot, so it might or might not be representative.
   the robot moves at a sane cadence, tracking is healthy. The next
   session needs *deliberately adversarial* driving — see *Next* below.
 
+## Progress log (cont.)
+
+**2026-05-24 — session 2 (Claude + Ginger)**
+
+* **First reproducible LOST: fast in-place spin.** Sequence:
+  forward 1 s @ `duty=1800` then *immediately* spin `±1800` for 1.2 s
+  (no stop between). Tracked healthily through the forward
+  (60–71 inliers, kf 4 → 26) and into the spin (30/48, kf 27 with
+  +41 newly triangulated pts), then collapsed in ~14 frames:
+  *only 8 map matches → soft-lost → 3 soft-lost frames → Stage::Lost*.
+  Lost for 148 frames (~5 s) with the **map preserved** at 29 kf /
+  196 pts — BoW-ready give-up budget. `RELOC_MAX_FRAMES_BOW` fired
+  at frame 148; `reset_world` + re-bootstrap with zero panic. The
+  panic fix is solid; the failure is upstream.
+* **Slow spin survives.** Same starting state, spin `±600` for 3 s,
+  ended at 15 kf / 187 pts, still `tracking=true`. So the failure
+  mode is *rate*-driven, not a structural map issue.
+* **Diagnosis (mono-SLAM intrinsic).** Two compounding effects:
+  1. *Mapper can't keep up at high angular velocity.* `needs_keyframe`
+     fires every couple of frames during a fast pan, but each kf's
+     triangulation against its covisible neighbours takes finite time
+     (`LOCAL_BA_K=6` window, `LOCAL_BA_ITERS=5`).
+  2. *Pure rotation has zero parallax*, so even when the mapper does
+     pick up a fast-spin kf, it can't triangulate fresh points against
+     the just-previous (also-rotation-only) kf. New geometry only
+     appears for pairs that bracket some translation, which a pure
+     spin doesn't provide.
+  Net effect: the camera sweeps into unmapped scenery faster than map
+  points can be created there. Tracking starves on "only N map matches".
+  This is a generic mono-SLAM limitation (ORB-SLAM3 et al. also need
+  IMU or translation-during-rotation to bridge fast pans).
+* **Two-tier exploration limit observed empirically (this room):**
+  * Safe / mapping-friendly: differential ≤ ~1200 (e.g. `±600`
+    in-place spin, or curved forward turns).
+  * Tracking-breaking: differential ≥ ~3000 (e.g. `±1500..±2000`
+    in-place spins).
+  Threshold not narrowed further this session; ~2000 differential
+  is the next data point to gather.
+
 ## Next
 
-1. **Move around enough to actually lose tracking.** Easy cases ruled
-   out by session 1: gentle pulses in a textured scene. Try, in order:
-   * Sustained ≥ 2 s forward at `duty≈1800` — pushes the const-velocity
-     predict harder and increases motion blur on this rolling-shutter
-     sensor.
-   * Fast in-place spins (`±1800` for 1+ s) — pure rotation gives no
-     parallax, breaks any tracker that relies on translation.
-   * Drive into a low-texture area (a blank-ish wall, the dark area
-     under the laundry rack) — match supply collapses, reproj gate
-     starves.
-   * U-turn so the camera *leaves* the mapped region — forces
-     relocalization-from-cold; this is where the original bug bit.
+1. **Demonstrate "explore the room" works at safe rates.** Drive a
+   multi-pulse session staying under `|left - right| ≤ 1200`,
+   preferring curved arcs (translation + rotation) over in-place
+   spins. Success = `tracking=true` throughout, map grows monotonically,
+   `n_lost` stays at its starting value. Save the final
+   `/api/slam/map` snapshot.
 
-2. **Diagnose the first reproducible LOST and ship a targeted fix.**
+2. **Pick a real SLAM-side fix for fast rotation** (deferred to a
+   later session — non-trivial). Realistic options in rough
+   impact-to-cost order:
+   * **Soft angular-velocity clamp in the supervisor** (~10 LOC):
+     when `|left - right|` exceeds a threshold, scale it down while
+     keeping the translation mean. Saves users from themselves; does
+     not advance the SLAM's actual capability.
+   * **Frame-to-frame fallback when map matches starve**: match
+     current frame against `self.prev` for orientation-only updates
+     during shaky spans. Keeps the trajectory rotational-consistent
+     across short pans; modest scope (~100 LOC).
+   * **Panoramic mode** (proper fix): detect pure-rotation segments
+     and switch to 2D-2D homography tracking, populate BoW from
+     orientation-only keyframes, fold them into the metric map when
+     translation resumes. Multi-day, touches `slam-core`.
+
+3. **Out of scope here:** IMU fusion (no IMU on this chassis).
    Likely candidates, in rough order of suspicion:
 
    * **CV-prediction blow-up on motion onset / direction change.**
