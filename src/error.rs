@@ -14,6 +14,8 @@ pub enum Error {
     Timeout(&'static str),
     #[error("Camera: {0}")]
     Camera(String),
+    #[error("IMU: {0}")]
+    Imu(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
