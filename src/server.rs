@@ -61,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/slam/map", get(slam_map))
         .route("/api/camera/frame", get(camera_frame))
         .route("/api/imu/sample", get(imu_sample))
+        .route("/api/imu/calibrate", post(imu_calibrate))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -108,7 +109,9 @@ async fn sensor_stream(
             if let Some(imu) = st.imu.as_ref() {
                 snap.imu_rate_hz = Some(imu.rate_hz());
                 if let Some(s) = imu.latest() {
-                    snap.imu_gyro_dps = Some(s.raw.gyro_dps());
+                    let b = imu.gyro_bias_dps();
+                    let g = s.raw.gyro_dps();
+                    snap.imu_gyro_dps = Some([g[0] - b[0], g[1] - b[1], g[2] - b[2]]);
                     snap.imu_accel_mps2 = Some(s.raw.accel_mps2());
                     let now = std::time::Instant::now();
                     let sample_age = now.duration_since(s.t_read).as_secs_f32() * 1000.0;
@@ -252,9 +255,11 @@ async fn imu_sample(State(st): State<AppState>) -> Response {
     let frame_t = st.camera.try_frame().map(|f| f.t_capture);
     let t_frame_capture_ago_ms = frame_t.map(|t| now.duration_since(t).as_secs_f32() * 1000.0);
     let frame_to_sample_ms = t_frame_capture_ago_ms.map(|f| f - t_sample_ago_ms);
+    let bias = imu.gyro_bias_dps();
+    let g = s.raw.gyro_dps();
 
     Json(ImuSampleView {
-        gyro_dps: s.raw.gyro_dps(),
+        gyro_dps: [g[0] - bias[0], g[1] - bias[1], g[2] - bias[2]],
         accel_mps2: s.raw.accel_mps2(),
         sensortime: s.sensortime,
         rate_hz: imu.rate_hz(),
@@ -263,6 +268,24 @@ async fn imu_sample(State(st): State<AppState>) -> Response {
         frame_to_sample_ms,
     })
     .into_response()
+}
+
+/// Restart the IMU's auto-bias collection window. Use after placing the
+/// chassis still if the auto-on-boot attempt aborted (e.g. the robot was
+/// being moved during the first second). Returns 200 always when the IMU
+/// is present, 503 when it isn't — the WebUI may bind this to a button
+/// without needing a body.
+async fn imu_calibrate(State(st): State<AppState>) -> Response {
+    let Some(imu) = st.imu.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            "imu not initialised",
+        )
+            .into_response();
+    };
+    imu.recalibrate_bias();
+    StatusCode::OK.into_response()
 }
 
 // ── WebRTC signalling ─────────────────────────────────────────────────────────

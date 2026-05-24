@@ -22,12 +22,15 @@
 //!
 //! ### What's not in this module (yet)
 //!
-//! * Gyro bias calibration — Stage 3 (`bin/calib-imu.rs` writes
-//!   `slam.toml` `[imu]`).
 //! * Consumption by the SLAM frontend's tracking-predict — Stage 4
 //!   (`src/slam/frontend.rs` will `recent_since(t_prev_frame)` from this
-//!   ring and pre-integrate).
+//!   ring and pre-integrate, with `gyro_bias_dps()` subtracted per sample).
 //! * IMU-as-BA-constraint factors — Stage 6+ per `PLAN.md`.
+//!
+//! Auto-bias-on-boot is in place (`BiasState` FSM below): no on-disk
+//! persistence — the bias is temperature-dependent, and re-estimating
+//! every boot is more accurate than reloading a stale value. The
+//! `POST /api/imu/calibrate` endpoint restarts the window on demand.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -57,6 +60,19 @@ const SAMPLE_PERIOD: Duration = Duration::from_millis(5);
 /// unbounded ring would mask a stuck consumer.
 const RING_CAPACITY: usize = 2000;
 
+/// Bias-calibration window: collect ~1 s of samples after boot, then
+/// the same after each `recalibrate_bias()` call. At 142–200 Hz this is
+/// 140–200 samples, well over the law-of-large-numbers floor for the
+/// chip's ±0.05 dps RMS noise.
+const BIAS_WINDOW: Duration = Duration::from_millis(1000);
+
+/// Stationarity gate. Any single-sample gyro axis exceeding this magnitude
+/// during the bias window aborts the calibration — the chassis was moved
+/// while we were trying to learn the bias. Chosen well above the chip's
+/// noise floor (~0.05 dps RMS) but well below any deliberate motion
+/// (the slow-spin failure mode in session 2 used ±100 dps).
+const STATIONARY_DPS: f32 = 2.0;
+
 // ── Sample type ──────────────────────────────────────────────────────────────
 
 /// One IMU sample with both host and chip timestamps.
@@ -78,14 +94,43 @@ pub struct ImuSample {
 
 // ── Shared state between the polling thread and HTTP consumers ───────────────
 
+/// Bias-estimator FSM. `Collecting` and `Failed` both behave as "bias
+/// is zero" for the consumer; `Ready` returns the learned offset.
+#[derive(Debug, Clone, Copy)]
+enum BiasState {
+    /// First `BIAS_WINDOW` after boot / after a recalibrate request.
+    /// Samples are accumulated; movement aborts to `Failed`.
+    Collecting {
+        started_at: Instant,
+        sum_dps: [f32; 3],
+        n: u32,
+        aborted: bool,
+    },
+    /// Settled. Consumers subtract this from raw gyro before use.
+    Ready { bias_dps: [f32; 3] },
+    /// Window saw motion. Bias stays at zero until the operator
+    /// re-triggers via `recalibrate_bias()`; the predict eats the
+    /// resulting per-frame drift (negligible — see PLAN.md Stage 3).
+    Failed,
+}
+
+impl Default for BiasState {
+    fn default() -> Self {
+        BiasState::Collecting {
+            started_at: Instant::now(),
+            sum_dps: [0.0; 3],
+            n: 0,
+            aborted: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// Most-recently-read sample, populated after the first successful poll.
     latest: Option<ImuSample>,
     /// Bounded ring of recent samples in insertion order (oldest at the
-    /// front). Stage 4 will read the tail; for Stage 2 only `latest` is
-    /// surfaced, but the ring fills as soon as the thread is up so the
-    /// behaviour is testable in isolation.
+    /// front). Stage 4 reads the tail with `recent_since`.
     ring: VecDeque<ImuSample>,
     /// Rolling EWMA of the achieved sample rate, in Hz. Updated on every
     /// poll so the 1 Hz status log can report it without re-computing.
@@ -93,6 +138,21 @@ struct State {
     /// Total I²C read failures since boot — logged at the 1 Hz tick if
     /// non-zero so a flaky bus is visible.
     read_failures: u64,
+    /// Auto-bias estimator. Starts `Collecting`; transitions to `Ready`
+    /// after one `BIAS_WINDOW` of stationary samples, or `Failed` if
+    /// motion was detected during the window.
+    bias: BiasState,
+}
+
+impl State {
+    /// The learned bias (zeros until `Ready`). Cheap; safe to call on
+    /// every poll. Consumers subtract this before reporting / integrating.
+    fn current_bias_dps(&self) -> [f32; 3] {
+        match self.bias {
+            BiasState::Ready { bias_dps } => bias_dps,
+            _ => [0.0; 3],
+        }
+    }
 }
 
 // ── Public handle ────────────────────────────────────────────────────────────
@@ -154,6 +214,40 @@ impl Imu {
     pub fn rate_hz(&self) -> f32 {
         self.state.lock().unwrap().rate_hz
     }
+
+    /// Learned gyro bias in dps. Zeros until the calibrator transitions
+    /// to `Ready` (~1 s after boot, longer if motion was detected). Safe
+    /// to subtract unconditionally — pre-learning it's just a no-op
+    /// rather than wildly wrong.
+    pub fn gyro_bias_dps(&self) -> [f32; 3] {
+        self.state.lock().unwrap().current_bias_dps()
+    }
+
+    /// Restart the bias-collection window. Used by `POST /api/imu/calibrate`
+    /// after the operator places the chassis still — the auto-on-boot
+    /// attempt may have aborted because something was being adjusted.
+    pub fn recalibrate_bias(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.bias = BiasState::Collecting {
+            started_at: Instant::now(),
+            sum_dps: [0.0; 3],
+            n: 0,
+            aborted: false,
+        };
+        info!("imu: bias recalibration requested");
+    }
+
+    /// `true` once auto-bias has settled (one of `Ready` / `Failed`).
+    /// Used in tests; not surfaced yet (the WebUI just shows the bias
+    /// value, which is zero in both `Collecting` and `Failed` states —
+    /// indistinguishable for human-eyeball purposes).
+    #[cfg(test)]
+    fn bias_settled(&self) -> bool {
+        !matches!(
+            self.state.lock().unwrap().bias,
+            BiasState::Collecting { .. }
+        )
+    }
 }
 
 // ── Polling thread ───────────────────────────────────────────────────────────
@@ -198,6 +292,46 @@ fn sample_loop<B: I2cBus>(mut chip: Bmi160<B>, state: Arc<Mutex<State>>) {
                     st.ring.pop_front();
                 }
                 st.ring.push_back(sample);
+                // Bias estimator. Cheap to evaluate even when settled;
+                // keeping the match here (not behind an early-return)
+                // means a future `recalibrate_bias()` instantly resumes
+                // collection without coordinating with the sample loop.
+                if let BiasState::Collecting {
+                    started_at,
+                    sum_dps,
+                    n,
+                    aborted,
+                } = &mut st.bias
+                {
+                    let g = sample.raw.gyro_dps();
+                    if g.iter().any(|c| c.abs() > STATIONARY_DPS) {
+                        *aborted = true;
+                    } else {
+                        for k in 0..3 {
+                            sum_dps[k] += g[k];
+                        }
+                        *n += 1;
+                    }
+                    if started_at.elapsed() >= BIAS_WINDOW {
+                        if *aborted || *n == 0 {
+                            warn!(
+                                "imu: bias calibration aborted — motion detected \
+                                 during the {BIAS_WINDOW:?} stationary window; \
+                                 bias stays at zero (POST /api/imu/calibrate to retry)"
+                            );
+                            st.bias = BiasState::Failed;
+                        } else {
+                            let nf = *n as f32;
+                            let bias_dps = [sum_dps[0] / nf, sum_dps[1] / nf, sum_dps[2] / nf];
+                            info!(
+                                "imu: bias learned from {n} samples — \
+                                 [{:+.3} {:+.3} {:+.3}] dps",
+                                bias_dps[0], bias_dps[1], bias_dps[2]
+                            );
+                            st.bias = BiasState::Ready { bias_dps };
+                        }
+                    }
+                }
             }
             Err(e) => {
                 let mut st = state.lock().unwrap();
@@ -344,5 +478,144 @@ mod tests {
         thread::sleep(Duration::from_millis(40));
         let future = Instant::now() + Duration::from_secs(60);
         assert!(imu.recent_since(future).is_empty());
+    }
+
+    /// At-rest bus that returns a constant non-zero gyro reading on
+    /// every burst — i.e. pure bias, no motion. The estimator must
+    /// converge to ≈ that value within one BIAS_WINDOW.
+    struct ConstantBiasBus {
+        gyro_raw: [i16; 3],
+    }
+
+    impl I2cBus for ConstantBiasBus {
+        fn write_byte(&mut self, _: u8, _: u8) -> crate::Result<()> {
+            Ok(())
+        }
+        fn read_byte(&mut self, reg: u8) -> crate::Result<u8> {
+            if reg == REG_CHIP_ID {
+                Ok(CHIP_ID_BMI160)
+            } else {
+                Ok(0)
+            }
+        }
+        fn read_block(&mut self, reg: u8, buf: &mut [u8]) -> crate::Result<()> {
+            for b in buf.iter_mut() {
+                *b = 0;
+            }
+            if reg == REG_DATA_GYR && buf.len() == 12 {
+                for (i, &raw) in self.gyro_raw.iter().enumerate() {
+                    buf[2 * i..2 * i + 2].copy_from_slice(&raw.to_le_bytes());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Bus that ramps gyro magnitude up over time so the bias window
+    /// sees clearly-non-stationary samples — the estimator must abort.
+    struct MovingBus {
+        i: Arc<AtomicU32>,
+    }
+
+    impl I2cBus for MovingBus {
+        fn write_byte(&mut self, _: u8, _: u8) -> crate::Result<()> {
+            Ok(())
+        }
+        fn read_byte(&mut self, reg: u8) -> crate::Result<u8> {
+            if reg == REG_CHIP_ID {
+                Ok(CHIP_ID_BMI160)
+            } else {
+                Ok(0)
+            }
+        }
+        fn read_block(&mut self, reg: u8, buf: &mut [u8]) -> crate::Result<()> {
+            for b in buf.iter_mut() {
+                *b = 0;
+            }
+            if reg == REG_DATA_GYR && buf.len() == 12 {
+                // raw of 10000 LSB → ~152 dps, well above STATIONARY_DPS.
+                let raw = 10_000i16.to_le_bytes();
+                buf[0..2].copy_from_slice(&raw);
+                self.i.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    /// Wait for the bias FSM to settle (Ready or Failed). Fails the test
+    /// if the window doesn't close within 2× BIAS_WINDOW + a generous
+    /// slack — that would indicate the estimator state machine is stuck.
+    fn wait_for_bias_settled(imu: &Imu) {
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline {
+            if imu.bias_settled() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("bias estimator never settled");
+    }
+
+    #[test]
+    fn auto_bias_converges_to_constant_offset_when_stationary() {
+        // 200 LSB ≈ 200 · 500/32768 ≈ 3.05 dps. Above the chip's noise
+        // floor, well below STATIONARY_DPS (2.0) so... wait, that's
+        // above it. Use a smaller value so the gate passes.
+        // 50 LSB ≈ 0.76 dps, comfortably under STATIONARY_DPS.
+        let bus = ConstantBiasBus {
+            gyro_raw: [50, -30, 20],
+        };
+        let chip = Bmi160::open(bus).unwrap();
+        let imu = Imu::spawn(chip);
+        wait_for_bias_settled(&imu);
+        let bias = imu.gyro_bias_dps();
+        let expected = [
+            50.0 * (500.0 / 32768.0),
+            -30.0 * (500.0 / 32768.0),
+            20.0 * (500.0 / 32768.0),
+        ];
+        // Tolerate ~5% — the estimator averages over a finite window
+        // and the constant gyro reading is exact, but timing jitter in
+        // the wait may include a partial first sample.
+        for k in 0..3 {
+            assert!(
+                (bias[k] - expected[k]).abs() < 0.05,
+                "axis {k}: bias {} vs expected {}",
+                bias[k],
+                expected[k]
+            );
+        }
+    }
+
+    #[test]
+    fn auto_bias_aborts_when_chassis_moves() {
+        let i = Arc::new(AtomicU32::new(0));
+        let bus = MovingBus { i: i.clone() };
+        let chip = Bmi160::open(bus).unwrap();
+        let imu = Imu::spawn(chip);
+        wait_for_bias_settled(&imu);
+        // Failed state surfaces as zero bias — same as Collecting — so
+        // we can't distinguish via gyro_bias_dps() alone. The settled
+        // check is the load-bearing assertion: the FSM transitioned out
+        // of Collecting (and to Failed since samples were non-stationary).
+        assert_eq!(imu.gyro_bias_dps(), [0.0; 3]);
+        // Sanity: the polling thread really did keep producing samples.
+        assert!(i.load(Ordering::SeqCst) > 10);
+    }
+
+    #[test]
+    fn recalibrate_resets_a_failed_window() {
+        let i = Arc::new(AtomicU32::new(0));
+        let bus = MovingBus { i: i.clone() };
+        let chip = Bmi160::open(bus).unwrap();
+        let imu = Imu::spawn(chip);
+        wait_for_bias_settled(&imu); // → Failed
+        imu.recalibrate_bias();
+        // After recalibrate the FSM is back to Collecting, so
+        // bias_settled() should be false immediately.
+        assert!(
+            !imu.bias_settled(),
+            "recalibrate should put the FSM back into Collecting"
+        );
     }
 }
