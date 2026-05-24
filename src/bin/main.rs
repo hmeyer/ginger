@@ -1,12 +1,13 @@
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use log::info;
+use log::{info, warn};
 use tokio::sync::mpsc;
 
 use ginger_rs::{
     api::{Command, SensorSnapshot},
     camera::Camera,
+    imu::{self, Imu},
     robot::supervisor,
     server::{self, AppState},
     slam::{self, MapSnapshot, SlamSnapshot},
@@ -41,12 +42,32 @@ async fn main() {
             .expect("spawn slam thread");
     }
 
+    // Best-effort: a missing/flaky BMI160 must not stop the rest of the
+    // robot booting. The SLAM tracking-predict (Stage 4) treats the IMU
+    // as an enrichment; Stage 2 only ships /api/imu/sample for manual
+    // verification.
+    let imu = match Imu::open(imu::DEFAULT_ADDR) {
+        Ok(i) => {
+            info!("imu: BMI160 opened at 0x{:02x}", imu::DEFAULT_ADDR);
+            Some(Arc::new(i))
+        }
+        Err(e) => {
+            warn!(
+                "imu: BMI160 not available at 0x{:02x} ({e}); \
+                 /api/imu/sample will return 503",
+                imu::DEFAULT_ADDR
+            );
+            None
+        }
+    };
+
     server::serve(AppState {
         cmd_tx,
         sensors,
         camera,
         slam,
         map,
+        imu,
     })
     .await;
 }

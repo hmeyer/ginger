@@ -110,3 +110,36 @@ pub struct DriveBody {
 pub struct AngleBody {
     pub angle: f32,
 }
+
+// ── IMU sample (debug endpoint) ──────────────────────────────────────────────
+
+/// Wire format for `GET /api/imu/sample`: the latest BMI160 reading
+/// alongside the *current* host clock and the latest camera frame's
+/// capture time, so a caller can directly read off how far in the past
+/// each event was without doing any clock-domain conversion themselves.
+///
+/// `t_*_ago_ms` are all positive; they are `now - t_event` in
+/// milliseconds. The interesting one for sync verification is
+/// `frame_to_sample_ms = t_frame_capture_ago_ms - t_sample_ago_ms`,
+/// which is the host-monotonic gap between the latest camera frame and
+/// the latest IMU sample. With a 200 Hz IMU and a 10–30 Hz camera, this
+/// should be roughly uniform in `[0, 5 ms]`.
+#[derive(Clone, Serialize)]
+pub struct ImuSampleView {
+    pub gyro_dps: [f32; 3],
+    pub accel_mps2: [f32; 3],
+    /// Chip-internal 24-bit counter ticks (39.0625 µs each); a stalled
+    /// sample stream shows up as this not advancing across requests.
+    pub sensortime: u32,
+    /// Achieved sample rate EWMA in Hz.
+    pub rate_hz: f32,
+    /// Milliseconds between the IMU sample and "now" at request time.
+    pub t_sample_ago_ms: f32,
+    /// Milliseconds between the latest camera frame arrival and "now".
+    /// `None` if no camera frame has been captured yet.
+    pub t_frame_capture_ago_ms: Option<f32>,
+    /// Signed gap between the two: positive means the frame is older
+    /// than the IMU sample (typical, since the IMU is 200 Hz vs the
+    /// camera's ~10 Hz). Same as `t_frame_capture_ago_ms - t_sample_ago_ms`.
+    pub frame_to_sample_ms: Option<f32>,
+}

@@ -2,6 +2,7 @@ pub mod api;
 pub mod camera;
 pub mod devices;
 pub mod hal;
+pub mod imu;
 pub mod robot;
 pub mod server;
 pub mod slam;

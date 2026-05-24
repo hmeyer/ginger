@@ -8,9 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
-#[cfg(feature = "libcamera")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "libcamera")]
 use libcamera::{
@@ -48,6 +46,19 @@ pub struct Frame {
     pub height: u32,
     /// Raw YUYV bytes: 2 bytes per pixel, [Y0 U Y1 V] per 4-byte group.
     pub data: Vec<u8>,
+    /// Monotonic-clock instant the frame was received from libcamera (or
+    /// generated, in the mock). Used by the SLAM frontend to correlate
+    /// the frame with IMU samples (see [`crate::imu`]); both stamps live
+    /// on the same `Instant` clock so a direct `Duration` subtraction is
+    /// the gap between the events.
+    ///
+    /// This is *frame-arrival* time, a few ms after the actual start-of-
+    /// exposure. The chip-side start-of-exposure is in libcamera's
+    /// `SensorTimestamp` metadata; calibrating that constant offset is a
+    /// Stage-5 follow-up per `PLAN.md` and not needed for the gyro-
+    /// pre-integration predict in Stage 4 (which integrates *between*
+    /// frames, so a constant offset cancels out).
+    pub t_capture: Instant,
 }
 
 // ── Internal shared state ─────────────────────────────────────────────────────
@@ -283,13 +294,14 @@ fn run_camera(
                 ae_step(&mut cfg, luma, applied_brightness)
             };
 
+            let now = Instant::now();
             let frame = Arc::new(Frame {
                 width,
                 height,
                 data,
+                t_capture: now,
             });
 
-            let now = Instant::now();
             let dt = now.duration_since(last_frame_instant).as_secs_f32();
             last_frame_instant = now;
             if dt > 0.0 {

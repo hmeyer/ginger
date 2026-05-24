@@ -26,8 +26,9 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::{
-    api::{AngleBody, Command, DriveBody, SensorConfig, SensorSnapshot},
+    api::{AngleBody, Command, DriveBody, ImuSampleView, SensorConfig, SensorSnapshot},
     camera::Camera,
+    imu::Imu,
     slam::{MapSnapshot, SlamSnapshot},
     video::webrtc,
 };
@@ -43,6 +44,10 @@ pub struct AppState {
     pub camera: Arc<Camera>,
     pub slam: Arc<RwLock<SlamSnapshot>>,
     pub map: Arc<RwLock<MapSnapshot>>,
+    /// `None` when the BMI160 wasn't reachable at boot (no hardware,
+    /// flaky bus, headless dev / test). Endpoints that depend on it
+    /// answer 503 in that case rather than panicking.
+    pub imu: Option<Arc<Imu>>,
 }
 
 /// Build the axum router (all routes + shared state). Split out from
@@ -55,6 +60,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/slam/stream", get(slam_stream))
         .route("/api/slam/map", get(slam_map))
         .route("/api/camera/frame", get(camera_frame))
+        .route("/api/imu/sample", get(imu_sample))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -199,6 +205,49 @@ async fn camera_frame(State(st): State<AppState>, Query(p): Query<CameraFramePar
     ([(header::CONTENT_TYPE, "image/jpeg")], buf).into_response()
 }
 
+// ── IMU sample (debug / sync-verification) ────────────────────────────────────
+
+/// Latest BMI160 sample + the latest camera frame's capture time, both
+/// reported as "ago in ms" so the caller can read the host-monotonic
+/// gap directly. Returns 503 if the IMU wasn't initialized at boot
+/// (no chip on the bus) or if the polling thread hasn't produced a
+/// sample yet (first ~5–10 ms after start).
+async fn imu_sample(State(st): State<AppState>) -> Response {
+    let Some(imu) = st.imu.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            "imu not initialised",
+        )
+            .into_response();
+    };
+    let Some(s) = imu.latest() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            "imu sample not ready",
+        )
+            .into_response();
+    };
+
+    let now = std::time::Instant::now();
+    let t_sample_ago_ms = now.duration_since(s.t_read).as_secs_f32() * 1000.0;
+    let frame_t = st.camera.try_frame().map(|f| f.t_capture);
+    let t_frame_capture_ago_ms = frame_t.map(|t| now.duration_since(t).as_secs_f32() * 1000.0);
+    let frame_to_sample_ms = t_frame_capture_ago_ms.map(|f| f - t_sample_ago_ms);
+
+    Json(ImuSampleView {
+        gyro_dps: s.raw.gyro_dps(),
+        accel_mps2: s.raw.accel_mps2(),
+        sensortime: s.sensortime,
+        rate_hz: imu.rate_hz(),
+        t_sample_ago_ms,
+        t_frame_capture_ago_ms,
+        frame_to_sample_ms,
+    })
+    .into_response()
+}
+
 // ── WebRTC signalling ─────────────────────────────────────────────────────────
 
 async fn webrtc_whep(State(st): State<AppState>, body: String) -> Response {
@@ -278,6 +327,9 @@ mod tests {
             camera: Arc::new(Camera::new().expect("mock camera")),
             slam: Arc::new(RwLock::new(SlamSnapshot::initial())),
             map: Arc::new(RwLock::new(MapSnapshot::initial())),
+            // Headless: no chip on the bus. /api/imu/sample returns 503,
+            // which the next test asserts on.
+            imu: None,
         };
         // Distinctive values so the assertions check real serialization,
         // not just the `initial()` defaults.
@@ -331,6 +383,7 @@ mod tests {
         // because the encoder output can shift across versions, but the
         // JPEG container framing is stable.
         let resp = app
+            .clone()
             .oneshot(
                 Request::get("/api/camera/frame?w=64&q=70")
                     .body(Body::empty())
@@ -355,5 +408,15 @@ mod tests {
             &[0xff, 0xd9],
             "missing JPEG EOI marker"
         );
+
+        // GET /api/imu/sample — IMU absent in this headless config, so
+        // the handler must answer 503 rather than panic. Verifies the
+        // Option<Imu> fallback path; the populated path is exercised by
+        // `crate::imu::tests` and a manual on-Pi curl per PLAN.md.
+        let resp = app
+            .oneshot(Request::get("/api/imu/sample").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

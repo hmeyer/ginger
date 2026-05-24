@@ -37,6 +37,7 @@ mod tests {
             width: w,
             height: h,
             data,
+            t_capture: std::time::Instant::now(),
         }
     }
 

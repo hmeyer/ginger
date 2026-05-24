@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ginger_slam_core::dataset::{FrameSequence, GrayFrame};
 use log::{info, warn};
@@ -42,6 +42,7 @@ fn gray_to_yuyv(width: u32, height: u32, luma: &[u8]) -> Frame {
         width,
         height,
         data,
+        t_capture: Instant::now(),
     }
 }
 
