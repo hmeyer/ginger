@@ -104,60 +104,236 @@ frozen snapshot, so it might or might not be representative.
     in-place spins).
   Threshold not narrowed further this session; ~2000 differential
   is the next data point to gather.
+* **Exploration session at "safe" rates also failed — cumulative
+  rotation matters.** Three back-to-back gentle right arcs
+  (`left=900, right=300`, diff=600, ~0.8 s each) totalled ~90° of
+  rotation away from the mapped sector and lost tracking with
+  `weak 1/27 inliers`. Per-frame rate was safe; the *total* angular
+  drift past the mapped scenery was the killer. So a simple
+  supervisor clamp on instantaneous `|left-right|` would *not* have
+  helped this case — the failure is "rotated past what's been
+  mapped", not "rotated too fast in one moment".
+* **Relocalization-on-return works exactly as advertised.** Earlier
+  in the same session, a near-collision triggered Lost for 113
+  frames; the moment I backed up into the mapped scenery, BoW reloc
+  brought us back with `tracking: 94/198 inliers` and `n_lost`
+  intact. The recovery path is solid; *avoiding* the loss is what
+  needs help.
+* **Decision:** the right next move is to add an IMU (BMI160 lying
+  around in the user's bin). See *Next* below — pure software fixes
+  for the rotation problem all have heavy cost or partial coverage.
 
-## Next
+## Next: integrate a BMI160 IMU
 
-1. **Demonstrate "explore the room" works at safe rates.** Drive a
-   multi-pulse session staying under `|left - right| ≤ 1200`,
-   preferring curved arcs (translation + rotation) over in-place
-   spins. Success = `tracking=true` throughout, map grows monotonically,
-   `n_lost` stays at its starting value. Save the final
-   `/api/slam/map` snapshot.
+The session-2 failures are *generic mono-SLAM limits* — pure rotation
+has no triangulation parallax, and a const-velocity predict in SE(3)
+can't model motion onsets or direction changes well. An IMU is the
+standard fix: gyro pre-integration between camera frames gives an
+accurate rotation predict regardless of what the map looks like, and
+accelerometer + gravity eventually gives metric scale. We have a
+BMI160 (6-DOF: 3-axis gyro + 3-axis accel, I²C, 3.3 V) and the Pi's
+I²C bus already drives the PCA9685 PWM at `0x40` and the ADS7830 ADC
+at `0x48`, so the wiring is incremental.
 
-2. **Pick a real SLAM-side fix for fast rotation** (deferred to a
-   later session — non-trivial). Realistic options in rough
-   impact-to-cost order:
-   * **Soft angular-velocity clamp in the supervisor** (~10 LOC):
-     when `|left - right|` exceeds a threshold, scale it down while
-     keeping the translation mean. Saves users from themselves; does
-     not advance the SLAM's actual capability.
-   * **Frame-to-frame fallback when map matches starve**: match
-     current frame against `self.prev` for orientation-only updates
-     during shaky spans. Keeps the trajectory rotational-consistent
-     across short pans; modest scope (~100 LOC).
-   * **Panoramic mode** (proper fix): detect pure-rotation segments
-     and switch to 2D-2D homography tracking, populate BoW from
-     orientation-only keyframes, fold them into the metric map when
-     translation resumes. Multi-day, touches `slam-core`.
+### Hardware
 
-3. **Out of scope here:** IMU fusion (no IMU on this chassis).
-   Likely candidates, in rough order of suspicion:
+Pin out (Pi 4, BCM numbering — same bus the existing devices use):
 
-   * **CV-prediction blow-up on motion onset / direction change.**
-     `last_lost_reason: "weak 0/64 inliers"` with this many matches
-     means the predict was so far off that none of the matches lie
-     inside the 8 px/fx inlier gate. Two ways to attack: clamp the
-     predicted twist by a sane max-speed bound, or fall back to "no
-     motion" predict on the first frame after `relocalize()`. The
-     latter is already done — confirm it actually fires and check
-     whether two-frame turn-onsets need similar handling.
-   * **Inlier reprojection gate too tight at this hardware noise
-     floor.** 8 px/fx was already widened from 5. Try 10 or 12 and see
-     if the 0/64 turns into N/64.
-   * **Map points poorly conditioned in the current view.** If many
-     points are far + observed once, the predict has to be exact.
-     Tighten triangulation depth/parallax, or score points by
-     "n_observations" before using them for tracking.
+| Pi pin (BCM) | Pi pin (phys) | BMI160 pin | Notes |
+| --- | --- | --- | --- |
+| 3.3 V | 1 | VCC | **Not 5 V**; BMI160 is 3.3 V. |
+| GND | 9 | GND | Any ground pin. |
+| GPIO 2 (SDA1) | 3 | SDA | Shared with PCA9685, ADS7830. Pull-ups already on the bus. |
+| GPIO 3 (SCL1) | 5 | SCL | Same. |
 
-   Intrinsics are no longer a suspect: the verified ChArUco calibration
-   (`slam.toml`, rms 0.289 px) landed on `main` ahead of this work.
+I²C address: **0x68** if `SDO`/`AD0` is tied to GND (or floating —
+internal pull-down on most breakouts), **0x69** if tied to VCC.
+Confirm with `i2cdetect -y 1` after wiring — neither `0x68` nor
+`0x69` is in use today (only `0x40` and `0x48` show up).
 
-3. **Success criterion (revised).** The goal is no longer just "no
-   `lost: true` snapshots" — it's that the robot can *explore the
-   room using tracking*: drive across the floor, around the basket,
-   under the rack, return to the start, and the resulting map covers
-   that path without re-bootstrapping. Save the `/api/slam/map`
-   snapshot from such a session.
+Mounting: rigid attachment to the chassis is critical. The
+**IMU-camera relative orientation must not change at runtime** — any
+vibration or play injects rotational noise straight into the
+tracking-predict. Ideally mount close to the camera and aligned so
+the IMU axes are nominally parallel to the camera axes (saves work
+on the extrinsic calibration). A small zip-tied perfboard on the
+camera mount itself is fine; a flopping wire is not.
+
+### Software stages
+
+Each stage is a separately-mergeable commit / PR. Each adds tests.
+The headless DoD (`cargo test --workspace --no-default-features`)
+must stay green at every stage — gate the IMU behind the existing
+`libcamera` feature or a new `imu` feature, whichever is cleaner;
+**do not make non-IMU code paths require the hardware**.
+
+#### Stage 0 — post-solder verification (no Rust yet)
+
+After you finish soldering:
+
+```bash
+# Bus is detected, BMI160 shows up at 0x68 or 0x69
+i2cdetect -y 1
+
+# Read CHIP_ID (register 0x00) — must be 0xD1 for BMI160
+i2cget -y 1 0x68 0x00      # or 0x69 if SDO is tied high
+```
+
+If `i2cget` returns `0xd1`, the chip is alive and talking. If it
+returns `0x00` or `0xff`, recheck wiring (most often a swapped SDA/
+SCL or a 5 V/3.3 V mistake). Don't move to Stage 1 until this works.
+
+#### Stage 1 — HAL driver (`src/hal/bmi160.rs`)
+
+Follow the same shape as `src/hal/pca9685.rs` and `src/hal/adc.rs`:
+a `pub struct Bmi160 { i2c: I2c }` with `new(address: u16) -> Result<Self>`
+that powers up the gyro (`CMD = 0x15` for "PMU gyro normal") and
+accelerometer (`CMD = 0x11` for "PMU accel normal"), waits the
+chip's wakeup time (`~80 ms` for gyro, `~3.8 ms` for accel — check
+datasheet table 8), and verifies CHIP_ID == 0xD1.
+
+Public API to expose:
+
+* `read_gyro_raw(&mut self) -> Result<[i16; 3]>` — `DATA_8` ..
+  `DATA_13`, little-endian.
+* `read_accel_raw(&mut self) -> Result<[i16; 3]>` — `DATA_14` ..
+  `DATA_19`.
+* `read_both(&mut self) -> Result<([i16; 3], [i16; 3])>` — single
+  burst read of the 12 data bytes, cheapest and atomic (no
+  inter-axis jitter).
+* `read_sensortime(&mut self) -> Result<u32>` — chip's 24-bit
+  internal time at 39.0625 µs/tick; cheap way to detect dropped
+  samples.
+* Configurable range/ODR; sensible defaults: gyro `±500°/s` (range
+  reg `GYR_RANGE = 0x02`), gyro ODR `200 Hz` (`GYR_CONF = 0x09`),
+  accel `±4 g`, accel ODR `200 Hz`. 200 Hz is plenty given the
+  camera runs at ~30 Hz; we'll average 6–7 IMU samples per camera
+  frame for the pre-integration.
+
+Tests: mock the I²C bus (a `trait I2cBus` over `rppal::i2c::I2c`)
+so the driver is unit-testable without hardware — same trick the
+existing HAL would use if it had unit tests today (it mostly
+doesn't — fine to introduce just for this one).
+
+#### Stage 2 — sample loop + 1 Hz log + new HTTP endpoint
+
+Run a dedicated thread that loops on `read_both` at ~200 Hz, writes
+into a lock-free single-producer ring buffer keyed by `Instant`,
+and `info!`-logs the latest rate / latest sample once a second.
+Expose `GET /api/imu/sample` returning the latest `(gyro_dps,
+accel_mps2, t_mono_ns)` as JSON so we can verify the chip is
+sensible by hand (`curl /api/imu/sample` while shaking the chassis).
+
+This is the "ship a useful new endpoint and stop" gate. Don't touch
+SLAM yet. Confirm:
+
+* Gyro reads ≈ `[0, 0, 0]` when the robot is still (to within bias).
+* Accel reads ≈ one g along whichever axis is *up* (depends on
+  mounting; if you mounted Z-up it's `[0, 0, +9.81]`).
+* Rates: shake along one axis, see only that axis spike on gyro
+  (and on accel). If you see *all three* axes spike for a 1-axis
+  shake, the chip is mis-oriented or there's loose wiring.
+
+#### Stage 3 — gyro bias calibration
+
+A small CLI binary `bin/calib-imu.rs` (or sub-command of an existing
+one): hold the chassis still for ~10 s, average gyro to estimate
+the constant bias, write it into `slam.toml` next to the camera
+intrinsics. The existing config already has a `[slam]` table —
+add an `[imu]` table with `gyro_bias = [bx, by, bz]` (in dps) and a
+`temperature` field for sanity. Repeat the calibration if the
+ambient temperature shifts a lot — BMI160 gyro bias drifts ~0.05
+dps/°C.
+
+Camera-IMU extrinsic calibration is **not needed for stage 4** if
+you mount the IMU axis-aligned to the camera. Defer formal Kalibr-
+style extrinsics until stage 5+.
+
+#### Stage 4 — gyro-pre-integrated tracking-predict
+
+The current predict in `src/slam/frontend.rs` is:
+
+```rust
+let predict = if np >= 2 {
+    tracking::constant_velocity(&st.trajectory[np - 2], &st.trajectory[np - 1])
+} else {
+    st.trajectory[np - 1]
+};
+```
+
+Replace the *rotational* part of `predict` with the gyro
+pre-integration over the camera-frame interval. Translation predict
+stays CV for now (accel-based translation predict is much harder —
+requires reliable gravity subtraction and double integration that
+drifts fast). Concretely:
+
+1. Between camera frame `t_{k-1}` and `t_k`, pull all IMU samples
+   from the ring buffer and apply `ΔR = Π exp([ω_i - bias] × Δt_i)`
+   in SO(3). Use the slam-core `Lie` helpers — there is already a
+   `so3_exp` for this.
+2. Combine with the last pose's rotation:
+   `R_predict = R_{k-1} * R_camera_imu * ΔR * R_camera_imu^T` (the
+   conjugation handles the camera/IMU frame difference; if you
+   mounted axis-aligned, `R_camera_imu = I`).
+3. Translation predict: keep CV.
+4. Feed this predict into `tracking::track_pose` exactly as today.
+
+Add a flag (config or env var) to fall back to vision-only predict
+so we can A/B the change and have a kill switch if the IMU integration
+introduces a regression.
+
+Headless test: extend the existing tracking unit tests with a
+synthetic gyro stream and assert the predict rotates by the
+expected amount over a synthesized 1 s spin.
+
+#### Stage 5 — validation against today's failures
+
+Re-run session 2's failing fast-spin sequence with the same duty
+values (`±1800` for 1.2 s after a 1 s forward). The pass criteria:
+
+* `tracking=true` throughout the spin.
+* Map grows during the spin (kfs accepted at IMU-predicted poses
+  give the mapper a baseline to triangulate against later).
+* `n_lost` does not increment.
+
+If we still lose tracking, the next-most-likely culprit is camera-
+IMU temporal sync (we use `Instant::now()` for both, which can drift
+relative to the camera's hardware timestamp). Fall back to using the
+libcamera frame timestamp + the BMI160 `sensortime` register and
+estimate a constant offset.
+
+### Gotchas (write these in code comments at the touch points)
+
+* **Camera-IMU time alignment.** The libcamera frame timestamp is the
+  start-of-exposure (or end-of-exposure — check `request.metadata`),
+  not the frame-arrival time at our pipeline. Off-by-one-frame
+  alignment shows up as systematic over-rotation. Acceptable for
+  stage 4; revisit if stage 5 needs it.
+* **Coordinate frames.** Gyro `[ωx, ωy, ωz]` is in the *IMU* frame.
+  Camera SE(3) twist uses `[ρ; φ]` (translation, rotation) and the
+  rotation is in the *camera* frame. If the IMU is mounted with X
+  forward and the camera is mounted with Z forward (typical), a
+  90° axis swap is needed before integration. Write down the
+  convention in the bmi160 module docstring and unit-test it.
+* **Gyro bias drift with temperature.** Don't bake the calibration
+  into the binary; keep it in `slam.toml` so it's easy to recalibrate.
+* **Headless test must not require hardware.** Gate the actual i2c
+  path behind `cfg(feature = "libcamera")` (or a new `cfg(feature =
+  "imu")`); have the SLAM consume an `IMU: trait` with a mock
+  implementation that the test feeds synthetic gyro samples through.
+* **Pi I²C clock.** Default is 100 kHz; with three slaves on the bus
+  (PCA9685, ADS7830, BMI160) that's borderline for a 200 Hz gyro
+  stream. Bump to 400 kHz via `/boot/config.txt`
+  (`dtparam=i2c_arm_baudrate=400000`) — well within everything's
+  spec.
+
+### Success criterion for the whole IMU thread
+
+Same as the session-2 goal, just now achievable: the robot can be
+driven in a multi-minute exploration of the room — including
+in-place direction changes — with `tracking=true` for the whole
+session and the map growing monotonically. Save the `/api/slam/map`
+snapshot that proves it.
 
 ## Workflow
 
@@ -169,8 +345,11 @@ frozen snapshot, so it might or might not be representative.
   the `relocalizes_after_track_loss` style in
   `src/slam/frontend.rs`), run the workspace DoD, `make deploy`,
   observe.
-* Keep the *running TODO* (what's been tried, what worked) in this
-  PLAN.md and delete it when kitchen-exploration succeeds.
+* For the IMU thread specifically: every stage merges to `main`
+  on its own; do not stack stages in a single PR (each stage
+  changes behaviour subtly and should be bisectable).
+* Keep the *running TODO* in this PLAN.md and delete it (the whole
+  file) when room-scale exploration with tracking succeeds.
 
 ## Out of scope
 
@@ -181,3 +360,7 @@ frozen snapshot, so it might or might not be representative.
 * Frontend panic-resilience around the world mutex. With the mapper
   panic gone we shouldn't see a poisoned lock in normal operation;
   defense-in-depth there is a deferred task.
+* **Full visual-inertial bundle adjustment.** Stage 4 only uses the
+  IMU for the tracking-predict, not as a BA constraint. Adding IMU
+  factors to the local BA is the right *next* increment after Stage
+  5 lands; it's not a prerequisite for the room-exploration goal.
