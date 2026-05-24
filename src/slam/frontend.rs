@@ -262,12 +262,22 @@ impl Frontend {
 
     /// Process one frame's detected features (level-0 pixel coords with
     /// aligned descriptors). Pure given its inputs + prior state.
+    ///
+    /// `rotation_hint` is the camera-frame `ΔR` since the previous
+    /// frame: an external estimate (typically gyro-pre-integrated from
+    /// the IMU) of how much the camera rotated between `on_frame` calls.
+    /// When supplied during `Stage::Tracking`, it replaces the rotational
+    /// part of the constant-velocity predict — far more accurate for
+    /// fast spins / motion onsets, which is the failure mode session 2
+    /// reproduced. Pass `None` for vision-only behaviour (the default
+    /// when the IMU isn't present, or when `GINGER_IMU_PREDICT=0`).
     pub fn on_frame(
         &mut self,
         points: &[FeaturePoint],
         descs: &[brief::Descriptor],
         width: usize,
         height: usize,
+        rotation_hint: Option<UnitQuaternion<f64>>,
     ) -> FrameOut {
         if self.intrinsics.is_none() {
             let i = resolve_intrinsics(width as u32, height as u32);
@@ -328,7 +338,7 @@ impl Frontend {
                 Stage::Bootstrapping { anchor } => {
                     self.bootstrap(anchor, points, descs, width, cam)
                 }
-                Stage::Tracking(st) => self.track(st, points, descs, cam, fx),
+                Stage::Tracking(st) => self.track(st, points, descs, cam, fx, rotation_hint),
                 Stage::Lost { since, track } => {
                     self.relocalize(since, track, points, descs, cam, fx)
                 }
@@ -556,6 +566,7 @@ impl Frontend {
         descs: &[brief::Descriptor],
         cam: CameraModel,
         fx: f64,
+        rotation_hint: Option<UnitQuaternion<f64>>,
     ) -> Option<Stage> {
         let mut next: Option<Stage> = None;
         // Re-find map points: snapshot (id, desc, pos) of
@@ -584,11 +595,35 @@ impl Frontend {
         // Hoisted out of the match-count branch so soft-lost failures
         // can still push a predicted pose to keep the trajectory
         // contiguous and the const-velocity model warm.
+        //
+        // Predict policy: if an external rotation hint is available
+        // (gyro pre-integration over the inter-frame interval), use it
+        // for the *rotation* and CV for the *translation*. Rationale:
+        // the predict's rotation is what catches in-place spins (the
+        // session-2 failure mode), and a constant-velocity rotation
+        // model can't anticipate a sudden direction change, while a
+        // CV-translation predict is fine because the wheels don't
+        // reverse instantaneously. With no hint we fall back to pure
+        // CV — the historical behaviour, preserved for the
+        // `GINGER_IMU_PREDICT=0` kill switch.
         let np = st.trajectory.len();
-        let predict = if np >= 2 {
+        let cv = if np >= 2 {
             tracking::constant_velocity(&st.trajectory[np - 2], &st.trajectory[np - 1])
         } else {
             st.trajectory[np - 1]
+        };
+        let predict = match rotation_hint {
+            Some(dr) if np >= 1 => {
+                // Apply ΔR (camera frame) to the last pose's rotation.
+                // Poses are T_cw (world→camera): a camera rotating by
+                // ΔR in its own frame composes on the LEFT of the
+                // current rotation, since R_cw expresses world *as
+                // seen by* the camera. `cv.translation` keeps the
+                // wheel-derived inter-frame translation guess.
+                let new_rot = dr * st.trajectory[np - 1].rotation;
+                Isometry3::from_parts(cv.translation, new_rot)
+            }
+            _ => cv,
         };
         if mm.len() >= TRACK_MIN_MATCHES {
             let obs: Vec<Observation> = mm
@@ -1044,7 +1079,7 @@ mod pipeline_tests {
     /// its thread would (the tested seam is identical to production —
     /// only the driver differs: sync pump vs `recv` loop).
     fn step(fe: &mut Frontend, fp: &[FeaturePoint], fd: &[brief::Descriptor]) -> FrameOut {
-        let out = fe.on_frame(fp, fd, W, H);
+        let out = fe.on_frame(fp, fd, W, H, None);
         fe.pump_local_mapper();
         out
     }
@@ -1245,7 +1280,7 @@ mod pipeline_tests {
         // case where one bad refine shouldn't destroy the map. The
         // (SOFT_LOST_MAX + 1)th tips to Stage::Lost.
         for i in 0..SOFT_LOST_MAX {
-            let shaky = fe.on_frame(&fp, &fd, W, H);
+            let shaky = fe.on_frame(&fp, &fd, W, H, None);
             assert!(
                 shaky.map.status.contains("shaky") || shaky.map.status.contains("predicting"),
                 "frame {i}: expected shaky status, got: {}",
@@ -1256,7 +1291,7 @@ mod pipeline_tests {
                 "map points corrupted at frame {i}"
             );
         }
-        let lost = fe.on_frame(&fp, &fd, W, H);
+        let lost = fe.on_frame(&fp, &fd, W, H, None);
         assert!(
             lost.map.status.contains("lost"),
             "expected lost after grace period, got: {}",

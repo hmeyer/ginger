@@ -32,20 +32,9 @@ async fn main() {
     let camera = Arc::new(Camera::new().expect("camera init failed"));
     println!("Camera ready.");
 
-    let slam = Arc::new(RwLock::new(SlamSnapshot::initial()));
-    let map = Arc::new(RwLock::new(MapSnapshot::initial()));
-    {
-        let (camera, slam, map) = (camera.clone(), slam.clone(), map.clone());
-        thread::Builder::new()
-            .name("slam".into())
-            .spawn(move || slam::run(camera, slam, map))
-            .expect("spawn slam thread");
-    }
-
     // Best-effort: a missing/flaky BMI160 must not stop the rest of the
     // robot booting. The SLAM tracking-predict (Stage 4) treats the IMU
-    // as an enrichment; Stage 2 only ships /api/imu/sample for manual
-    // verification.
+    // as an enrichment; when absent it falls back to constant-velocity.
     let imu = match Imu::open(imu::DEFAULT_ADDR) {
         Ok(i) => {
             info!("imu: BMI160 opened at 0x{:02x}", imu::DEFAULT_ADDR);
@@ -60,6 +49,16 @@ async fn main() {
             None
         }
     };
+
+    let slam = Arc::new(RwLock::new(SlamSnapshot::initial()));
+    let map = Arc::new(RwLock::new(MapSnapshot::initial()));
+    {
+        let (camera, imu, slam, map) = (camera.clone(), imu.clone(), slam.clone(), map.clone());
+        thread::Builder::new()
+            .name("slam".into())
+            .spawn(move || slam::run(camera, imu, slam, map))
+            .expect("spawn slam thread");
+    }
 
     server::serve(AppState {
         cmd_tx,
