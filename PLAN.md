@@ -68,6 +68,55 @@ frozen snapshot, so it might or might not be representative.
 
 ## Progress log (cont.)
 
+**2026-05-24 — session 4 (Claude + Ginger) — Stages 3+4 done, validated**
+
+* **Stage 3 (auto-bias on boot)** shipped (`b037d77`). Bias FSM in
+  `src/imu/mod.rs`: collects ~1 s of stationary samples, mean → bias.
+  `POST /api/imu/calibrate` re-runs on demand. Three tests; bias
+  surfaces to /api/imu/sample and the SSE stream subtracted. At-rest
+  gyro on the live binary now reads ~0.1 dps (was 0.2–0.4 dps).
+* **Stage 4 (IMU-pre-integrated rotation predict)** shipped (`33c6309`).
+  `Frontend::on_frame` gained an `Option<UnitQuaternion<f64>>` rotation
+  hint; `gyro_pre_integrate` in `src/slam/mod.rs` integrates the gyro
+  ring over `(prev_capture, t_curr]` with `so3_exp` and bias
+  subtraction. Default extrinsic `R_camera_imu = I`. Kill-switch
+  `GINGER_IMU_PREDICT=0`. Three integrator tests (90 dps spin → π/2,
+  bias-cancel → identity, sparse stream → None). 50 tests total.
+* **Live validation — IMU predict measurably helps the mapper.**
+  Session-2 fast-spin reproduction (forward 1500 × 0.7 s →
+  spin ±1800 × 1.2 s, no stop) — tracking still ended Lost, but
+  with **+5 keyframes and +186 map points triangulated during the
+  spin** (session 2 got only +1 kf and +41 pts at the same motion).
+  The IMU predict positions keyframes well enough in SE(3) for the
+  mapper to triangulate them — the previous failure of "predict was
+  wrong → keyframe pose corrupted → mapper can't use it" is gone.
+* **The remaining failure mode is map-coverage, not predict accuracy.**
+  Slow-exploration cadence (5× forward `1300 × 0.4 s` pulses with 1 s
+  pauses) — map grew **18 kf → 35 kf, 1188 pts → 2031 pts** but
+  tracking died after pulse 3 with inliers decaying 338 → 113 → 17 → 0.
+  The mapper is keeping up; the visual tracker is starving because the
+  hardwood-floor scene has features that disappear quickly with even
+  small forward motion. **This is not a Stage-4 regression** — it's a
+  pre-existing visual-tracker / scene-density limit that the IMU
+  predict cannot affect alone.
+* **Reasonable next axes for room-scale exploration:**
+  1. Drop `TRACK_MIN_INLIERS` further (currently 6, was 10 pre-session-1).
+     6/N with the IMU predict probably stays trustworthy down to 4.
+  2. Add an inlier-decay keyframe trigger (currently only `needs_keyframe`
+     gates on count + frames-since-kf; consider also "inliers dropped
+     >50% in 5 frames → force a kf so mapper triangulates new content
+     *before* tracker dies").
+  3. IMU as a BA factor (PLAN.md "Out of scope" → reconsider). Adding
+     gyro-derived rotation constraints to motion-only BA would let the
+     pose refine even when visual inliers are marginal.
+  4. **Operator-side workaround that works today:** drive with longer
+     pauses (≥1.5 s) so the mapper triangulates new content before the
+     next pulse takes us past it.
+* **Frame↔sample sync gap remains healthy.** Live readings during the
+  drive sequence: typically 2–25 ms, well inside one camera period.
+  IMU rate stays at 142 Hz (PCA9685 + ADS7830 + BMI160 contention on
+  the 100 kHz bus — 400 kHz bump is still queued for next reboot).
+
 **2026-05-24 — session 3 (Claude + Ginger) — IMU is wired and live**
 
 * **Stages 0, 1, 2 are DONE and deployed.** The BMI160 is on the bus at
