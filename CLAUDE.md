@@ -65,6 +65,38 @@ Auth: `gh auth login` is enough (`pull-binary.sh` falls through to
 env-var alternatives. Exit codes: `0`=installed, `10`=no new artifact
 yet, `11`=no token. Deploys only fire from `main`.
 
+## Driving / probing the live robot from a shell
+
+The same HTTP endpoints the WebUI uses are also the cleanest way to
+script test drives. Two gotchas worth knowing before you `curl`:
+
+* **`/api/drive` left/right are raw PWM, not 0–100.** Range is ±4095
+  (hard cap in `devices/motors.rs`), the WebUI joystick saturates at
+  ±2000 (see `DUTY` in `bin/web/index.html`). So when the running
+  TODO talks about "35% duty" it means *~35 % of the WebUI scale =
+  `~700`* — not `35`. `35` is essentially zero, the wheels don't move.
+* **Always stop before sleeping more than a beat.** No watchdog will
+  cut motion if your script crashes mid-pulse. The forward path is
+  also guarded by a 30 cm ultrasonic stop that auto-unlocks on a
+  reverse command (`robot/supervisor.rs`).
+
+A reasonable single pulse + observation loop:
+
+```bash
+curl -sX POST localhost:8080/api/drive -H 'content-type: application/json' \
+     -d '{"left":1500,"right":1500}'     # firm forward
+sleep 0.7                                 # ≤ 1 s; longer = motion blur
+curl -sX POST localhost:8080/api/stop
+curl -s "localhost:8080/api/camera/frame?w=480&q=70" -o /tmp/now.jpg
+curl -s localhost:8080/api/slam/map | jq '{kf:.n_keyframes, pts:.n_points,
+       tracking, n_lost, status, last_lost_reason}'
+```
+
+For SLAM verification specifically: poll `/api/slam/map` every ~300 ms
+in the background — if the JSON body is *identical* two ticks in a
+row the supervisor thread is dead and the HUD is serving a stale
+snapshot (the failure mode `fd8fc13` fixed).
+
 ## Definition of done for a change
 
 A change is not done until all of these pass (this is what CI gates on):

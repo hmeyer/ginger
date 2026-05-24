@@ -79,6 +79,10 @@ impl Default for SensorConfig {
 
 /// A request from the web layer to the robot supervisor (hardware thread).
 pub enum Command {
+    /// Raw PWM per side, clamped to `-MAX_DUTY..MAX_DUTY` (±4095) by the
+    /// motor driver. Positive = forward, negative = reverse. The WebUI
+    /// joystick saturates at ±2000 (see `DUTY` in `bin/web/index.html`);
+    /// CLI / test callers should treat 2000 as "full" and scale from there.
     SetMotors {
         left: i32,
         right: i32,
@@ -93,6 +97,9 @@ pub enum Command {
 
 // ── Request bodies ────────────────────────────────────────────────────────────
 
+/// Body of `POST /api/drive`. `left` / `right` are raw PWM, see
+/// [`Command::SetMotors`] for the scale (±4095 hard cap, ±2000 = "full"
+/// by WebUI convention).
 #[derive(Deserialize)]
 pub struct DriveBody {
     pub left: i32,

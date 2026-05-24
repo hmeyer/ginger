@@ -54,10 +54,13 @@ frozen snapshot, so it might or might not be representative.
 
 2. **Drive in ≤ 1 s pulses** through the kitchen, *checking the camera
    view* (`/api/camera/frame`) between pulses. The current trace had
-   a 1 s forward pulse at 35% duty producing only ~20–26 px disparity —
-   that's the cadence the gates are tuned for. Pulses that are too
-   long or too aggressive cause motion blur and that's a separate
-   failure mode we are not trying to solve yet.
+   a 1 s forward pulse at ~35 % of the WebUI joystick range producing
+   only ~20–26 px disparity — that's the cadence the gates are tuned
+   for. In raw `/api/drive` PWM terms (the field the HTTP body actually
+   carries, range ±4095, WebUI full-stick = 2000) that's roughly
+   `left=right=700`. Pulses that are too long or too aggressive cause
+   motion blur and that's a separate failure mode we are not trying
+   to solve yet.
 
 3. **Diagnose the first reproducible LOST and ship a targeted fix.**
    Likely candidates, in rough order of suspicion:
