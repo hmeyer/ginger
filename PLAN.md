@@ -68,6 +68,50 @@ frozen snapshot, so it might or might not be representative.
 
 ## Progress log (cont.)
 
+**2026-05-24 — session 3 (Claude + Ginger) — IMU is wired and live**
+
+* **Stages 0, 1, 2 are DONE and deployed.** The BMI160 is on the bus at
+  `0x69` (SDO tied to VCC), `i2cget` returns `0xd1`. `src/hal/bmi160.rs`
+  drives it through an `I2cBus` trait with five unit tests against a
+  recording mock. `src/imu/mod.rs` owns a polling thread that publishes
+  `latest()` + a 10 s ring (`recent_since(t)`) for Stage 4 to consume,
+  plus a 1 Hz info log. `/api/imu/sample` returns the latest reading
+  with frame↔sample sync diagnostics. **The WebUI sidebar got an IMU
+  card** (gyro x/y/z dps, accel x/y/z m/s², achieved rate, sync gap
+  ms with green/amber/red tinting at 110/300 ms thresholds) plus a
+  mobile-strip summary (`|gyro|`, Δt). Commits `4e01ecf`, `5f956f2`,
+  `de09441`.
+* **Frame↔sample sync invariant holds.** `Frame.t_capture` and
+  `ImuSample.t_read` are both `Instant::now()` on the host's
+  `CLOCK_MONOTONIC`, set at request-complete (libcamera / mock) and
+  immediately after the I²C burst respectively. Observed sync gap
+  on the live binary is **−2 to +20 ms**, i.e. roughly uniform inside
+  one camera period (33 ms at 30 fps), which is the expected
+  distribution for a 200 Hz IMU and ~30 Hz camera. Stage 4's
+  pre-integration can rely on the two clocks being directly subtractable
+  without conversion.
+* **At-rest sensor reads check out.** Gyro `~[0.2, -0.4, 0.2] dps`
+  (constant bias). Accel `~[9.86, -0.60, 0.08] m/s²` — magnitude
+  9.88 ≈ g, so the chip is essentially **Z-up** with a small Y-axis
+  tilt (~3.5°). Useful inference: the gyro axis that measures yaw
+  in-place is **Z**, since rotation about gravity = rotation about
+  +Z_imu given this mounting.
+* **Achieved IMU rate is 142 Hz, not 200 Hz.** Bus contention with the
+  PCA9685 (motor PWM updates) and ADS7830 (battery polls). The plan's
+  "Pi I²C clock" gotcha applies: bumping `/boot/firmware/config.txt`'s
+  `dtparam=i2c_arm_baudrate=400000` is the documented fix and the next
+  reboot is the right time to do it. **Not blocking Stage 4:** the
+  predict only needs more samples than the camera-frame interval
+  contains, and 142 Hz ÷ 30 fps ≈ 4.7 samples per frame is plenty
+  for an inter-frame rotation integral.
+* **Stage 3 (bias persistence) is being downscoped.** BMI160 gyro bias
+  drifts ~0.05 dps/°C. Persisting a value into `slam.toml` and reloading
+  on next boot bakes in stale temperature; auto-bias on every boot
+  (average the first ~1 s of stationary samples) captures the *current*
+  temperature with no setup ritual. Cost: a 1 s "hold still after boot"
+  window during which the predict is bias-uncorrected — at 0.2 dps that
+  is 0.2°/s × 33 ms/frame = 0.007°/frame, negligible.
+
 **2026-05-24 — session 2 (Claude + Ginger)**
 
 * **First reproducible LOST: fast in-place spin.** Sequence:
@@ -167,23 +211,12 @@ must stay green at every stage — gate the IMU behind the existing
 `libcamera` feature or a new `imu` feature, whichever is cleaner;
 **do not make non-IMU code paths require the hardware**.
 
-#### Stage 0 — post-solder verification (no Rust yet)
+#### Stage 0 — post-solder verification (no Rust yet) — **DONE**
 
-After you finish soldering:
+Confirmed `0x69` is alive on the bus and `i2cget -y 1 0x69 0x00`
+returns `0xd1`. Chip is wired correctly.
 
-```bash
-# Bus is detected, BMI160 shows up at 0x68 or 0x69
-i2cdetect -y 1
-
-# Read CHIP_ID (register 0x00) — must be 0xD1 for BMI160
-i2cget -y 1 0x68 0x00      # or 0x69 if SDO is tied high
-```
-
-If `i2cget` returns `0xd1`, the chip is alive and talking. If it
-returns `0x00` or `0xff`, recheck wiring (most often a swapped SDA/
-SCL or a 5 V/3.3 V mistake). Don't move to Stage 1 until this works.
-
-#### Stage 1 — HAL driver (`src/hal/bmi160.rs`)
+#### Stage 1 — HAL driver (`src/hal/bmi160.rs`) — **DONE** (`4e01ecf`)
 
 Follow the same shape as `src/hal/pca9685.rs` and `src/hal/adc.rs`:
 a `pub struct Bmi160 { i2c: I2c }` with `new(address: u16) -> Result<Self>`
@@ -215,39 +248,43 @@ so the driver is unit-testable without hardware — same trick the
 existing HAL would use if it had unit tests today (it mostly
 doesn't — fine to introduce just for this one).
 
-#### Stage 2 — sample loop + 1 Hz log + new HTTP endpoint
+#### Stage 2 — sample loop + 1 Hz log + new HTTP endpoint — **DONE** (`5f956f2`, WebUI surface in `de09441`)
 
-Run a dedicated thread that loops on `read_both` at ~200 Hz, writes
-into a lock-free single-producer ring buffer keyed by `Instant`,
-and `info!`-logs the latest rate / latest sample once a second.
-Expose `GET /api/imu/sample` returning the latest `(gyro_dps,
-accel_mps2, t_mono_ns)` as JSON so we can verify the chip is
-sensible by hand (`curl /api/imu/sample` while shaking the chassis).
+Polling thread + 10 s ring keyed by `Instant` + `/api/imu/sample`. Frame
+↔ sample sync verified live (gap −2 to +20 ms; within one camera
+period). Achieved rate **142 Hz** (vs the 200 Hz target) due to PCA9685
+/ ADS7830 bus contention — covered by the "Pi I²C clock" gotcha; bumping
+to 400 kHz is the documented fix for the next reboot. Not blocking
+Stage 4 since 142 Hz still gives ~4.7 samples per 30 fps camera frame.
 
-This is the "ship a useful new endpoint and stop" gate. Don't touch
-SLAM yet. Confirm:
+#### Stage 3 — gyro bias (auto-on-boot, no persistence) — **NEXT**
 
-* Gyro reads ≈ `[0, 0, 0]` when the robot is still (to within bias).
-* Accel reads ≈ one g along whichever axis is *up* (depends on
-  mounting; if you mounted Z-up it's `[0, 0, +9.81]`).
-* Rates: shake along one axis, see only that axis spike on gyro
-  (and on accel). If you see *all three* axes spike for a 1-axis
-  shake, the chip is mis-oriented or there's loose wiring.
+Downscoped from the original "CLI + `slam.toml` round-trip" plan because
+the bias is temperature-dependent (~0.05 dps/°C); persisting yesterday's
+value to disk is *less* accurate than re-estimating today's. The polling
+thread (`src/imu/mod.rs`) does the work:
 
-#### Stage 3 — gyro bias calibration
+1. **Stationary detection** — first `~1 s` after `Imu::open`, watch the
+   per-sample gyro magnitude. If the max sample magnitude across the
+   window stays below `STATIONARY_DPS = 2.0` (well above the chip's
+   noise floor but well below any deliberate motion), accept the
+   window's mean as bias. Otherwise log a `warn!` and leave bias at
+   zero; the operator should re-call `Imu::recalibrate_bias()` (also
+   exposed as `POST /api/imu/calibrate`) once the chassis is still.
+2. **Expose** `Imu::gyro_bias_dps() -> [f32; 3]`. SSE handler and
+   `/api/imu/sample` subtract it before reporting so the WebUI shows
+   "near zero" at rest immediately after the warm-up. Raw samples in
+   the ring stay unbiased; Stage 4 subtracts the bias inside the
+   integrator so the rotation isn't double-corrected.
 
-A small CLI binary `bin/calib-imu.rs` (or sub-command of an existing
-one): hold the chassis still for ~10 s, average gyro to estimate
-the constant bias, write it into `slam.toml` next to the camera
-intrinsics. The existing config already has a `[slam]` table —
-add an `[imu]` table with `gyro_bias = [bx, by, bz]` (in dps) and a
-`temperature` field for sanity. Repeat the calibration if the
-ambient temperature shifts a lot — BMI160 gyro bias drifts ~0.05
-dps/°C.
-
-Camera-IMU extrinsic calibration is **not needed for stage 4** if
-you mount the IMU axis-aligned to the camera. Defer formal Kalibr-
-style extrinsics until stage 5+.
+Camera-IMU extrinsic: **not needed for Stage 4** under the observed
+mounting. At-rest accel = `[~0, ~0, +g]` ⇒ IMU body Z is gravity-up,
+which means yaw (rotation about gravity) is `gyro_z`. The robot's
+horizontal-plane motion is yaw-dominated, so for Stage 4 we treat
+gyro X and Y as small corrections and integrate the full 3-vector
+with a configurable `R_camera_imu` whose default is identity. Formal
+Kalibr-style extrinsics are deferred unless validation shows axis
+misalignment.
 
 #### Stage 4 — gyro-pre-integrated tracking-predict
 
@@ -265,67 +302,113 @@ Replace the *rotational* part of `predict` with the gyro
 pre-integration over the camera-frame interval. Translation predict
 stays CV for now (accel-based translation predict is much harder —
 requires reliable gravity subtraction and double integration that
-drifts fast). Concretely:
+drifts fast).
 
-1. Between camera frame `t_{k-1}` and `t_k`, pull all IMU samples
-   from the ring buffer and apply `ΔR = Π exp([ω_i - bias] × Δt_i)`
-   in SO(3). Use the slam-core `Lie` helpers — there is already a
-   `so3_exp` for this.
-2. Combine with the last pose's rotation:
-   `R_predict = R_{k-1} * R_camera_imu * ΔR * R_camera_imu^T` (the
-   conjugation handles the camera/IMU frame difference; if you
-   mounted axis-aligned, `R_camera_imu = I`).
-3. Translation predict: keep CV.
-4. Feed this predict into `tracking::track_pose` exactly as today.
+**Hook point.** `Frontend::on_frame` is the only entry into the state
+machine (lines ~588–592 of `src/slam/frontend.rs`). The cleanest seam
+is to extend its signature with `rotation_hint: Option<UnitQuaternion<f64>>`
+representing **camera-frame ΔR since the previous frame**. Internally:
 
-Add a flag (config or env var) to fall back to vision-only predict
-so we can A/B the change and have a kill switch if the IMU integration
-introduces a regression.
+* If `rotation_hint` is `Some` and `np >= 1`, use
+  `predict.rotation = st.trajectory[np-1].rotation * hint`,
+  `predict.translation = constant_velocity(...).translation`
+  (or just `st.trajectory[np-1].translation` if `np < 2`).
+* Else, fall through to the existing CV predict path unchanged.
 
-Headless test: extend the existing tracking unit tests with a
-synthetic gyro stream and assert the predict rotates by the
-expected amount over a synthesized 1 s spin.
+This keeps `slam-core` camera-free (no IMU dependency on the inner
+crate) and the call site in `src/slam/mod.rs::run` is the only place
+that pulls from `imu.recent_since(t_prev_capture)` and applies the
+extrinsic.
 
-#### Stage 5 — validation against today's failures
+**Integrator** (in `src/slam/mod.rs::run`):
 
-Re-run session 2's failing fast-spin sequence with the same duty
-values (`±1800` for 1.2 s after a 1 s forward). The pass criteria:
+1. Track `t_prev_capture: Option<Instant>` across frames.
+2. On each frame, call `imu.recent_since(t_prev_capture.unwrap_or(now))`.
+3. Sum: `ΔR_imu = ∏ exp([(ω_i - bias) · dt_i]_×)` in SO(3), where
+   `dt_i` is the gap to the next sample (last sample uses the gap to
+   `frame.t_capture`).
+4. Apply extrinsic: `ΔR_cam = R_camera_imu · ΔR_imu · R_camera_imu^T`.
+   Default `R_camera_imu = I` per the Stage 3 mounting inference;
+   override via env var if validation shows axis swap is needed.
+5. Pass `Some(UnitQuaternion::from_matrix(&ΔR_cam))` into
+   `on_frame(...)`.
 
-* `tracking=true` throughout the spin.
-* Map grows during the spin (kfs accepted at IMU-predicted poses
-  give the mapper a baseline to triangulate against later).
-* `n_lost` does not increment.
+**A/B switch.** `GINGER_IMU_PREDICT=0` (env var, read once at startup
+in `slam/mod.rs::run`) falls back to vision-only — kill switch if the
+IMU integration regresses something.
 
-If we still lose tracking, the next-most-likely culprit is camera-
-IMU temporal sync (we use `Instant::now()` for both, which can drift
-relative to the camera's hardware timestamp). Fall back to using the
-libcamera frame timestamp + the BMI160 `sensortime` register and
-estimate a constant offset.
+**Headless tests.** No camera or hardware needed:
 
-### Gotchas (write these in code comments at the touch points)
+* `lie::so3_exp` round-trips: spin a synthetic 1 s 90°/s rotation
+  through the integrator and assert recovered `ΔR ≈ R_x(90°)`.
+* `Frontend::on_frame` with a `rotation_hint` matching the synthetic
+  scene's true motion gives a tighter inlier count than the CV
+  predict alone (regression of "tracking through fast motion").
 
-* **Camera-IMU time alignment.** The libcamera frame timestamp is the
-  start-of-exposure (or end-of-exposure — check `request.metadata`),
-  not the frame-arrival time at our pipeline. Off-by-one-frame
-  alignment shows up as systematic over-rotation. Acceptable for
-  stage 4; revisit if stage 5 needs it.
-* **Coordinate frames.** Gyro `[ωx, ωy, ωz]` is in the *IMU* frame.
-  Camera SE(3) twist uses `[ρ; φ]` (translation, rotation) and the
-  rotation is in the *camera* frame. If the IMU is mounted with X
-  forward and the camera is mounted with Z forward (typical), a
-  90° axis swap is needed before integration. Write down the
-  convention in the bmi160 module docstring and unit-test it.
-* **Gyro bias drift with temperature.** Don't bake the calibration
-  into the binary; keep it in `slam.toml` so it's easy to recalibrate.
-* **Headless test must not require hardware.** Gate the actual i2c
-  path behind `cfg(feature = "libcamera")` (or a new `cfg(feature =
-  "imu")`); have the SLAM consume an `IMU: trait` with a mock
-  implementation that the test feeds synthetic gyro samples through.
-* **Pi I²C clock.** Default is 100 kHz; with three slaves on the bus
-  (PCA9685, ADS7830, BMI160) that's borderline for a 200 Hz gyro
-  stream. Bump to 400 kHz via `/boot/config.txt`
-  (`dtparam=i2c_arm_baudrate=400000`) — well within everything's
-  spec.
+#### Stage 5 — validation: fast spin + room loop
+
+Driven over HTTP with **visual control before each pulse** — i.e.
+`curl /api/camera/frame -o /tmp/now.jpg` then look at the image
+before sending a `/api/drive` so we don't drive into anything.
+
+1. **Fast-spin reproduction** (the session-2 failure): forward at
+   `duty=1500` for 0.7 s, then *immediately* in-place spin `±1800`
+   for 1.2 s, no stop between. Watch `/api/slam/map` while doing
+   it. Pass criteria:
+   * `tracking=true` throughout the spin (was: collapsed in 14 frames).
+   * `n_lost` doesn't increment.
+   * Map grows during the spin (or at minimum survives it).
+2. **Slow room loop** (the session-2 cumulative-rotation failure):
+   three back-to-back gentle right arcs (`left=900, right=300`,
+   ~0.8 s each) totalling ~90°. Same pass criteria.
+3. **Multi-minute exploration** (the actual goal in CLAUDE.md):
+   alternating short forward pulses (`±1500` for 0.5–1 s) and gentle
+   turns (`differential ≤ 1200`) for several minutes, with visual
+   confirmation before each pulse. Save the `/api/slam/map`
+   snapshot at the end as evidence.
+
+If tracking still collapses on (1), the most-likely culprits in
+order are: (a) wrong extrinsic — re-check `R_camera_imu` by
+spinning in-place and asserting `gyro_z` dominates; (b) bias not
+yet learned at the moment of the spin (warm-up window collided
+with the test); (c) camera-IMU temporal sync drift — fall back to
+the libcamera `SensorTimestamp` metadata + BMI160 `sensortime`
+constant-offset fit.
+
+### Gotchas
+
+* **Camera-IMU time alignment — current status.** Both stamps come
+  from `Instant::now()` on `CLOCK_MONOTONIC`. The libcamera
+  `SensorTimestamp` metadata (true start-of-exposure) was deliberately
+  *not* used for Stage 2 — `Instant::now()` at request-complete is
+  ~one frame later but jitter-free and on the same clock as the IMU.
+  Stage 4's integral runs *between* frames, so a constant offset
+  cancels out. Live sync gap is −2..+20 ms (well inside one camera
+  period). Only revisit if Stage 5 fails (a) and the other two
+  hypotheses don't pan out.
+* **Coordinate frames — mounting inferred from gravity.** At rest
+  `accel ≈ [0, 0, +g]` ⇒ IMU body Z = up. Yaw (rotation about
+  gravity) = `gyro_z`. Camera convention is Z-forward, Y-down;
+  camera-Y is gravity-aligned. The integrator default extrinsic is
+  `R_camera_imu = I` (which assumes gyro X/Y are interpreted as
+  camera X/Y, gyro Z as camera-Y); the dominant in-plane motion is
+  yaw, which Z handles correctly. If Stage 5 shows the predict
+  rotates the wrong sign or axis, **first** dump a 1 s in-place spin
+  trace to `/tmp/imu-spin.csv` and check which gyro axis dominates,
+  **then** set `R_camera_imu` via env var rather than tweaking math.
+* **Gyro bias drift with temperature.** Don't persist to `slam.toml`
+  — temperature-dependent (~0.05 dps/°C). Auto-bias on every boot
+  (see Stage 3) captures current temperature without any setup ritual.
+* **Headless test must not require hardware.** The driver's `I2cBus`
+  trait + `MockI2cBus` is in place (`src/hal/bmi160.rs`). The IMU
+  thread uses the same trait so the polling loop, ring, and bias
+  estimator can be exercised without hardware (`src/imu/mod.rs`
+  `tests` module).
+* **Pi I²C clock — apply after next reboot.** Default 100 kHz, three
+  slaves on the bus → achieved IMU rate is 142 Hz vs 200 Hz target.
+  Bump via `/boot/firmware/config.txt` (not `/boot/config.txt` on
+  modern RPi OS): `dtparam=i2c_arm_baudrate=400000`. Reboot required.
+  Stage 4 works at 142 Hz; this is a polish item.
 
 ### Success criterion for the whole IMU thread
 
