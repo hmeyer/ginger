@@ -68,13 +68,35 @@ frozen snapshot, so it might or might not be representative.
 
 ## Progress log (cont.)
 
-**2026-05-24 — session 5 (Claude + Ginger) — iterating toward room exploration**
+**2026-05-24 — session 5 (Claude + Ginger) — ROOM EXPLORATION WORKS**
+
+The goal — "explore the room without losing tracking" — is reached at
+iter 1. A nine-segment exploration loop (forward + small curves,
+diff ≤ 600, 1.5 s pauses) survived end-to-end with tracking
+continuously alive. Final state from the live binary:
+
+```
+{ kf: 94, pts: 4068, tracking: true, loop_closures: 9,
+  bow_words: 2749, bow_ready: true }
+```
+
+That's a complete SLAM session: bootstrap → exploration → BoW
+self-training → nine independent loop closures → globally
+optimised map, *no operator-side relocalisation needed at any point.*
+The IMU predict + iter-1 inlier threshold gave us the working
+envelope; the rest is the existing visual stack doing its job.
+
+What this changes in PLAN.md: **the IMU thread is done.** Further
+work (in-place spin support, hard-turn support, IMU-as-BA-factor)
+becomes optional refinement, not blocking the original failure
+this plan was opened to fix. Keeping the *Next* axes captured below
+in case a future session wants them.
 
 Goal: get to "explore the room without losing tracking" by iterating
 tuning levers on top of the IMU-predict baseline. Each iter = code
 change → deploy → drive-test → record outcome → commit + push.
 
-* **Iter 1: TRACK_MIN_INLIERS 6 → 4** (`4251096`). **Partial win.**
+* **Iter 1: TRACK_MIN_INLIERS 6 → 4** (`4251096`). **WIN.**
   Multi-pulse forward + gentle-curve exploration (forward 1300×0.4s
   → gentle right arc 1000/600 × 0.5s → forward → gentle left arc
   600/1000 × 0.5s → forward, all with 1.2s pauses between) **survived
@@ -93,6 +115,17 @@ change → deploy → drive-test → record outcome → commit + push.
   1500 × 0.5s, curves at differential ≤ 600, in-place spins still
   not safe past ~30°. **This is enough to explore a room incrementally
   — turning corners requires a forward+curve combo, not a stop-spin.**
+
+  *Extended-loop validation:* nine motion segments (forward / right-arc
+  / forward / right-arc / forward / left-arc / forward / left-arc /
+  forward) entirely inside the working envelope. Tracking stayed alive
+  throughout — one transient "shaky" frame with `weak 1/160 inliers`
+  was ridden through with the IMU predict (`predicting, 2/3 skips`).
+  Map went 23 kf / 1592 pts → 85 kf / 3790 pts → 94 kf / 4068 pts
+  (mapper kept absorbing queued keyframes after the last drive
+  command). BoW vocabulary self-trained mid-run (2749 words); nine
+  loop closures fired. This is the demonstration the project was
+  opened to enable. Saved snapshot: `/tmp/slam-end.json`.
 
 **2026-05-24 — session 4 (Claude + Ginger) — Stages 3+4 done, validated**
 
