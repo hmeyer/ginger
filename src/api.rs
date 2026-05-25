@@ -48,6 +48,14 @@ pub struct SensorSnapshot {
     /// A steady drift here would break Stage 4's gyro pre-integration —
     /// this is the canary surfaced in the WebUI.
     pub imu_frame_sync_ms: Option<f32>,
+    /// Most recently applied motor PWM (PCA9685 duty in
+    /// `[-MAX_DUTY, MAX_DUTY]`). Surfaced so the Stage-2 label worker
+    /// (`src/motion/labels.rs`) can pair each 200 ms training window
+    /// with the command that produced its observed motion — without
+    /// subscribing to the supervisor's command channel directly. Zero
+    /// at boot until the first `Command::SetMotors`.
+    pub pwm_l_cmd: i32,
+    pub pwm_r_cmd: i32,
 }
 
 impl SensorSnapshot {
@@ -73,6 +81,8 @@ impl SensorSnapshot {
             imu_accel_mps2: None,
             imu_rate_hz: None,
             imu_frame_sync_ms: None,
+            pwm_l_cmd: 0,
+            pwm_r_cmd: 0,
         }
     }
 }

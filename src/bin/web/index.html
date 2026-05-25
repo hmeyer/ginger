@@ -259,6 +259,14 @@ footer{
         </div>
         <div class="row" style="margin-top:2px"><span class="lbl" style="min-width:48px">→ pwm</span><span class="val" id="v-mm-pwm">—</span></div>
       </div>
+      <div style="margin-top:8px;font-size:.7rem;color:var(--dim2);text-align:center">labels (Stage 2)</div>
+      <div class="row"><span class="lbl" style="min-width:48px">obs</span><span class="val" id="v-mm-obs">—</span><span class="lbl" style="margin-left:8px">v-lab</span><span class="val" id="v-mm-vlab">—</span></div>
+      <div class="row" title="Whole-window rejections: gyro spike (|ω|>5 rad/s) and accel spike (|a|−g>3 m/s²)">
+        <span class="lbl" style="min-width:48px">spike</span><span class="val" id="v-mm-rej-spike">—</span>
+      </div>
+      <div class="row" title="v-label-only rejections by reason">
+        <span class="lbl" style="min-width:48px">v-rej</span><span class="val" id="v-mm-rej-vonly">—</span>
+      </div>
     </div>
   </aside>
 </div>
@@ -794,6 +802,23 @@ sse.onmessage = e => {
         document.getElementById('v-mm-stale').style.color = col;
       }
       document.getElementById('v-mm-stale').textContent = stale;
+    } catch (_) {}
+    try {
+      const l = await (await fetch('/api/motion/labels')).json();
+      const obs = l.samples_observed;
+      const vlab = l.samples_v_labelled;
+      const vRate = obs > 0 ? Math.round(100 * vlab / obs) : 0;
+      document.getElementById('v-mm-obs').textContent  = obs.toLocaleString();
+      document.getElementById('v-mm-vlab').textContent = `${vlab.toLocaleString()} (${vRate}%)`;
+      // Whole-window rejections: spike rows.
+      const r = l.rejections || {};
+      const spike = (r.gyro_spike || 0) + (r.accel_spike || 0);
+      document.getElementById('v-mm-rej-spike').textContent =
+        `${spike} (gyro ${r.gyro_spike || 0} · accel ${r.accel_spike || 0})`;
+      // v-only rejection breakdown.
+      const vonly = (r.v_out_of_range || 0) + (r.v_not_straight || 0) + (r.v_non_monotonic || 0);
+      document.getElementById('v-mm-rej-vonly').textContent =
+        `${vonly} (rng ${r.v_out_of_range || 0} · turn ${r.v_not_straight || 0} · mono ${r.v_non_monotonic || 0})`;
     } catch (_) {}
   }
 

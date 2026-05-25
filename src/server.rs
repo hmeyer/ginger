@@ -54,6 +54,12 @@ pub struct AppState {
     /// drives the motors through it yet. Stage 2 wires the label stream
     /// → `MotorModel::observe`; Stage 3 wires the WebUI joystick → predict.
     pub motor_model: Arc<RwLock<MotorModel>>,
+    /// Telemetry from the Stage-2 label worker
+    /// (`src/motion/labels.rs`). Counters + rejection breakdown surfaced
+    /// at `/api/motion/labels`. Zeroed at boot, updated in-place by the
+    /// worker. Always present even when the IMU isn't (in which case
+    /// the counters never advance — the operator sees the silence).
+    pub label_stats: Arc<RwLock<crate::motion::LabelStats>>,
 }
 
 /// Build the axum router (all routes + shared state). Split out from
@@ -71,6 +77,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/motion/model", get(motion_model_info))
         .route("/api/motion/model/predict", get(motion_model_predict))
         .route("/api/motion/model/reset", post(motion_model_reset))
+        .route("/api/motion/labels", get(motion_labels))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -350,6 +357,14 @@ async fn motion_model_reset(State(st): State<AppState>) -> Response {
     StatusCode::OK.into_response()
 }
 
+/// Stage-2 label-worker telemetry. Counters of observed/v-labelled
+/// windows and rejection breakdown by reason — backs the "Labels"
+/// subsection of the WebUI Motor model card.
+async fn motion_labels(State(st): State<AppState>) -> Response {
+    let stats = *st.label_stats.read().unwrap();
+    Json(stats).into_response()
+}
+
 #[derive(Deserialize)]
 struct MotionPredictQuery {
     v_target: f32,
@@ -427,7 +442,7 @@ mod tests {
     use tower::ServiceExt; // `oneshot`
 
     use crate::camera::Camera;
-    use crate::motion::MotorModel;
+    use crate::motion::{LabelStats, MotorModel};
     use crate::slam::{MapSnapshot, SlamSnapshot};
 
     /// Exercise the read + control endpoints end-to-end: real router,
@@ -445,6 +460,7 @@ mod tests {
             // which the next test asserts on.
             imu: None,
             motor_model: Arc::new(RwLock::new(MotorModel::default_bootstrap(7.8))),
+            label_stats: Arc::new(RwLock::new(LabelStats::default())),
         };
         // Distinctive values so the assertions check real serialization,
         // not just the `initial()` defaults.
