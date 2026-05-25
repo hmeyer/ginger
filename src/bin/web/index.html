@@ -235,6 +235,31 @@ footer{
         <span class="lbl" style="min-width:32px">sync</span><span class="val" id="v-imu-sync">—</span><span style="color:var(--dim2);font-size:.75rem">ms</span>
       </div>
     </div>
+    <div class="card" id="motor-model-card" title="Inverse motor-driver MLP — translates desired motion to PWM. Stage 1 of PLAN.md.">
+      <div class="card-title">Motor model
+        <span id="v-mm-stale" style="color:var(--dim2);font-size:.7rem;font-weight:normal;margin-left:4px">—</span>
+        <button id="mm-reset-btn" title="Re-bootstrap from scratch (synthetic warm-up)" style="margin-left:auto;font-size:.65rem;background:var(--bg4);color:var(--fg);border:0;border-radius:4px;padding:2px 6px;cursor:pointer">reset</button>
+      </div>
+      <div class="row"><span class="lbl" style="min-width:48px">steps</span><span class="val" id="v-mm-steps">—</span></div>
+      <div class="row"><span class="lbl" style="min-width:48px">resid</span><span class="val" id="v-mm-resid">—</span><span style="color:var(--dim2);font-size:.75rem">norm</span></div>
+      <div class="row"><span class="lbl" style="min-width:48px">fit-V</span><span class="val" id="v-mm-batv">—</span><span style="color:var(--dim2);font-size:.75rem">V</span></div>
+      <div style="margin-top:8px;font-size:.7rem;color:var(--dim2);text-align:center">predict (v↔ω → PWM)</div>
+      <canvas id="mm-heatmap" width="180" height="180" style="display:block;margin:4px auto;border-radius:4px;background:#222;cursor:crosshair" title="Click a cell to populate the probe with that (v,ω) target"></canvas>
+      <div style="display:flex;justify-content:space-between;font-size:.65rem;color:var(--dim2)">
+        <span>−ω</span><span>ω=0</span><span>+ω</span>
+      </div>
+      <div style="margin-top:6px">
+        <div class="row"><span class="lbl" style="min-width:32px">v</span>
+          <input id="mm-vt" type="range" min="-0.6" max="0.6" step="0.05" value="0" style="flex:1">
+          <span class="val" id="v-mm-vt" style="min-width:36px;text-align:right">0.00</span>
+        </div>
+        <div class="row"><span class="lbl" style="min-width:32px">ω</span>
+          <input id="mm-wt" type="range" min="-1.5" max="1.5" step="0.1" value="0" style="flex:1">
+          <span class="val" id="v-mm-wt" style="min-width:36px;text-align:right">0.0</span>
+        </div>
+        <div class="row" style="margin-top:2px"><span class="lbl" style="min-width:48px">→ pwm</span><span class="val" id="v-mm-pwm">—</span></div>
+      </div>
+    </div>
   </aside>
 </div>
 
@@ -681,6 +706,141 @@ sse.onmessage = e => {
     document.getElementById('v-imu-sync-m').textContent = g != null ? g.toFixed(0) : '—';
   }
 };
+
+// ── Motor model card (Stage 1) ────────────────────────────────────────────────
+//
+// /api/motion/model       — health (trained_steps, residual, fit-time battery)
+// /api/motion/model/predict?v_target=&omega_target=&...  — one forward pass
+// /api/motion/model/reset — re-bootstrap (button)
+//
+// The card has three live elements: a health row (polled), a manual probe
+// (sliders → text), and an inverse-prediction heatmap covering the
+// (v_target, ω_target) plane. The heatmap is re-rendered on load, on
+// every reset, and once a second while the user is on the page — it
+// changes slowly enough that aggressive polling is wasteful.
+{
+  const V_MAX = 0.6;     // m/s on the heatmap axis
+  const W_MAX = 1.5;     // rad/s on the heatmap axis
+  const GRID  = 9;       // 9×9 cells
+  const PWM_MAX = 4095;
+
+  const vtSlider = document.getElementById('mm-vt');
+  const wtSlider = document.getElementById('mm-wt');
+  const vtView   = document.getElementById('v-mm-vt');
+  const wtView   = document.getElementById('v-mm-wt');
+  const pwmView  = document.getElementById('v-mm-pwm');
+  const hmCanvas = document.getElementById('mm-heatmap');
+
+  // Heatmap renderer. One fetch per cell — 81 cheap GETs, runs on demand.
+  // Colours: forward PWM = green, reverse = red, near-zero = grey.
+  async function renderHeatmap() {
+    const ctx = hmCanvas.getContext('2d');
+    const cellW = hmCanvas.width  / GRID;
+    const cellH = hmCanvas.height / GRID;
+    const calls = [];
+    for (let i = 0; i < GRID; i++) {       // i along ω axis (left→right)
+      for (let j = 0; j < GRID; j++) {     // j along v axis (top→bottom, v decreasing as j grows)
+        const wt = -W_MAX + (i / (GRID - 1)) * 2 * W_MAX;
+        const vt =  V_MAX - (j / (GRID - 1)) * 2 * V_MAX;
+        calls.push(fetch(`/api/motion/model/predict?v_target=${vt}&omega_target=${wt}`)
+          .then(r => r.json()).then(p => ({i, j, vt, wt, pwm_l: p.pwm_l, pwm_r: p.pwm_r})));
+      }
+    }
+    const cells = await Promise.all(calls);
+    ctx.clearRect(0, 0, hmCanvas.width, hmCanvas.height);
+    for (const c of cells) {
+      const avg = (c.pwm_l + c.pwm_r) / 2;
+      const u = Math.max(-1, Math.min(1, avg / PWM_MAX));
+      // Green-going-forward, red-going-reverse, grey-near-zero. Lightness
+      // tracks |u|; full saturation only at the extremes.
+      const hue = u > 0 ? 130 : 0;  // 130 = green, 0 = red
+      const sat = Math.min(80, Math.abs(u) * 100);
+      const light = 15 + Math.abs(u) * 30;
+      ctx.fillStyle = `hsl(${hue}, ${sat}%, ${light}%)`;
+      ctx.fillRect(c.i * cellW, c.j * cellH, cellW + 1, cellH + 1);
+      // pwm_diff (turning) overlaid as a small text glyph in lighter cells
+      if (Math.abs(u) > 0.05) {
+        const diff = c.pwm_r - c.pwm_l;
+        const arrow = Math.abs(diff) < 200 ? '·' : diff > 0 ? '↶' : '↷';
+        ctx.fillStyle = 'rgba(255,255,255,0.7)';
+        ctx.font = '11px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(arrow, c.i * cellW + cellW / 2, c.j * cellH + cellH / 2);
+      }
+    }
+    // Centre crosshair at (v=0, ω=0).
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.beginPath();
+    ctx.moveTo(0, hmCanvas.height / 2); ctx.lineTo(hmCanvas.width, hmCanvas.height / 2);
+    ctx.moveTo(hmCanvas.width / 2, 0); ctx.lineTo(hmCanvas.width / 2, hmCanvas.height);
+    ctx.stroke();
+  }
+
+  async function refreshHealth() {
+    try {
+      const d = await (await fetch('/api/motion/model')).json();
+      document.getElementById('v-mm-steps').textContent = d.trained_steps.toLocaleString();
+      document.getElementById('v-mm-resid').textContent = d.residual_pwm.toFixed(3);
+      document.getElementById('v-mm-batv').textContent  = d.last_battery_v.toFixed(2);
+      // Staleness vs the live battery (in the sensor stream's v-bat).
+      const liveV = parseFloat(document.getElementById('v-bat').textContent);
+      const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - d.last_updated_unix));
+      let stale = `${ageSec}s`;
+      if (!isNaN(liveV)) {
+        const drift = Math.abs(liveV - d.last_battery_v);
+        const col = drift > 0.3 ? 'var(--err)' : drift > 0.15 ? 'var(--warn)' : 'var(--ok)';
+        stale = `${ageSec}s · ΔV ${drift.toFixed(2)}`;
+        document.getElementById('v-mm-stale').style.color = col;
+      }
+      document.getElementById('v-mm-stale').textContent = stale;
+    } catch (_) {}
+  }
+
+  async function refreshProbe() {
+    const vt = parseFloat(vtSlider.value);
+    const wt = parseFloat(wtSlider.value);
+    vtView.textContent = vt.toFixed(2);
+    wtView.textContent = wt.toFixed(1);
+    try {
+      const p = await (await fetch(`/api/motion/model/predict?v_target=${vt}&omega_target=${wt}`)).json();
+      pwmView.textContent = `L ${p.pwm_l}  R ${p.pwm_r}`;
+    } catch (_) {
+      pwmView.textContent = '—';
+    }
+  }
+
+  vtSlider.addEventListener('input', refreshProbe);
+  wtSlider.addEventListener('input', refreshProbe);
+
+  // Click on heatmap → load that cell's targets into the probe.
+  hmCanvas.addEventListener('click', (ev) => {
+    const rect = hmCanvas.getBoundingClientRect();
+    const i = Math.floor(((ev.clientX - rect.left) / rect.width)  * GRID);
+    const j = Math.floor(((ev.clientY - rect.top ) / rect.height) * GRID);
+    const wt = -W_MAX + (i / (GRID - 1)) * 2 * W_MAX;
+    const vt =  V_MAX - (j / (GRID - 1)) * 2 * V_MAX;
+    vtSlider.value = vt.toFixed(2);
+    wtSlider.value = wt.toFixed(1);
+    refreshProbe();
+  });
+
+  document.getElementById('mm-reset-btn').addEventListener('click', async () => {
+    if (!confirm('Re-bootstrap motor model from scratch?')) return;
+    try {
+      await fetch('/api/motion/model/reset', { method: 'POST' });
+      await renderHeatmap();
+      await refreshHealth();
+      await refreshProbe();
+    } catch (_) {}
+  });
+
+  // Initial paint + slow refresh.
+  renderHeatmap();
+  refreshHealth();
+  refreshProbe();
+  setInterval(refreshHealth, 1000);
+}
 
 // ── Camera H.264 stream via WebRTC ────────────────────────────────────────────
 //
