@@ -9,6 +9,8 @@
 
 pub mod labels;
 pub mod model;
+pub mod pose;
 
 pub use labels::{LabelStats, RejectionCounts};
 pub use model::{LabelledSample, ModelInput, MotorModel, PwmCommand};
+pub use pose::{MotionTarget, PoseState, TrailPoint};
