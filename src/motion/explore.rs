@@ -186,15 +186,34 @@ struct ExploreWorker {
 
 impl ExploreWorker {
     fn run(&mut self) {
+        let mut was_on = false;
         loop {
-            if !self.on.load(Ordering::SeqCst) {
-                // Idle: keep the motors stopped so a leftover command
-                // doesn't keep the chassis drifting.
-                self.send_motion(0.0, 0.0);
+            let on = self.on.load(Ordering::SeqCst);
+            if !on {
+                // Idle: do **not** route motor commands through the
+                // model. The model's predicted PWM for `(0, 0)` can
+                // sit anywhere in `±~400` (within the L2-regulariser's
+                // basin, not strictly zero), and sending that every
+                // 100 ms used to keep the chassis spinning even when
+                // explore was off — plus it poisoned the label stream
+                // ("commanded near-zero, measured spinning → learn that
+                // near-zero PWM should produce spinning"). The
+                // supervisor's dead-man timeout is the right backstop;
+                // we just need to fire one explicit `Stop` on the
+                // off-edge to clear any leftover non-zero command.
+                if was_on {
+                    self.hard_stop();
+                }
+                was_on = false;
                 self.set_phase(ExplorePhase::Idle);
                 thread::sleep(Duration::from_millis(TICK_MS));
                 continue;
             }
+            was_on = true;
+            // Before scanning, ensure the chassis is stationary —
+            // again, bypassing the model so a non-zero `(0, 0)`
+            // prediction can't drift the chassis during a scan.
+            self.hard_stop();
             // One pass through the state machine. Each branch is
             // synchronous (and may block for seconds during a scan)
             // — we don't tick at any particular rate while exploring.
@@ -207,7 +226,7 @@ impl ExploreWorker {
                     "explore: boxed in (clearance {:.0} cm < {:.0}) — stopping",
                     scan.chosen_clearance_cm, BOXED_IN_CM
                 );
-                self.send_motion(0.0, 0.0);
+                self.hard_stop();
                 self.set_phase(ExplorePhase::BoxedIn);
                 self.on.store(false, Ordering::SeqCst);
                 self.status.write().unwrap().on = false;
@@ -274,7 +293,7 @@ impl ExploreWorker {
         let start = std::time::Instant::now();
         loop {
             if !self.on.load(Ordering::SeqCst) {
-                self.send_motion(0.0, 0.0);
+                self.hard_stop();
                 return;
             }
             let theta_now = self.pose.read().unwrap().theta;
@@ -283,7 +302,7 @@ impl ExploreWorker {
                 target_theta_rad: target_theta,
             });
             if err.abs() < TURN_TOLERANCE_RAD {
-                self.send_motion(0.0, 0.0);
+                self.hard_stop();
                 return;
             }
             if start.elapsed().as_secs_f32() > TURN_TIMEOUT_S {
@@ -291,7 +310,7 @@ impl ExploreWorker {
                     "explore: turn timeout (target {:.2} rad, current {:.2} rad)",
                     target_theta, theta_now
                 );
-                self.send_motion(0.0, 0.0);
+                self.hard_stop();
                 return;
             }
             let omega = err.signum() * W_TURN_RAD_S;
@@ -308,7 +327,7 @@ impl ExploreWorker {
         };
         loop {
             if !self.on.load(Ordering::SeqCst) {
-                self.send_motion(0.0, 0.0);
+                self.hard_stop();
                 return;
             }
             let (x, y) = {
@@ -321,7 +340,7 @@ impl ExploreWorker {
                 distance_remaining_m: remaining,
             });
             if remaining <= 0.05 {
-                self.send_motion(0.0, 0.0);
+                self.hard_stop();
                 return;
             }
             let us = self.sensors.read().unwrap().us_cm;
@@ -332,17 +351,32 @@ impl ExploreWorker {
                     "explore: stopping leg — obstacle at {:.0} cm < {:.0}",
                     d, STOP_DIST_CM
                 );
-                self.send_motion(0.0, 0.0);
+                self.hard_stop();
                 return;
             }
             if start.elapsed().as_secs_f32() > DRIVE_TIMEOUT_S {
                 warn!("explore: drive leg timeout");
-                self.send_motion(0.0, 0.0);
+                self.hard_stop();
                 return;
             }
             self.send_motion(V_FORWARD_M_S, 0.0);
             thread::sleep(Duration::from_millis(TICK_MS));
         }
+    }
+
+    /// Bypass the motor model and tell the supervisor to stop. Used
+    /// on idle, before scans, and when a turn / drive leg completes —
+    /// anywhere we want motors definitely off. Routing this through
+    /// `send_motion(0, 0)` would feed the model's possibly-non-zero
+    /// `(0, 0)` prediction into the motors, which is exactly the bug
+    /// that left the chassis spinning at boot.
+    fn hard_stop(&self) {
+        let _ = self.cmd_tx.blocking_send(Command::Stop);
+        // Keep `motion_target` consistent with what the supervisor
+        // actually sees, so `/api/motion/pose`'s `v_cmd` shows the
+        // stop too and label samples from this window don't get
+        // labelled with a stale non-zero "commanded" PWM.
+        *self.motion_target.write().unwrap() = MotionTarget::default();
     }
 
     /// Translate desired motion through the motor model and issue the
