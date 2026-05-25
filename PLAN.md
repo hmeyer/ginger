@@ -331,7 +331,15 @@ Endpoints:
 * No behaviour change on the robot yet — model is a passive observer
   fed by Stage 2's labels and read by Stage 3's integrator.
 
-### Stage 2 — label streams: gyro `ω` + ultrasonic `v` — **IN PROGRESS**
+### Stage 2 — label streams: gyro `ω` + ultrasonic `v` — **DONE** (PR #59)
+
+**Live status:** `/api/motion/labels` responding on the Pi; the
+`motion-labels` worker is observing ~5 windows/s and feeding the
+motor model continuously. ω labels (gyro mean over 200 ms) always
+present; v labels (ultrasonic Δd/Δt) when straight + monotonic +
+in 8–80 cm range — verified to fire when the chassis was driven
+within range during the live test. `accel_spike` rejection catches
+each motor-start lurch as designed.
 
 The model from Stage 1 needs supervision. Two sources, both already
 wired at the hardware level.
@@ -402,7 +410,15 @@ samples in a small JSON blob.
   straight-driving segments) and the loss sparkline trends down
   over the first ~2 minutes, then sits flat.
 
-### Stage 3 — pose integrator + desired-motion drive endpoint
+### Stage 3 — pose integrator + desired-motion drive endpoint — **DONE** (PR #61)
+
+**Live status:** `/api/motion/pose` responds with `(x, y, θ, drift,
+v_cmd, v_us, omega_cmd, omega_gyro, trail)`. WebUI Pose card renders
+the trajectory plot (auto-zoom from ±0.5 m), drift indicator, and
+side-by-side commanded-vs-measured v/ω. Joystick switched to
+`/api/motion/drive` (motion units); raw `/api/drive` retained for
+diagnostics. The PLAN's "square test" (drive a 1×1 m square, return
+within 25 cm) is the operator-validated gate — not auto-runnable.
 
 First user-visible signal that the new stack does something useful.
 
@@ -463,7 +479,7 @@ ring buffer; capped at ~1000 points so the JSON stays small.
   ultrasonic-labelled v windows, or the model needs more training
   time on varied commands. Iterate before moving to Stage 4.
 
-### Stage 4 — swept-ultrasonic local scan + greedy exploration controller
+### Stage 4 — swept-ultrasonic local scan + greedy exploration controller — **IN PROGRESS** (PR #62)
 
 Cheapest perception we can build, no ML. Validates that "explore the
 room without a global map" is reachable on motor-model pose alone.
