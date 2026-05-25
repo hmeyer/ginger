@@ -11,7 +11,7 @@ use ginger_rs::{
     api::{Command, SensorSnapshot},
     camera::Camera,
     imu::{self, Imu},
-    motion::MotorModel,
+    motion::{LabelStats, MotorModel, labels},
     robot::supervisor,
     server::{self, AppState},
     slam::{self, MapSnapshot, SlamSnapshot},
@@ -129,6 +129,22 @@ async fn main() {
             .expect("spawn motor-model saver");
     }
 
+    // Stage 2: feed labelled windows to the motor model. Skip if the IMU
+    // isn't on the bus — the labeller needs gyro `ω` as its only
+    // always-available label source, and the model can stay at its
+    // bootstrap weights without it.
+    let label_stats: Arc<RwLock<LabelStats>> = Arc::new(RwLock::new(LabelStats::default()));
+    if let Some(imu_arc) = imu.as_ref() {
+        labels::spawn(
+            sensors.clone(),
+            imu_arc.clone(),
+            motor_model.clone(),
+            label_stats.clone(),
+        );
+    } else {
+        warn!("motion-labels: IMU absent — label worker not spawned");
+    }
+
     server::serve(AppState {
         cmd_tx,
         sensors,
@@ -137,6 +153,7 @@ async fn main() {
         map,
         imu,
         motor_model,
+        label_stats,
     })
     .await;
 }

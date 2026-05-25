@@ -233,6 +233,8 @@ pub fn run(mut cmd_rx: mpsc::Receiver<Command>, sensors: Arc<RwLock<SensorSnapsh
             imu_accel_mps2: None,    // filled by SSE handler
             imu_rate_hz: None,       // filled by SSE handler
             imu_frame_sync_ms: None, // filled by SSE handler
+            pwm_l_cmd: motor_left,
+            pwm_r_cmd: motor_right,
         };
 
         // Safety stop if motors have been spinning with no command for 500 ms

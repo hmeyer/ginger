@@ -64,7 +64,21 @@ Each stage is a separately-mergeable commit / PR. Headless DoD
 (`cargo test --workspace --no-default-features`) must stay green
 at every stage; nothing in the non-libcamera path requires hardware.
 
-### Stage 1 — motor driver model: MLP, fit, persistence
+### Stage 1 — motor driver model: MLP, fit, persistence — **DONE** (PR #55, #56)
+
+**Live status as of 2026-05-25:** model loads from
+`motor-model.toml` on Pi boot (battery-anchored at the real ADC reading
+thanks to PR #56's `wait_for_battery` helper), serves
+`/api/motion/model{,/predict,/reset}`, autosaves every 60 s, and the
+WebUI "Motor model" card renders the 9×9 inverse heatmap. Two
+follow-up bugs surfaced and shipped in #56:
+
+1. `make deploy` would race CI and grab the previous main's artifact —
+   `scripts/pull-binary.sh` now matches `head_sha` against `origin/main`'s
+   tip and keeps polling otherwise.
+2. `main()` constructed the model before the supervisor had populated
+   `battery_v`, so the staleness anchor defaulted to 7.8 V; now we
+   poll-sleep up to 3 s for a real reading.
 
 Wholly camera-free. Builds the foundation everything else needs:
 **"to produce this desired motion from this chassis state, what PWM
@@ -317,7 +331,7 @@ Endpoints:
 * No behaviour change on the robot yet — model is a passive observer
   fed by Stage 2's labels and read by Stage 3's integrator.
 
-### Stage 2 — label streams: gyro `ω` + ultrasonic `v`
+### Stage 2 — label streams: gyro `ω` + ultrasonic `v` — **IN PROGRESS**
 
 The model from Stage 1 needs supervision. Two sources, both already
 wired at the hardware level.
