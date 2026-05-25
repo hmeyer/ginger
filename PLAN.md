@@ -1,557 +1,653 @@
-# PLAN: drive + iterate the SLAM tracking-LOST loop
+# PLAN: hardwood-floor exploration with a learned motor model + depth + ultrasonic
 
-## Status
+## Why this plan exists
 
-Tracking was getting "almost immediately LOST" while driving. Live
-journal showed why:
+The ORB-SLAM frontend keeps going LOST during room exploration in this
+apartment. Six tuning rounds (IMU pre-integration predict, min-inliers
+down to 4, longer pauses between pulses, BoW reloc, panic-fix) bought
+individual sessions but did not change the underlying problem: hardwood
+floors plus blank walls do not give a feature tracker enough persistent
+landmarks. Direct / dense visual methods inherit the same scene
+limitation.
 
-```
-21:50:16  slam: relocalization stuck for 151 frames with BoW ready (117 kf, 7055 pts)
-  — discarding, re-bootstrapping
-21:50:16  slam: two-view init OK — 121 pts, model=essential, R_H=0.39, matches=158
-21:50:16  thread 'slam-mapper' panicked at src/slam/mapper.rs:425:66:
-          index out of bounds: the len is 115 but the index is 117
-21:50:16  thread 'slam'        panicked at src/slam/frontend.rs:567:39:
-          called `Result::unwrap()` on an `Err` value: PoisonError { .. }
-```
+This plan pivots the exploration path off visual SLAM entirely. The
+replacement stack:
 
-A loop-closure pose-graph optimization was running off-lock when the
-frontend's "relocalization gave up" path called `reset_world()`. The
-new bootstrap inserted keyframes with ids ≥ `n`; the writeback indexed
-`poses[id]` and panicked, poisoning the world mutex and taking the
-tracking thread with it. `/api/slam/map` then returned the **last
-snapshot before the crash**, which made tracking *look* fine in the
-HUD while in fact both SLAM threads were dead — hence "immediately
-LOST" the moment the user drove past the (frozen) mapped area.
+* **Motor model** — small, online-learned function
+  `(pwm_l, pwm_r) → (v, ω)`, persisted to disk and refit continuously
+  while driving. Exploits the fact that the apartment is uniform
+  hardwood (one floor coefficient is enough).
+* **Gyro** — BMI160 already integrated; gives `ω` as a continuous,
+  zero-cost label and overrides the model's `ω` at runtime.
+* **Swept ultrasonic** — the HC-SR04 sits on the pan servo, so it can
+  build a ~150° local scan at a stationary waypoint. Cheap, no ML.
+* **Monocular depth predictor** — on-device neural net at ~1 Hz, gives
+  dense structure for mapping and obstacle avoidance. Highest-risk
+  component; sequenced last so the rest of the stack works without it.
 
-**The panic is now fixed and shipped** (commit on `main`):
+The existing visual stack (`src/slam`, `crates/slam-core`, `crates/fast`,
+`src/imu`) is **not deleted** — `crates/*` are camera-free,
+well-tested, and may be useful if we ever add stereo or RGB-D. They
+just stop being on the critical path for exploration.
 
-* `apply_loop_correction` extracted as a testable helper.
-* Bails if the gauge-fix `origin` is no longer alive (`reset_world()`
-  ran underneath the optimization).
-* Uses `poses.get(id)` so keyframes inserted after the snapshot are
-  skipped, not OOB-indexed.
-* Three regression tests cover happy-path, mid-flight insert, and
-  reset-under-us.
-
-What we **don't yet know** is what the *real* tracking-loss behaviour
-looks like once the threads stay alive. The HUD reported "tracking:
-37/39 inliers" with `n_lost: 5` and `last_lost_reason: "weak 0/64
-inliers"` — that "0/64" pattern (lots of matches, zero pass the
-reprojection gate) is a smell: the const-velocity prediction is wildly
-wrong, or the matches are mostly wrong correspondences, or the gate is
-too tight for this descriptor noise. But that diagnosis came from a
-frozen snapshot, so it might or might not be representative.
-
-## Progress log
-
-**2026-05-24 — session 1 (Claude + Ginger)**
-
-* **Step 1 — fix is live and threads stay up: DONE.** Verified the
-  panic-fix binary by polling `/api/slam/map` at ~3 Hz across two
-  drive sessions (156 + 606 ticks, **0 frozen snapshots**). Service
-  PID stayed put; no panic strings. Bootstrap succeeded during the
-  test (kf 0 → 383 across the run), inlier ratios 60–95 %.
-* **Step 2 — drive-in-pulses cadence: PARTIALLY DONE.** Did short
-  forward / back / turn pulses in the middle of the living room
-  (drying-rack + basket ~1 m on either side). `n_lost` stayed at 2
-  the entire time — *no new LOST events triggered*. Real translation
-  needed `duty≈1500` (≈0.7 s pulses ≈40 cm); 35-raw didn't move the
-  wheels at all. That gotcha is now documented in `CLAUDE.md` and the
-  step-2 wording above.
-* **Step 3 — diagnose first reproducible LOST: BLOCKED.** No LOST
-  reproduced in this session. The "0/64 weak inliers" pattern from
-  the original journal trace looks more and more like the
-  frozen-snapshot artifact: when the threads are actually alive and
-  the robot moves at a sane cadence, tracking is healthy. The next
-  session needs *deliberately adversarial* driving — see *Next* below.
-
-## Progress log (cont.)
-
-**2026-05-24 — session 5 (Claude + Ginger) — ROOM EXPLORATION WORKS**
-
-The goal — "explore the room without losing tracking" — is reached at
-iter 1. A nine-segment exploration loop (forward + small curves,
-diff ≤ 600, 1.5 s pauses) survived end-to-end with tracking
-continuously alive. Final state from the live binary:
+## Architecture target
 
 ```
-{ kf: 94, pts: 4068, tracking: true, loop_closures: 9,
-  bow_words: 2749, bow_ready: true }
+camera frame ──> depth predictor (~1 Hz) ─────┐
+                                              │
+ultrasonic (panned, swept) ──> local scan ───┤
+                                              ├──> 2D occupancy grid
+motor PWM ──┐                                 │       (robot frame)
+gyro ──┐    │                                 │
+       │    └──> motor model (MLP) ──> (v, ω) ──┴──> pose integrator
+       └──> ω label                       ▲
+ultrasonic Δd/Δt ──> v label ─────────────┘  (online SGD update)
 ```
 
-That's a complete SLAM session: bootstrap → exploration → BoW
-self-training → nine independent loop closures → globally
-optimised map, *no operator-side relocalisation needed at any point.*
-The IMU predict + iter-1 inlier threshold gave us the working
-envelope; the rest is the existing visual stack doing its job.
+Persistence:
 
-What this changes in PLAN.md: **the IMU thread is done.** Further
-work (in-place spin support, hard-turn support, IMU-as-BA-factor)
-becomes optional refinement, not blocking the original failure
-this plan was opened to fix. Keeping the *Next* axes captured below
-in case a future session wants them.
+* `motor-model.toml` (gitignored) — MLP weights + normaliser
+  constants + step count + the battery voltage they were fit at.
+  Read at startup, written on graceful shutdown and every ~60 s
+  while driving.
+* Calibration (`slam.toml`) is unrelated and stays untouched.
 
-Goal: get to "explore the room without losing tracking" by iterating
-tuning levers on top of the IMU-predict baseline. Each iter = code
-change → deploy → drive-test → record outcome → commit + push.
+## Stages
 
-* **Iter 1: TRACK_MIN_INLIERS 6 → 4** (`4251096`). **WIN.**
-  Multi-pulse forward + gentle-curve exploration (forward 1300×0.4s
-  → gentle right arc 1000/600 × 0.5s → forward → gentle left arc
-  600/1000 × 0.5s → forward, all with 1.2s pauses between) **survived
-  end-to-end with zero LOST events.** Map grew 14 kf / 560 pts →
-  48 kf / 2041 pts, inliers ranged 67–162. This is the cleanest
-  sustained-tracking trace in the project so far.
+Each stage is a separately-mergeable commit / PR. Headless DoD
+(`cargo test --workspace --no-default-features`) must stay green
+at every stage; nothing in the non-libcamera path requires hardware.
 
-  *Failure boundary, still:* a sharper in-place turn (3× ±700 for 0.6s,
-  diff=1400, ~90° total) lost tracking with `weak 1/131 inliers`. The
-  IMU predict positioned the tracker correctly but the descriptor
-  matches were mostly to features at the *previous* orientation — they
-  matched, but didn't reproject. Same map-coverage failure mode as
-  session 4, just at a higher rotation budget than before.
+### Stage 1 — motor model: MLP, fit, persistence
 
-  *Working envelope* with iter 1 active: forward pulses up to
-  1500 × 0.5s, curves at differential ≤ 600, in-place spins still
-  not safe past ~30°. **This is enough to explore a room incrementally
-  — turning corners requires a forward+curve combo, not a stop-spin.**
+Wholly camera-free. Builds the foundation everything else needs:
+"given a motor command and the chassis's current state, what is it
+doing right now."
 
-  *Extended-loop validation:* nine motion segments (forward / right-arc
-  / forward / right-arc / forward / left-arc / forward / left-arc /
-  forward) entirely inside the working envelope. Tracking stayed alive
-  throughout — one transient "shaky" frame with `weak 1/160 inliers`
-  was ridden through with the IMU predict (`predicting, 2/3 skips`).
-  Map went 23 kf / 1592 pts → 85 kf / 3790 pts → 94 kf / 4068 pts
-  (mapper kept absorbing queued keyframes after the last drive
-  command). BoW vocabulary self-trained mid-run (2749 words); nine
-  loop closures fired. This is the demonstration the project was
-  opened to enable. Saved snapshot: `/tmp/slam-end.json`.
-
-**2026-05-24 — session 4 (Claude + Ginger) — Stages 3+4 done, validated**
-
-* **Stage 3 (auto-bias on boot)** shipped (`b037d77`). Bias FSM in
-  `src/imu/mod.rs`: collects ~1 s of stationary samples, mean → bias.
-  `POST /api/imu/calibrate` re-runs on demand. Three tests; bias
-  surfaces to /api/imu/sample and the SSE stream subtracted. At-rest
-  gyro on the live binary now reads ~0.1 dps (was 0.2–0.4 dps).
-* **Stage 4 (IMU-pre-integrated rotation predict)** shipped (`33c6309`).
-  `Frontend::on_frame` gained an `Option<UnitQuaternion<f64>>` rotation
-  hint; `gyro_pre_integrate` in `src/slam/mod.rs` integrates the gyro
-  ring over `(prev_capture, t_curr]` with `so3_exp` and bias
-  subtraction. Default extrinsic `R_camera_imu = I`. Kill-switch
-  `GINGER_IMU_PREDICT=0`. Three integrator tests (90 dps spin → π/2,
-  bias-cancel → identity, sparse stream → None). 50 tests total.
-* **Live validation — IMU predict measurably helps the mapper.**
-  Session-2 fast-spin reproduction (forward 1500 × 0.7 s →
-  spin ±1800 × 1.2 s, no stop) — tracking still ended Lost, but
-  with **+5 keyframes and +186 map points triangulated during the
-  spin** (session 2 got only +1 kf and +41 pts at the same motion).
-  The IMU predict positions keyframes well enough in SE(3) for the
-  mapper to triangulate them — the previous failure of "predict was
-  wrong → keyframe pose corrupted → mapper can't use it" is gone.
-* **The remaining failure mode is map-coverage, not predict accuracy.**
-  Slow-exploration cadence (5× forward `1300 × 0.4 s` pulses with 1 s
-  pauses) — map grew **18 kf → 35 kf, 1188 pts → 2031 pts** but
-  tracking died after pulse 3 with inliers decaying 338 → 113 → 17 → 0.
-  The mapper is keeping up; the visual tracker is starving because the
-  hardwood-floor scene has features that disappear quickly with even
-  small forward motion. **This is not a Stage-4 regression** — it's a
-  pre-existing visual-tracker / scene-density limit that the IMU
-  predict cannot affect alone.
-* **Reasonable next axes for room-scale exploration:**
-  1. Drop `TRACK_MIN_INLIERS` further (currently 6, was 10 pre-session-1).
-     6/N with the IMU predict probably stays trustworthy down to 4.
-  2. Add an inlier-decay keyframe trigger (currently only `needs_keyframe`
-     gates on count + frames-since-kf; consider also "inliers dropped
-     >50% in 5 frames → force a kf so mapper triangulates new content
-     *before* tracker dies").
-  3. IMU as a BA factor (PLAN.md "Out of scope" → reconsider). Adding
-     gyro-derived rotation constraints to motion-only BA would let the
-     pose refine even when visual inliers are marginal.
-  4. **Operator-side workaround that works today:** drive with longer
-     pauses (≥1.5 s) so the mapper triangulates new content before the
-     next pulse takes us past it.
-* **Frame↔sample sync gap remains healthy.** Live readings during the
-  drive sequence: typically 2–25 ms, well inside one camera period.
-  IMU rate stays at 142 Hz (PCA9685 + ADS7830 + BMI160 contention on
-  the 100 kHz bus — 400 kHz bump is still queued for next reboot).
-
-**2026-05-24 — session 3 (Claude + Ginger) — IMU is wired and live**
-
-* **Stages 0, 1, 2 are DONE and deployed.** The BMI160 is on the bus at
-  `0x69` (SDO tied to VCC), `i2cget` returns `0xd1`. `src/hal/bmi160.rs`
-  drives it through an `I2cBus` trait with five unit tests against a
-  recording mock. `src/imu/mod.rs` owns a polling thread that publishes
-  `latest()` + a 10 s ring (`recent_since(t)`) for Stage 4 to consume,
-  plus a 1 Hz info log. `/api/imu/sample` returns the latest reading
-  with frame↔sample sync diagnostics. **The WebUI sidebar got an IMU
-  card** (gyro x/y/z dps, accel x/y/z m/s², achieved rate, sync gap
-  ms with green/amber/red tinting at 110/300 ms thresholds) plus a
-  mobile-strip summary (`|gyro|`, Δt). Commits `4e01ecf`, `5f956f2`,
-  `de09441`.
-* **Frame↔sample sync invariant holds.** `Frame.t_capture` and
-  `ImuSample.t_read` are both `Instant::now()` on the host's
-  `CLOCK_MONOTONIC`, set at request-complete (libcamera / mock) and
-  immediately after the I²C burst respectively. Observed sync gap
-  on the live binary is **−2 to +20 ms**, i.e. roughly uniform inside
-  one camera period (33 ms at 30 fps), which is the expected
-  distribution for a 200 Hz IMU and ~30 Hz camera. Stage 4's
-  pre-integration can rely on the two clocks being directly subtractable
-  without conversion.
-* **At-rest sensor reads check out.** Gyro `~[0.2, -0.4, 0.2] dps`
-  (constant bias). Accel `~[9.86, -0.60, 0.08] m/s²` — magnitude
-  9.88 ≈ g, so the chip is essentially **Z-up** with a small Y-axis
-  tilt (~3.5°). Useful inference: the gyro axis that measures yaw
-  in-place is **Z**, since rotation about gravity = rotation about
-  +Z_imu given this mounting.
-* **Achieved IMU rate is 142 Hz, not 200 Hz.** Bus contention with the
-  PCA9685 (motor PWM updates) and ADS7830 (battery polls). The plan's
-  "Pi I²C clock" gotcha applies: bumping `/boot/firmware/config.txt`'s
-  `dtparam=i2c_arm_baudrate=400000` is the documented fix and the next
-  reboot is the right time to do it. **Not blocking Stage 4:** the
-  predict only needs more samples than the camera-frame interval
-  contains, and 142 Hz ÷ 30 fps ≈ 4.7 samples per frame is plenty
-  for an inter-frame rotation integral.
-* **Stage 3 (bias persistence) is being downscoped.** BMI160 gyro bias
-  drifts ~0.05 dps/°C. Persisting a value into `slam.toml` and reloading
-  on next boot bakes in stale temperature; auto-bias on every boot
-  (average the first ~1 s of stationary samples) captures the *current*
-  temperature with no setup ritual. Cost: a 1 s "hold still after boot"
-  window during which the predict is bias-uncorrected — at 0.2 dps that
-  is 0.2°/s × 33 ms/frame = 0.007°/frame, negligible.
-
-**2026-05-24 — session 2 (Claude + Ginger)**
-
-* **First reproducible LOST: fast in-place spin.** Sequence:
-  forward 1 s @ `duty=1800` then *immediately* spin `±1800` for 1.2 s
-  (no stop between). Tracked healthily through the forward
-  (60–71 inliers, kf 4 → 26) and into the spin (30/48, kf 27 with
-  +41 newly triangulated pts), then collapsed in ~14 frames:
-  *only 8 map matches → soft-lost → 3 soft-lost frames → Stage::Lost*.
-  Lost for 148 frames (~5 s) with the **map preserved** at 29 kf /
-  196 pts — BoW-ready give-up budget. `RELOC_MAX_FRAMES_BOW` fired
-  at frame 148; `reset_world` + re-bootstrap with zero panic. The
-  panic fix is solid; the failure is upstream.
-* **Slow spin survives.** Same starting state, spin `±600` for 3 s,
-  ended at 15 kf / 187 pts, still `tracking=true`. So the failure
-  mode is *rate*-driven, not a structural map issue.
-* **Diagnosis (mono-SLAM intrinsic).** Two compounding effects:
-  1. *Mapper can't keep up at high angular velocity.* `needs_keyframe`
-     fires every couple of frames during a fast pan, but each kf's
-     triangulation against its covisible neighbours takes finite time
-     (`LOCAL_BA_K=6` window, `LOCAL_BA_ITERS=5`).
-  2. *Pure rotation has zero parallax*, so even when the mapper does
-     pick up a fast-spin kf, it can't triangulate fresh points against
-     the just-previous (also-rotation-only) kf. New geometry only
-     appears for pairs that bracket some translation, which a pure
-     spin doesn't provide.
-  Net effect: the camera sweeps into unmapped scenery faster than map
-  points can be created there. Tracking starves on "only N map matches".
-  This is a generic mono-SLAM limitation (ORB-SLAM3 et al. also need
-  IMU or translation-during-rotation to bridge fast pans).
-* **Two-tier exploration limit observed empirically (this room):**
-  * Safe / mapping-friendly: differential ≤ ~1200 (e.g. `±600`
-    in-place spin, or curved forward turns).
-  * Tracking-breaking: differential ≥ ~3000 (e.g. `±1500..±2000`
-    in-place spins).
-  Threshold not narrowed further this session; ~2000 differential
-  is the next data point to gather.
-* **Exploration session at "safe" rates also failed — cumulative
-  rotation matters.** Three back-to-back gentle right arcs
-  (`left=900, right=300`, diff=600, ~0.8 s each) totalled ~90° of
-  rotation away from the mapped sector and lost tracking with
-  `weak 1/27 inliers`. Per-frame rate was safe; the *total* angular
-  drift past the mapped scenery was the killer. So a simple
-  supervisor clamp on instantaneous `|left-right|` would *not* have
-  helped this case — the failure is "rotated past what's been
-  mapped", not "rotated too fast in one moment".
-* **Relocalization-on-return works exactly as advertised.** Earlier
-  in the same session, a near-collision triggered Lost for 113
-  frames; the moment I backed up into the mapped scenery, BoW reloc
-  brought us back with `tracking: 94/198 inliers` and `n_lost`
-  intact. The recovery path is solid; *avoiding* the loss is what
-  needs help.
-* **Decision:** the right next move is to add an IMU (BMI160 lying
-  around in the user's bin). See *Next* below — pure software fixes
-  for the rotation problem all have heavy cost or partial coverage.
-
-## Next: integrate a BMI160 IMU
-
-The session-2 failures are *generic mono-SLAM limits* — pure rotation
-has no triangulation parallax, and a const-velocity predict in SE(3)
-can't model motion onsets or direction changes well. An IMU is the
-standard fix: gyro pre-integration between camera frames gives an
-accurate rotation predict regardless of what the map looks like, and
-accelerometer + gravity eventually gives metric scale. We have a
-BMI160 (6-DOF: 3-axis gyro + 3-axis accel, I²C, 3.3 V) and the Pi's
-I²C bus already drives the PCA9685 PWM at `0x40` and the ADS7830 ADC
-at `0x48`, so the wiring is incremental.
-
-### Hardware
-
-Pin out (Pi 4, BCM numbering — same bus the existing devices use):
-
-| Pi pin (BCM) | Pi pin (phys) | BMI160 pin | Notes |
-| --- | --- | --- | --- |
-| 3.3 V | 1 | VCC | **Not 5 V**; BMI160 is 3.3 V. |
-| GND | 9 | GND | Any ground pin. |
-| GPIO 2 (SDA1) | 3 | SDA | Shared with PCA9685, ADS7830. Pull-ups already on the bus. |
-| GPIO 3 (SCL1) | 5 | SCL | Same. |
-
-I²C address: **0x68** if `SDO`/`AD0` is tied to GND (or floating —
-internal pull-down on most breakouts), **0x69** if tied to VCC.
-Confirm with `i2cdetect -y 1` after wiring — neither `0x68` nor
-`0x69` is in use today (only `0x40` and `0x48` show up).
-
-Mounting: rigid attachment to the chassis is critical. The
-**IMU-camera relative orientation must not change at runtime** — any
-vibration or play injects rotational noise straight into the
-tracking-predict. Ideally mount close to the camera and aligned so
-the IMU axes are nominally parallel to the camera axes (saves work
-on the extrinsic calibration). A small zip-tied perfboard on the
-camera mount itself is fine; a flopping wire is not.
-
-### Software stages
-
-Each stage is a separately-mergeable commit / PR. Each adds tests.
-The headless DoD (`cargo test --workspace --no-default-features`)
-must stay green at every stage — gate the IMU behind the existing
-`libcamera` feature or a new `imu` feature, whichever is cleaner;
-**do not make non-IMU code paths require the hardware**.
-
-#### Stage 0 — post-solder verification (no Rust yet) — **DONE**
-
-Confirmed `0x69` is alive on the bus and `i2cget -y 1 0x69 0x00`
-returns `0xd1`. Chip is wired correctly.
-
-#### Stage 1 — HAL driver (`src/hal/bmi160.rs`) — **DONE** (`4e01ecf`)
-
-Follow the same shape as `src/hal/pca9685.rs` and `src/hal/adc.rs`:
-a `pub struct Bmi160 { i2c: I2c }` with `new(address: u16) -> Result<Self>`
-that powers up the gyro (`CMD = 0x15` for "PMU gyro normal") and
-accelerometer (`CMD = 0x11` for "PMU accel normal"), waits the
-chip's wakeup time (`~80 ms` for gyro, `~3.8 ms` for accel — check
-datasheet table 8), and verifies CHIP_ID == 0xD1.
-
-Public API to expose:
-
-* `read_gyro_raw(&mut self) -> Result<[i16; 3]>` — `DATA_8` ..
-  `DATA_13`, little-endian.
-* `read_accel_raw(&mut self) -> Result<[i16; 3]>` — `DATA_14` ..
-  `DATA_19`.
-* `read_both(&mut self) -> Result<([i16; 3], [i16; 3])>` — single
-  burst read of the 12 data bytes, cheapest and atomic (no
-  inter-axis jitter).
-* `read_sensortime(&mut self) -> Result<u32>` — chip's 24-bit
-  internal time at 39.0625 µs/tick; cheap way to detect dropped
-  samples.
-* Configurable range/ODR; sensible defaults: gyro `±500°/s` (range
-  reg `GYR_RANGE = 0x02`), gyro ODR `200 Hz` (`GYR_CONF = 0x09`),
-  accel `±4 g`, accel ODR `200 Hz`. 200 Hz is plenty given the
-  camera runs at ~30 Hz; we'll average 6–7 IMU samples per camera
-  frame for the pre-integration.
-
-Tests: mock the I²C bus (a `trait I2cBus` over `rppal::i2c::I2c`)
-so the driver is unit-testable without hardware — same trick the
-existing HAL would use if it had unit tests today (it mostly
-doesn't — fine to introduce just for this one).
-
-#### Stage 2 — sample loop + 1 Hz log + new HTTP endpoint — **DONE** (`5f956f2`, WebUI surface in `de09441`)
-
-Polling thread + 10 s ring keyed by `Instant` + `/api/imu/sample`. Frame
-↔ sample sync verified live (gap −2 to +20 ms; within one camera
-period). Achieved rate **142 Hz** (vs the 200 Hz target) due to PCA9685
-/ ADS7830 bus contention — covered by the "Pi I²C clock" gotcha; bumping
-to 400 kHz is the documented fix for the next reboot. Not blocking
-Stage 4 since 142 Hz still gives ~4.7 samples per 30 fps camera frame.
-
-#### Stage 3 — gyro bias (auto-on-boot, no persistence) — **NEXT**
-
-Downscoped from the original "CLI + `slam.toml` round-trip" plan because
-the bias is temperature-dependent (~0.05 dps/°C); persisting yesterday's
-value to disk is *less* accurate than re-estimating today's. The polling
-thread (`src/imu/mod.rs`) does the work:
-
-1. **Stationary detection** — first `~1 s` after `Imu::open`, watch the
-   per-sample gyro magnitude. If the max sample magnitude across the
-   window stays below `STATIONARY_DPS = 2.0` (well above the chip's
-   noise floor but well below any deliberate motion), accept the
-   window's mean as bias. Otherwise log a `warn!` and leave bias at
-   zero; the operator should re-call `Imu::recalibrate_bias()` (also
-   exposed as `POST /api/imu/calibrate`) once the chassis is still.
-2. **Expose** `Imu::gyro_bias_dps() -> [f32; 3]`. SSE handler and
-   `/api/imu/sample` subtract it before reporting so the WebUI shows
-   "near zero" at rest immediately after the warm-up. Raw samples in
-   the ring stay unbiased; Stage 4 subtracts the bias inside the
-   integrator so the rotation isn't double-corrected.
-
-Camera-IMU extrinsic: **not needed for Stage 4** under the observed
-mounting. At-rest accel = `[~0, ~0, +g]` ⇒ IMU body Z is gravity-up,
-which means yaw (rotation about gravity) is `gyro_z`. The robot's
-horizontal-plane motion is yaw-dominated, so for Stage 4 we treat
-gyro X and Y as small corrections and integrate the full 3-vector
-with a configurable `R_camera_imu` whose default is identity. Formal
-Kalibr-style extrinsics are deferred unless validation shows axis
-misalignment.
-
-#### Stage 4 — gyro-pre-integrated tracking-predict
-
-The current predict in `src/slam/frontend.rs` is:
+New module `src/motion/model.rs`. Public API:
 
 ```rust
-let predict = if np >= 2 {
-    tracking::constant_velocity(&st.trajectory[np - 2], &st.trajectory[np - 1])
-} else {
-    st.trajectory[np - 1]
-};
+pub struct MotorModel { /* MLP weights + optimizer state + meta */ }
+
+impl MotorModel {
+    pub fn load_or_default(path: &Path) -> Result<Self>;
+    pub fn save(&self, path: &Path) -> Result<()>;
+
+    /// Forward inference: motor command + current dynamic state → predicted motion.
+    pub fn predict(&self, x: ModelInput) -> Motion;
+
+    /// Online update from one labelled window. One SGD step.
+    pub fn observe(&mut self, sample: LabelledSample);
+}
+
+pub struct ModelInput {
+    pub pwm_l: i32, pub pwm_r: i32,
+    pub pwm_l_prev: i32, pub pwm_r_prev: i32,  // last tick — captures Δcommand
+    pub v_prev: f32,         // last predicted v (or last gyro-confirmed pose Δ)
+    pub omega_prev: f32,     // last gyro-measured ω
+    pub battery_v: f32,
+}
+
+pub struct Motion { pub v: f32, pub omega: f32 }  // m/s, rad/s
+
+pub struct LabelledSample {
+    pub input: ModelInput,
+    pub omega_meas: f32,           // from gyro, always present
+    pub v_meas: Option<f32>,       // from ultrasonic, sometimes
+    pub dt_s: f32,
+}
 ```
 
-Replace the *rotational* part of `predict` with the gyro
-pre-integration over the camera-frame interval. Translation predict
-stays CV for now (accel-based translation predict is much harder —
-requires reliable gravity subtraction and double integration that
-drifts fast).
+#### Architecture
 
-**Hook point.** `Frontend::on_frame` is the only entry into the state
-machine (lines ~588–592 of `src/slam/frontend.rs`). The cleanest seam
-is to extend its signature with `rotation_hint: Option<UnitQuaternion<f64>>`
-representing **camera-frame ΔR since the previous frame**. Internally:
+A 7 → 16 → 16 → 2 fully-connected MLP. Tanh activations on hidden
+layers (symmetric, bounded, well-behaved with signed motion); linear
+output. ≈ 430 trainable parameters total — small enough to inspect by
+eye in `motor-model.toml`, small enough to forward in ~µs on the Pi,
+big enough to capture the nonlinearities we care about (deadband at
+low PWM, saturation at high PWM, turning-radius dependence on speed,
+inertia from `(v_prev, ω_prev)`, Δcommand transients from
+`(pwm_*_prev)`, and battery droop).
 
-* If `rotation_hint` is `Some` and `np >= 1`, use
-  `predict.rotation = st.trajectory[np-1].rotation * hint`,
-  `predict.translation = constant_velocity(...).translation`
-  (or just `st.trajectory[np-1].translation` if `np < 2`).
-* Else, fall through to the existing CV predict path unchanged.
+Inputs are normalised before entering the network:
 
-This keeps `slam-core` camera-free (no IMU dependency on the inner
-crate) and the call site in `src/slam/mod.rs::run` is the only place
-that pulls from `imu.recent_since(t_prev_capture)` and applies the
-extrinsic.
+* `pwm_l, pwm_r, pwm_l_prev, pwm_r_prev` → divide by `MAX_DUTY` (4095)
+  → roughly [-1, 1]
+* `v_prev` → divide by 1.0 m/s (a reasonable indoor max)
+* `omega_prev` → divide by 2.0 rad/s
+* `battery_v` → `(V - 7.8) / 0.6` → roughly [-1, 1] across the
+  usable battery range
 
-**Integrator** (in `src/slam/mod.rs::run`):
+Normaliser constants live in the file alongside the weights; never
+hard-coded in load paths.
 
-1. Track `t_prev_capture: Option<Instant>` across frames.
-2. On each frame, call `imu.recent_since(t_prev_capture.unwrap_or(now))`.
-3. Sum: `ΔR_imu = ∏ exp([(ω_i - bias) · dt_i]_×)` in SO(3), where
-   `dt_i` is the gap to the next sample (last sample uses the gap to
-   `frame.t_capture`).
-4. Apply extrinsic: `ΔR_cam = R_camera_imu · ΔR_imu · R_camera_imu^T`.
-   Default `R_camera_imu = I` per the Stage 3 mounting inference;
-   override via env var if validation shows axis swap is needed.
-5. Pass `Some(UnitQuaternion::from_matrix(&ΔR_cam))` into
-   `on_frame(...)`.
+#### Training
 
-**A/B switch.** `GINGER_IMU_PREDICT=0` (env var, read once at startup
-in `slam/mod.rs::run`) falls back to vision-only — kill switch if the
-IMU integration regresses something.
+* **Loss.** Weighted MSE:
+  `L = (ω_pred - ω_meas)² + α · 𝟙[v_meas present] · (v_pred - v_meas)²`
+  with `α ≈ 3` because v-labelled windows are sparser than ω-labelled
+  windows and we want the v head to learn at a comparable rate.
+* **Optimiser.** Adam-lite (Adam without bias correction; one extra
+  vector per parameter). Learning rate `1e-3`, β₁ `0.9`, β₂ `0.99`.
+  Roll our own — no ML dep on the Pi.
+* **Backprop.** Hand-written. Two-hidden-layer tanh MLP with MSE loss
+  is ~30 lines of careful code; an external autodiff or ML crate is
+  overkill and adds aarch64 build pain.
+* **Step cadence.** One SGD step per `LabelledSample` (~5 Hz when
+  driving). 5 Hz × 60 s = 300 steps/min — fast convergence for a
+  400-param model.
 
-**Headless tests.** No camera or hardware needed:
+#### Bootstrap
 
-* `lie::so3_exp` round-trips: spin a synthetic 1 s 90°/s rotation
-  through the integrator and assert recovered `ΔR ≈ R_x(90°)`.
-* `Frontend::on_frame` with a `rotation_hint` matching the synthetic
-  scene's true motion gives a tighter inlier count than the CV
-  predict alone (regression of "tracking through fast motion").
+Random Xavier init + a synthetic warm-up so a fresh `motor-model.toml`
+doesn't make the robot drive blind for the first minute:
 
-#### Stage 5 — validation: fast spin + room loop
+1. On first boot (no model file), generate 2000 synthetic samples
+   from a hand-coded prior — a linear-with-deadband function that
+   matches the operator note in `CLAUDE.md` (PWM 1500 ≈ 0.6 m/s).
+2. Run 2000 SGD steps against the synthetic data. Save.
+3. From there, the live label stream takes over.
 
-Driven over HTTP with **visual control before each pulse** — i.e.
-`curl /api/camera/frame -o /tmp/now.jpg` then look at the image
-before sending a `/api/drive` so we don't drive into anything.
+The warm-up is deterministic (seeded RNG) and runs at module-init
+time in ~10 ms — no user-visible delay.
 
-1. **Fast-spin reproduction** (the session-2 failure): forward at
-   `duty=1500` for 0.7 s, then *immediately* in-place spin `±1800`
-   for 1.2 s, no stop between. Watch `/api/slam/map` while doing
-   it. Pass criteria:
-   * `tracking=true` throughout the spin (was: collapsed in 14 frames).
-   * `n_lost` doesn't increment.
-   * Map grows during the spin (or at minimum survives it).
-2. **Slow room loop** (the session-2 cumulative-rotation failure):
-   three back-to-back gentle right arcs (`left=900, right=300`,
-   ~0.8 s each) totalling ~90°. Same pass criteria.
-3. **Multi-minute exploration** (the actual goal in CLAUDE.md):
-   alternating short forward pulses (`±1500` for 0.5–1 s) and gentle
-   turns (`differential ≤ 1200`) for several minutes, with visual
-   confirmation before each pulse. Save the `/api/slam/map`
-   snapshot at the end as evidence.
+#### Staleness check on load
 
-If tracking still collapses on (1), the most-likely culprits in
-order are: (a) wrong extrinsic — re-check `R_camera_imu` by
-spinning in-place and asserting `gyro_z` dominates; (b) bias not
-yet learned at the moment of the spin (warm-up window collided
-with the test); (c) camera-IMU temporal sync drift — fall back to
-the libcamera `SensorTimestamp` metadata + BMI160 `sensortime`
-constant-offset fit.
+If `motor-model.toml` was saved at a battery voltage > 0.3 V away from
+the current reading, **don't reload it.** Re-bootstrap from synthetic
+warm-up. Cheap insurance against the model file outliving its
+calibration regime.
 
-### Gotchas
+#### File format
 
-* **Camera-IMU time alignment — current status.** Both stamps come
-  from `Instant::now()` on `CLOCK_MONOTONIC`. The libcamera
-  `SensorTimestamp` metadata (true start-of-exposure) was deliberately
-  *not* used for Stage 2 — `Instant::now()` at request-complete is
-  ~one frame later but jitter-free and on the same clock as the IMU.
-  Stage 4's integral runs *between* frames, so a constant offset
-  cancels out. Live sync gap is −2..+20 ms (well inside one camera
-  period). Only revisit if Stage 5 fails (a) and the other two
-  hypotheses don't pan out.
-* **Coordinate frames — mounting inferred from gravity.** At rest
-  `accel ≈ [0, 0, +g]` ⇒ IMU body Z = up. Yaw (rotation about
-  gravity) = `gyro_z`. Camera convention is Z-forward, Y-down;
-  camera-Y is gravity-aligned. The integrator default extrinsic is
-  `R_camera_imu = I` (which assumes gyro X/Y are interpreted as
-  camera X/Y, gyro Z as camera-Y); the dominant in-plane motion is
-  yaw, which Z handles correctly. If Stage 5 shows the predict
-  rotates the wrong sign or axis, **first** dump a 1 s in-place spin
-  trace to `/tmp/imu-spin.csv` and check which gyro axis dominates,
-  **then** set `R_camera_imu` via env var rather than tweaking math.
-* **Gyro bias drift with temperature.** Don't persist to `slam.toml`
-  — temperature-dependent (~0.05 dps/°C). Auto-bias on every boot
-  (see Stage 3) captures current temperature without any setup ritual.
-* **Headless test must not require hardware.** The driver's `I2cBus`
-  trait + `MockI2cBus` is in place (`src/hal/bmi160.rs`). The IMU
-  thread uses the same trait so the polling loop, ring, and bias
-  estimator can be exercised without hardware (`src/imu/mod.rs`
-  `tests` module).
-* **Pi I²C clock — apply after next reboot.** Default 100 kHz, three
-  slaves on the bus → achieved IMU rate is 142 Hz vs 200 Hz target.
-  Bump via `/boot/firmware/config.txt` (not `/boot/config.txt` on
-  modern RPi OS): `dtparam=i2c_arm_baudrate=400000`. Reboot required.
-  Stage 4 works at 142 Hz; this is a polish item.
+TOML, human-readable, weight matrices as nested arrays:
 
-### Success criterion for the whole IMU thread
+```toml
+[meta]
+trained_steps = 14572
+last_battery_v = 7.92
+last_updated = "2026-05-25T13:42:17Z"
+schema_version = 1
 
-Same as the session-2 goal, just now achievable: the robot can be
-driven in a multi-minute exploration of the room — including
-in-place direction changes — with `tracking=true` for the whole
-session and the map growing monotonically. Save the `/api/slam/map`
-snapshot that proves it.
+[normalizer]
+pwm_scale = 4095.0
+v_scale = 1.0
+omega_scale = 2.0
+battery_mean = 7.8
+battery_scale = 0.6
+
+[layer_1]  # 7 → 16
+weights = [[...], ...]
+bias = [...]
+
+[layer_2]  # 16 → 16
+weights = [[...], ...]
+bias = [...]
+
+[layer_3]  # 16 → 2
+weights = [[...], ...]
+bias = [...]
+```
+
+#### Tests (headless)
+
+* Persistence round-trip: `save` → `load_or_default` gives bit-identical
+  predictions on a fixed input set (and the file is human-inspectable).
+* **MLP can fit a known nonlinear function.** Generate 5000 samples
+  from a synthetic ground-truth: `v = tanh(2·pwm_avg) · 0.6` plus a
+  deadband, `ω = 1.5 · (pwm_r - pwm_l) / MAX_DUTY · (1 + 0.3·v_prev)`
+  (turning rate depends on speed). After 5000 SGD steps assert
+  prediction RMSE < 20 % of target scale on a held-out set.
+* **Recurrence reaches steady state.** Feed back `(v_prev, ω_prev)`
+  from the previous prediction; with constant inputs the loop must
+  converge to a fixed point within 0.5 s of simulated time
+  (10 ticks @ 20 Hz).
+* **Battery input has measurable effect.** Sweep `battery_v` from
+  7.2 to 8.4 with everything else fixed; the output must vary
+  (otherwise the model's ignoring the input).
+* **Sparse v labels still learn the v head.** Synthetic stream where
+  only 1 in 5 samples has `v_meas`; the v RMSE must still drop over
+  training.
+* **Bootstrap is deterministic.** Two fresh `MotorModel::default()`s
+  with the same seed produce bit-identical weights.
+
+#### WebUI surface
+
+A new **"Motor model"** sidebar card. The model is the robot's
+self-belief about its own dynamics — the operator needs to see it
+both as health telemetry and as a tangible "what will happen if I
+drive at PWM X" map.
+
+* **Health row:** `trained_steps`, time since last update, current
+  battery_v vs. fit-time battery_v (green / amber / red badge for
+  staleness), schema version.
+* **Loss row:** running mean ω-residual and v-residual over the
+  last 60 samples (sparkline if cheap, otherwise just the number
+  with a colour against an absolute target).
+* **Prediction heatmap:** a 9×9 grid where each cell `(i, j)`
+  shows the model's predicted `(v, ω)` for `pwm_l = -4095 + i·...`,
+  `pwm_r = -4095 + j·...` (with `v_prev = 0`, `ω_prev = 0`,
+  current `battery_v`). Colour by `v`, text by `ω`. This is the
+  one-look "is the model sane" view — the diagonal should show
+  smooth forward/reverse gradients, the off-diagonals should turn.
+* **Manual probe:** a tiny form (`pwm_l`, `pwm_r` sliders) → live
+  predicted `(v, ω)` text. Doesn't drive the motors; pure inspection.
+
+Endpoints:
+
+* `GET /api/motion/model` — `{ trained_steps, last_battery_v,
+  last_updated, residual_v, residual_omega, weights_summary }` for
+  the health rows.
+* `GET /api/motion/model/predict?pwm_l=…&pwm_r=…&...` — runs one
+  forward pass; backs both the heatmap and the manual probe.
+* `POST /api/motion/model/reset` — re-runs synthetic warm-up;
+  WebUI button for emergency recovery if the model goes off the
+  rails on bad labels.
+
+#### Stage 1 done when
+
+* All tests green.
+* `motor-model.toml` written on shutdown and reloaded on boot on the
+  live binary; a manual `cat motor-model.toml` shows recognisable
+  structure (the matrix shapes match, values are finite and roughly
+  in [-2, 2]).
+* WebUI motor-model card renders, prediction heatmap is non-empty,
+  manual probe works.
+* No behaviour change on the robot yet — model is a passive observer
+  fed by Stage 2's labels and read by Stage 3's integrator.
+
+### Stage 2 — label streams: gyro `ω` + ultrasonic `v`
+
+The model from Stage 1 needs supervision. Two sources, both already
+wired at the hardware level.
+
+* **`ω` label.** Pre-integrate `gyro_z` over the 200 ms model-update
+  window (existing `imu.recent_since` API). Divide by window duration.
+* **Whole-window rejection** (drops both ω and v labels for the window
+  — anything that produced a bad ω also produced bad v):
+  1. Any single-sample |ω| > 5 rad/s — chassis bump.
+  2. Any single-sample `| |accel| - g |` > 3 m/s² — collision,
+     pickup, kick, or someone setting the robot down. Cheaper and
+     earlier signal than gyro for those events; gravity magnitude is
+     known and stable on flat hardwood.
+* **`v` label.** Δd/Δt from the front-facing ultrasonic, **but only**:
+  1. all readings in the window are within the sensor's reliable
+     range (8 – 80 cm),
+  2. the robot is commanded approximately straight (`|pwm_l - pwm_r|`
+     under some threshold — turning windows produce useless v labels),
+  3. distances are monotonic across the window (no obstacle moved or
+     came into / left the beam).
+  Expect maybe 10–20 % of windows to yield a usable v label. That is
+  enough for an online fit because the gyro-labelled `ω` stream is
+  abundant and the v fit is two parameters per sign.
+
+New `src/motion/labels.rs`. A small worker reads PWM + gyro +
+ultrasonic at 5 Hz, emits `LabelledSample`s, feeds them to
+`MotorModel::observe`.
+
+#### Tests (headless)
+
+* Synthetic gyro stream + window → expected average ω.
+* Synthetic ultrasonic stream: monotonic → correct v; non-monotonic →
+  `None`; spike → `None`.
+* Whole-window rejection: a window with a gyro spike is dropped;
+  a window with `|accel|` 5 m/s² above g is dropped; a clean window
+  passes.
+* End-to-end: synthetic driver feeds 1 minute of varied commands;
+  model converges to ground truth within 15 %.
+
+#### WebUI surface
+
+Extends the Stage 1 "Motor model" card with a **"Labels"** subsection
+that lets the operator watch supervision in real time:
+
+* **Counters:** total samples observed; ω-labelled count;
+  v-labelled count; v-label rate (% of windows producing a v
+  label, rolling 60 s).
+* **Rejection breakdown:** counts by reason — whole-window drops
+  ("gyro spike", "accel spike") separated from v-only drops ("out
+  of range", "not straight", "non-monotonic"). Helps the operator
+  notice "I drove for 5 minutes and got zero v labels — why?"
+  without having to read logs.
+* **Latest-sample table:** scrollable list of the last ~20
+  `LabelledSample`s — pwm_l, pwm_r, ω_meas, v_meas (or "—"), age.
+  This is the rawest possible view of what the model is being fed.
+* **Loss sparkline:** rolling per-step loss (ω-residual,
+  v-residual) over the last ~5 min. The "is it converging" view.
+
+Endpoint: `GET /api/motion/labels` returns counters + the last N
+samples in a small JSON blob.
+
+#### Stage 2 done when
+
+* On the live binary, `motor-model.toml` changes meaningfully across a
+  5-minute drive (weights move off the synthetic-warm-up defaults,
+  then stabilise).
+* The "Labels" card shows a healthy v-label rate (≥ 10 % during
+  straight-driving segments) and the loss sparkline trends down
+  over the first ~2 minutes, then sits flat.
+
+### Stage 3 — pose integrator
+
+First user-visible signal that the new stack does something useful.
+
+* `src/motion/pose.rs`. A worker at 20 Hz reads the latest commanded
+  PWM, predicts `(v_pred, ω_pred)`, **overrides ω with gyro-integrated
+  ω** (gyro is always more accurate; the model's ω prediction is kept
+  for monitoring only), and integrates `(v_pred, ω_actual)` into 2D
+  pose `(x, y, θ)`.
+* Operator endpoints: `GET /api/motion/pose` (current pose +
+  trajectory ring), `POST /api/motion/reset` (zero the integrator).
+
+#### Tests (headless)
+
+* Synthetic command sequence through the integrator; assert pose
+  matches analytic solution to within float tolerance.
+* Reset clears state.
+
+#### WebUI surface
+
+New **"Pose"** card. This is the first time the operator sees the
+robot's belief about its own location — the most important world-model
+view we have.
+
+* **Live pose readout:** `x` (m), `y` (m), `θ` (deg).
+  Plus: `|v|` (m/s) and `ω` (deg/s) live, with the model's prediction
+  shown alongside the gyro measurement for ω (visible disagreement
+  flags an unhealthy model).
+* **Top-down trajectory plot:** SVG canvas, ~5 m × 5 m bounded
+  around the robot's start, robot drawn as a triangle pointing
+  along θ, trail of the last ~5 min of poses. Auto-zooms if the
+  trajectory exits the default bounds.
+* **Drift indicator:** distance from origin; useful sanity check
+  on a "drive a square and come home" test.
+* **"Reset pose" button** wired to `POST /api/motion/reset`.
+
+Endpoint: `GET /api/motion/pose` returns
+`{ x, y, theta, v, omega, trail: [{x,y,t}, …] }`. The trail is the
+ring buffer; capped at ~1000 points so the JSON stays small.
+
+#### Stage 3 done when
+
+* "Square test" on the live binary: drive a 1 m × 1 m square (forward
+  1 m, in-place quarter turn, ×4) and end within ~25 cm of start. The
+  trajectory plot in the WebUI shows a recognisable square (some drift
+  OK; gross asymmetry indicates a motor-model bug, not drift). Save
+  the trace.
+* If the square fails badly, that is data: Stage 1/2 needs more
+  ultrasonic-labelled v windows, or the model needs more training
+  time on varied commands. Iterate before moving to Stage 4.
+
+### Stage 4 — swept-ultrasonic local scan + greedy exploration controller
+
+Cheapest perception we can build, no ML. Validates that "explore the
+room without a global map" is reachable on motor-model pose alone.
+
+At a stationary waypoint:
+
+* Pan the ultrasonic from ~15° to ~165° in 10° steps (~15 readings,
+  ~3 s total — servo settle dominates).
+* Build a 1D polar scan: `distance_cm[angle]`.
+* Identify the "best heading": the angular bin (with some neighbour
+  width, e.g. ±20°) whose minimum distance is largest. Tiebreak toward
+  current heading to reduce thrash.
+
+Controller (`src/motion/explore.rs`), tick every "waypoint":
+
+1. Swept scan at rest.
+2. If max free distance < 50 cm in any direction → STOP, log "boxed in".
+3. Else: turn toward best heading (motor model predicts the PWMs and
+   duration needed to rotate by the required angle; gyro confirms).
+4. Drive forward in a series of short pulses (~0.5 s) while the
+   forward ultrasonic clears 30 cm. Stop when within 40 cm of
+   anything or after ~1 m travelled (motor model integrates distance).
+5. Goto 1.
+
+No global plan, no map of where we have been, no return-to-base — just
+"keep going somewhere there is room." Loop closure / coverage tracking
+are deferred to Stage 6.
+
+#### Tests (headless)
+
+* Mock polar scan → controller picks the correct best-heading angle.
+* Boxed-in scan (all readings < 50 cm) → STOP.
+* Mock pose evolution under a synthetic command sequence; controller
+  switches to the next waypoint at the expected distance.
+
+#### WebUI surface
+
+Two new things, plus an overlay on the existing pose trajectory.
+
+* **"Scan" card.** Polar plot of the most recent swept scan (SVG;
+  half-disc, ~150° wedge). Each ray = one ultrasonic reading;
+  length = distance in cm. The chosen "best heading" is highlighted
+  (e.g. green wedge); rejected directions (< 30 cm) shown red.
+  Numerical readout below: `chosen θ`, `chosen d`, `scan age`.
+* **"Explore" card.** Toggle button (`POST /api/motion/explore?on=1`),
+  current state string (`scanning` / `turning to 47°` / `driving 0.6 m`
+  / `boxed in` / `idle`), and the controller's current target
+  heading. Plus an "abort" button that calls `POST /api/motion/stop`.
+* **Pose-plot overlay (extends Stage 3 plot).** Plot the latest scan
+  as fan-shaped rays emanating from the robot's current pose. The
+  operator can then see both "where I am" and "what I see right now"
+  in one glance.
+
+Endpoints:
+
+* `GET /api/motion/scan` — latest polar scan + timestamp.
+* `GET /api/motion/explore` — controller state + chosen heading.
+* `POST /api/motion/explore?on=1|0` — toggle.
+
+#### Stage 4 done when
+
+* **The main milestone of this plan**: robot drives autonomously in
+  the living room for ≥ 5 minutes without operator commands, without
+  bumping into anything, without the supervisor tripping ultrasonic
+  stop, with a trajectory from `/api/motion/pose` that shows
+  non-degenerate coverage (visits multiple distinct regions of the
+  room, not oscillating in a corner).
+* The Scan + Explore cards render and update in real time; the
+  trajectory overlay shows the live scan wedge.
+* Save the trajectory + scan log as evidence on the PR closing Stage 4.
+
+**If Stage 4 is enough for what we actually want, Stages 5–6 can be
+deferred indefinitely.** That is by design: stop here unless dense
+mapping is needed.
+
+### Stage 5 — on-device monocular depth predictor
+
+Highest-risk stage. Only enter if Stage 4 lands and dense structure is
+genuinely useful (mapping, smarter obstacle avoidance than swept-US
+allows, return-to-base).
+
+* **Pick model.** Three candidates, profile first:
+  * MiDaS-small INT8 (well-trodden path, broad accuracy).
+  * FastDepth (designed for mobile, smallest).
+  * DepthAnythingV2-Small (newer, more accurate, heavier).
+* **Pick runtime.** Two paths, pick after a one-day spike:
+  * Rust-native: the `ort` crate (ONNX Runtime). Cleanest integration,
+    requires aarch64 ONNX Runtime libs on the Pi.
+  * Python sidecar: a small `python3` process loading the model,
+    serving depth over a Unix socket. Less elegant but probably the
+    fastest way to validate "does any model run fast enough on the
+    Pi" — defer the Rust port until we know the answer.
+* **Profile gate.** Before integration, run all three models on a
+  static image via a throwaway `cargo run --bin depth-bench`. Pass
+  criteria: ≥ 1 Hz wall-clock end-to-end on the Pi, subjectively
+  reasonable depth on the three test scenes (corridor, living room,
+  blank wall). If no candidate clears 1 Hz, **drop Stage 5
+  entirely** — Stage 4 is the product.
+* **Metric scale.** Mono-depth output is up to unknown scale. Anchor
+  with the ground-plane assumption: known camera height H, fit a
+  single scalar gain that makes predicted depth at floor pixels
+  consistent with H. Refit once per minute. Persist alongside the
+  motor model (`motor-model.toml` is already the runtime-state file
+  for this machine; add a `[depth_scale]` table to it).
+* **Plumbing.** New module `src/depth/`, mirrors `src/imu/`:
+  background thread, latest-result snapshot.
+
+#### Tests (headless)
+
+* Mock depth backend returning a known-shape depth from a known-shape
+  image; assert ground-plane scaling produces the expected metric
+  depth at floor pixels.
+* The `--no-default-features` build uses the mock backend so the
+  workspace DoD stays green without ONNX or Python.
+
+#### WebUI surface
+
+New **"Depth"** card placed next to the live camera frame so the
+operator can compare them visually:
+
+* **Depth heatmap.** Colour-mapped JPEG from `/api/depth/frame`,
+  auto-refreshing at the depth predictor's rate (~1 Hz). Use a
+  consistent colour map (e.g. viridis: near = yellow, far = purple)
+  with a small legend.
+* **Metric scale row:** last-fit scale factor (m / depth-unit),
+  fit residual on the ground plane, time since last refit, count
+  of floor pixels used in the fit. If the fit fails (e.g. no floor
+  visible), surface that with an amber badge.
+* **Latency / FPS row:** end-to-end depth-predictor latency,
+  achieved FPS, queue depth if any.
+* **Same-frame overlay (optional, cheap):** thin crosshair on
+  both the camera frame and the depth heatmap with the predicted
+  depth at the centre pixel — useful sanity check when driving
+  toward a wall.
+
+Endpoints:
+
+* `GET /api/depth/frame?...` — JPEG, optional `w` / `q`.
+* `GET /api/depth/info` — scale + latency + FPS.
+
+#### Stage 5 done when
+
+* Pi-side: `/api/depth/frame` returns a depth visualisation at ≥ 1 Hz.
+* Pi CPU load with depth + IMU + camera + HTTP under ~80 % (room for
+  the supervisor and live driving).
+* Subjective sanity: in three scenes, the depth map ranks objects in
+  the right order (close > far) and the floor is monotonically
+  increasing with image row.
+
+### Stage 6 — dense 2D occupancy grid (depth-driven)
+
+Only if Stage 5 lands.
+
+* `OccupancyGrid` in `src/motion/grid.rs`. 5 cm cells, 8 m × 8 m
+  bounded around robot start.
+* Each depth frame projects to floor-plane occupancy in the current
+  motion-model pose. Bayesian update (log-odds) so a single noisy
+  prediction doesn't overwrite the grid.
+* Exploration controller (Stage 4) gains an "unvisited frontier"
+  heading bias: prefer headings toward grid cells marked unknown.
+
+No loop closure. No global consistency across drives. The grid is for
+one drive at a time; drift is acceptable as long as it stays locally
+coherent.
+
+#### WebUI surface
+
+The occupancy grid becomes the dominant world-model view, replacing
+or augmenting Stage 3's trajectory plot.
+
+* **Top-down grid view.** PNG (server-rendered for cheapness)
+  at `/api/motion/grid.png`, ~200×200 px for an 8 m × 8 m grid at
+  4 cm/px. Colour: white = free, black = occupied, grey = unknown.
+  Robot drawn as a triangle on top (same as Stage 3 plot). Trail
+  optional.
+* **Toggle overlays.** "Show trajectory" / "Show scan rays" /
+  "Show frontier cells" (cells flagged for exploration bias).
+  All client-side flags on the same canvas.
+* **Grid stats row:** % free, % occupied, % unknown, frontier
+  count, last update time.
+* **"Clear grid" button** wired to `POST /api/motion/grid/reset`
+  for starting a fresh drive without restarting the binary.
+
+Endpoints:
+
+* `GET /api/motion/grid.png` — rendered grid image, optional
+  query params for size / overlay flags.
+* `GET /api/motion/grid` — raw stats + maybe RLE-compressed cells
+  for clients that want to render themselves.
+* `POST /api/motion/grid/reset` — clear.
+
+#### Stage 6 done when
+
+* A 10-minute autonomous drive in the living room produces an
+  occupancy grid in which the room's gross geometry (walls, large
+  furniture footprints) is recognisable to a human looking at the
+  WebUI top-down view.
+
+## What we are explicitly dropping or deferring
+
+* **ORB-SLAM as the primary localiser.** Crates and `src/slam` keep
+  compiling and their tests keep running. Nothing on the exploration
+  path calls into them. The mapper / BA / BoW / loop-closure code is
+  preserved for a possible future stereo or RGB-D path; if six months
+  go by and that future doesn't materialise, delete it then.
+* **Loop closure / global map consistency.** Out of scope. Stage 6's
+  grid is robot-frame, single-drive.
+* **Per-wheel (4D) motor input.** 2D `(pwm_l, pwm_r)` first. The
+  hardware supports addressing all four wheels independently
+  (`src/devices/motors.rs:33`), but the chassis is skid-steer and the
+  theoretical benefit of front/rear differentiation on a symmetric
+  chassis is small. Revisit only if Stage 3's square test shows
+  systematic asymmetry that 2D inputs can't capture.
+* **Bathroom / non-hardwood floor handling.** The model is fit on one
+  surface; tile will break it. Manually keep the robot out of the
+  bathroom for now. A second model gated on a "floor regime" detector
+  is a possible Stage 7 if it matters.
+* **Visual-inertial bundle adjustment** (the old PLAN's "next" item).
+  Moot now — we're not using the visual stack for pose.
+
+## Gotchas
+
+* **Servo-sweep cost.** A 10°-step pan from 15° to 165° at typical
+  settle times is ~3 s per scan. Acceptable as a per-waypoint cost;
+  not acceptable as a continuous loop. The controller in Stage 4 must
+  not scan more than once per waypoint.
+* **Ultrasonic beamwidth.** HC-SR04 cone is ~15° wide; pretending the
+  scan has 1° resolution is wrong. Use 10° bins to match.
+* **Motor-model staleness across reboots.** Even with the battery
+  voltage check, a model fit with a half-charged battery six hours
+  ago can be off. If `/api/motion/model` shows the residual jumping
+  after a reload, force a re-init (`POST /api/motion/model/reset`).
+* **Depth predictor temporal flicker.** Frame-to-frame depth is
+  noisy. The Stage 6 Bayesian update absorbs this; don't write a
+  hard-overwrite update.
+* **Pi CPU contention.** The IMU thread is already starved (142 Hz
+  vs 200 Hz target on the contended I²C bus). Adding a depth
+  predictor takes a whole core. Pin threads with explicit affinity
+  if Stage 5 evidence shows competing latencies.
+* **Camera vs ultrasonic vs depth time-alignment.** Stage 6 will need
+  the depth frame's `t_capture` aligned to the pose at that moment.
+  `Instant::now()` on `CLOCK_MONOTONIC` is already the project-wide
+  convention; keep it.
+
+## Definition of done for the whole plan
+
+The bar is **Stage 4**: the robot drives itself around the living room
+for ≥ 5 minutes without operator commands, without collisions, with a
+non-degenerate trajectory from `/api/motion/pose`. Stages 5–6 are
+upgrades, not requirements.
+
+When Stage 4 passes:
+
+1. Save the trajectory and the swept-US scan log as evidence on the
+   merging PR.
+2. Update `README.md`'s "SLAM status" section to reflect that
+   exploration is now motion-model + swept-US driven, with visual SLAM
+   demoted to "available but not on the critical path."
+3. Delete this `PLAN.md`. Per `CLAUDE.md`, `PLAN.md` is a migration
+   roadmap, not a permanent doc.
 
 ## Workflow
 
-* Drive via the existing HTTP endpoints — short bursts only, and
-  always look at `/api/camera/frame` first to confirm the camera sees
-  what we think.
-* Each iteration: form a hypothesis, write the targeted fix, add a
-  test if the failure can be reproduced headlessly (preferred — see
-  the `relocalizes_after_track_loss` style in
-  `src/slam/frontend.rs`), run the workspace DoD, `make deploy`,
-  observe.
-* For the IMU thread specifically: every stage merges to `main`
-  on its own; do not stack stages in a single PR (each stage
-  changes behaviour subtly and should be bisectable).
-* Keep the *running TODO* in this PLAN.md and delete it (the whole
-  file) when room-scale exploration with tracking succeeds.
+Same as the prior plan, unchanged:
 
-## Out of scope
-
-* Camera calibration. The FOV-derived prior is good enough for a
-  bench test; a real ChArUco run is a separate work item.
-* Loop closure quality tuning. The mapper panic is fixed; observed
-  loop closure behaviour can be revisited once tracking is reliable.
-* Frontend panic-resilience around the world mutex. With the mapper
-  panic gone we shouldn't see a poisoned lock in normal operation;
-  defense-in-depth there is a deferred task.
-* **Full visual-inertial bundle adjustment.** Stage 4 only uses the
-  IMU for the tracking-predict, not as a BA constraint. Adding IMU
-  factors to the local BA is the right *next* increment after Stage
-  5 lands; it's not a prerequisite for the room-exploration goal.
+* Each stage merges to `main` independently; do not stack stages.
+* Test headless first (`cargo test --workspace --no-default-features`),
+  deploy via `make deploy`, validate on the live binary.
+* Every drive command on the live binary is preceded by
+  `curl /api/camera/frame -o /tmp/now.jpg` and a look at the image.
+* Drive in short pulses; never let the robot run with no stop command
+  cued up.
