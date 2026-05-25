@@ -68,10 +68,25 @@ gh_api() {
     "$@"
 }
 
-log "looking up latest successful '$WORKFLOW' run on '$BRANCH'"
-run_id="$(gh_api "$API/repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&status=success&per_page=1" \
-  | jq -r '.workflow_runs[0].id // empty')"
-[ -n "$run_id" ] || die "no successful '$WORKFLOW' run found on '$BRANCH'"
+# The "latest successful run" is *not* a safe target on its own: if the
+# burst polls right after a push, the just-pushed CI build is still
+# running, and the "latest successful" is the *previous* main commit —
+# which we'd then happily install and exit declaring success. That bug
+# bit us on Stage 1 of the motor-model PR; the cure is to identify the
+# run by `head_sha` and only proceed when it matches `$BRANCH`'s tip.
+log "looking up tip SHA of '$BRANCH' on $REPO"
+target_sha="$(gh_api "$API/repos/$REPO/branches/$BRANCH" \
+  | jq -r '.commit.sha // empty')"
+[ -n "$target_sha" ] || die "could not resolve $BRANCH tip SHA"
+log "target SHA $target_sha"
+
+log "looking up successful '$WORKFLOW' run matching $target_sha"
+run_id="$(gh_api "$API/repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&status=success&per_page=20" \
+  | jq -r --arg sha "$target_sha" 'first(.workflow_runs[] | select(.head_sha==$sha) | .id) // empty')"
+if [ -z "$run_id" ]; then
+  log "no successful '$WORKFLOW' run for $target_sha yet — burst keeps polling"
+  exit 10
+fi
 
 artifact_id="$(gh_api "$API/repos/$REPO/actions/runs/$run_id/artifacts" \
   | jq -r --arg n "$ARTIFACT" 'first(.artifacts[] | select(.name==$n) | .id) // empty')"

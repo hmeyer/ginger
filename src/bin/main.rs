@@ -26,6 +26,34 @@ const MOTOR_MODEL_PATH: &str = "motor-model.toml";
 /// an ungraceful shutdown.
 const MOTOR_MODEL_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Poll-sleep until the supervisor has published a non-zero battery
+/// reading, capped by [`BATTERY_BOOT_WAIT`]. Falls back to `7.8 V` (the
+/// middle of the 2S LiPo's usable range) and logs a warning if the ADC
+/// is slow or unreachable — the model still loads, it just anchors on
+/// a synthetic value and may re-bootstrap on the next session.
+const BATTERY_BOOT_WAIT: Duration = Duration::from_secs(3);
+const BATTERY_BOOT_FALLBACK_V: f32 = 7.8;
+const BATTERY_BOOT_VALID_THRESHOLD_V: f32 = 0.5;
+
+fn wait_for_battery(sensors: &Arc<RwLock<SensorSnapshot>>) -> f32 {
+    let deadline = std::time::Instant::now() + BATTERY_BOOT_WAIT;
+    loop {
+        let v = sensors.read().unwrap().battery_v;
+        if v > BATTERY_BOOT_VALID_THRESHOLD_V {
+            return v;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "motor-model: no valid battery reading after {:?}; anchoring on {:.1} V — \
+                 next boot will likely re-bootstrap",
+                BATTERY_BOOT_WAIT, BATTERY_BOOT_FALLBACK_V
+            );
+            return BATTERY_BOOT_FALLBACK_V;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -73,11 +101,14 @@ async fn main() {
             .expect("spawn slam thread");
     }
 
-    // Motor model: load if non-stale, else bootstrap. The first battery
-    // read may not have happened yet — pass a sensible default; the live
-    // staleness check kicks in on the *next* boot once we've been running
-    // long enough to capture a real reading.
-    let battery_v_now = sensors.read().unwrap().battery_v.max(7.8);
+    // Motor model: load if non-stale, else bootstrap. The supervisor
+    // hasn't polled the battery yet at this point, so `SensorSnapshot`
+    // still carries the `initial()` zero. Wait briefly for a real
+    // reading — anchoring the staleness check on a placeholder defeats
+    // the whole point, because the next boot at a different voltage
+    // will then trigger an unnecessary re-bootstrap and a saved-model
+    // session is effectively never reused.
+    let battery_v_now = wait_for_battery(&sensors);
     let motor_model = Arc::new(RwLock::new(MotorModel::load_or_bootstrap(
         Path::new(MOTOR_MODEL_PATH),
         battery_v_now,
