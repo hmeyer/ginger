@@ -130,6 +130,25 @@ For pipeline-shaped monitors (`tail -f log | grep …`) the
 `--line-buffered` flag on `grep` (or `awk -W interactive`, `sed -u`)
 is sufficient and the `exec 1>` prefix isn't needed.
 
+### 3. Prefer durable state files over `journalctl --user`
+
+`journalctl --user -u <unit>` returns "No journal files were found" in
+some non-interactive shell contexts on this Pi, even when
+`systemctl --user status <unit>` correctly renders the same log lines.
+The cause is journal-access permissions vs `SystemBus` vs missing
+session bits — sometimes fixable with explicit env vars, sometimes
+not. Either way, **don't gate a monitor on `journalctl` output if you
+can avoid it.** Use:
+
+* the API surface (`curl /api/motion/model | jq ...`), or
+* a unit's state file (`~/.config/ginger/last-deploy` changes when a
+  new artifact installs), or
+* `systemctl --user show <unit> -p ActiveEnterTimestamp` — works
+  reliably and gives you the last restart time.
+
+Reserve `journalctl` for interactive debugging where you can verify it
+works in the current shell.
+
 ### 2. Silent-fallback poll loops eat errors and never exit
 
 The "wrap a remote call in `|| echo "[]"` so the loop survives one
