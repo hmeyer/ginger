@@ -283,9 +283,16 @@ fn try_v_us(
     } else if pwm_avg < -STATIC_PWM_AVG_THRESHOLD {
         1.0
     } else {
-        0.0
+        // Commanded near zero — chassis should be stationary. If we
+        // returned `Some` here we'd integrate ultrasonic noise as
+        // motion. Live observation (post PR #65 deploy): pose.x
+        // wandered 0.84 → 1.72 → 1.17 over 30 s of explore's idle
+        // phase because each tick saw 1-2 cm of US jitter and computed
+        // v ≈ ±0.3 m/s from it. Returning `None` falls back to v_cmd
+        // (zero) in the integrator — ground truth for a stopped robot.
+        return None;
     };
-    if expected_sign != 0.0 && dd.signum() != expected_sign && dd.abs() > US_NOISE_FLOOR_CM {
+    if dd.signum() != expected_sign && dd.abs() > US_NOISE_FLOOR_CM {
         return None;
     }
     if dt_s < 0.01 {
@@ -442,9 +449,15 @@ mod tests {
     }
 
     #[test]
-    fn v_us_gate_static_command_tolerates_jitter() {
-        // Zero command, distance jittered → accept.
-        assert!(try_v_us(0, 0, Some(30.0), Some(30.5), 0.05, PAN).is_some());
+    fn v_us_gate_zero_command_rejects() {
+        // Zero command → no v_us. Returning anything here would
+        // integrate ultrasonic noise as fake forward motion during
+        // idle, which is the bug this assertion guards against.
+        assert!(try_v_us(0, 0, Some(30.0), Some(30.5), 0.05, PAN).is_none());
+        // Even on a perfectly-clean (zero Δd) reading: still None.
+        // Truth at zero command is "no motion" and the integrator
+        // should use v_cmd (= 0), not the sensor.
+        assert!(try_v_us(0, 0, Some(30.0), Some(30.0), 0.05, PAN).is_none());
     }
 
     #[test]
