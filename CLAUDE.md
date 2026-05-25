@@ -97,6 +97,87 @@ in the background — if the JSON body is *identical* two ticks in a
 row the supervisor thread is dead and the HUD is serving a stale
 snapshot (the failure mode `fd8fc13` fixed).
 
+## Monitor recipes (the Monitor tool)
+
+The Monitor tool emits a notification per stdout line of the supplied
+script. Two failure modes have burned us; both are silent (the monitor
+stays running but you never get told anything).
+
+### 1. Pipe buffering — every loop-shape monitor needs a `stdbuf` shim
+
+When the script is **bash** (not a pipeline like
+`tail -f log | grep --line-buffered ...`), stdout is **fully buffered**
+because it's connected to a pipe, not a terminal. Lines you `echo`
+sit in libc's 4 KB buffer and never reach the monitor until the
+script exits.
+
+The fix is one line at the top of the script:
+
+```bash
+exec 1> >(stdbuf -oL cat)
+```
+
+This re-routes the script's stdout through `stdbuf -oL cat`, which
+runs with **line-buffered** output. Every `\n` from your loop now
+flushes immediately. Use this for any monitor script that:
+
+* loops with `while true; ...; done`,
+* emits via `echo`, `printf`, `comm`, `jq -r`, etc. (not a piped
+  `grep --line-buffered`),
+* relies on the harness's per-line notification semantics.
+
+For pipeline-shaped monitors (`tail -f log | grep …`) the
+`--line-buffered` flag on `grep` (or `awk -W interactive`, `sed -u`)
+is sufficient and the `exec 1>` prefix isn't needed.
+
+### 2. Silent-fallback poll loops eat errors and never exit
+
+The "wrap a remote call in `|| echo "[]"` so the loop survives one
+transient failure" pattern is **dangerous** if the command syntax is
+wrong: the loop polls forever, never emits, never exits. This is
+how we lost a CI-watch session to `gh pr checks --json` (the flag
+doesn't exist on that subcommand — `gh pr view <PR> --json
+statusCheckRollup` is correct).
+
+Mitigations:
+
+* **Test your remote command interactively first.** One `gh ...`
+  invocation in a normal Bash call before arming the monitor catches
+  the syntax error in 1 s instead of a 5-minute timeout.
+* **Test the monitor against a known-complete state.** For a CI
+  watch, arm it on a PR that has already finished — events should
+  arrive within seconds. If they don't, your script is broken; fix
+  before arming on an in-flight PR.
+* **Don't swallow errors silently when designing the gate** — log
+  to stderr so the output file shows the failure. E.g.
+  `s=$(gh pr view 55 --json statusCheckRollup 2>>/tmp/mon-err.log \
+       || { echo "gh failed" >&2; echo '{"statusCheckRollup":[]}'; })`.
+
+### Pattern that works (CI-watch example)
+
+```bash
+exec 1> >(stdbuf -oL cat)   # ← load-bearing; without this, silence
+prev=""
+while true; do
+  s=$(gh pr view <PR#> --json statusCheckRollup 2>/dev/null \
+        || echo '{"statusCheckRollup":[]}')
+  cur=$(jq -r '.statusCheckRollup[] | select(.status=="COMPLETED")
+        | "\(.name): \(.conclusion)"' <<<"$s" | sort)
+  comm -13 <(echo "$prev") <(echo "$cur")  # diff: newly-resolved checks
+  prev=$cur
+  jq -e '.statusCheckRollup | length > 0 and all(.status=="COMPLETED")' \
+       <<<"$s" >/dev/null && break
+  sleep 30
+done
+echo "all-checks-done"
+```
+
+Verified working: arms against PR #55 (already complete), all four
+checks emit within ~5 s, then `all-checks-done`, then exit. If you
+need to adapt this for a different state (e.g. emit on failures only,
+or watch for a specific check name), change the `jq` filters — keep
+the `exec 1>`, the `comm -13` diff, and the gate test.
+
 ## Definition of done for a change
 
 A change is not done until all of these pass (this is what CI gates on):
@@ -140,12 +221,23 @@ non-decreasing. New behavior needs new tests in the same change.
 
 ## Git
 
-- Develop on the assigned feature branch; commit per logical unit with a
+- Develop on a feature branch; commit per logical unit with a
   descriptive message; push with `git push -u origin <branch>`.
-- Do not create a PR unless explicitly asked.
+- **Push and open a PR as early as possible** — even on the first
+  commit that builds and lints. CI on GitHub Actions runs on x86_64
+  and is *much* faster than the Pi (workspace debug builds here take
+  5–10 min; CI finishes in a fraction of that). Iterate on the PR by
+  **force-pushing** to the same branch
+  (`git push --force-with-lease origin <branch>`) rather than opening
+  a new PR per round.
+- Treat CI as the primary test runner. Local `cargo test` on the Pi
+  is for tight single-test iteration; the full
+  `cargo test --workspace --no-default-features` definition-of-done
+  belongs to CI.
 - Pre-commit hook runs `make lint`; never bypass with `--no-verify`.
 - Publishing to `main` on the Pi: use `make deploy` (not bare `git push`)
-  so the CI build is auto-pulled — see *Deploying to the Pi*.
+  so the CI build is auto-pulled — see *Deploying to the Pi*. (Pure
+  docs PRs to `main` can skip `make deploy` — there's no binary to pull.)
 
 ## TODO / status tracking
 

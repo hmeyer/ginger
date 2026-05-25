@@ -37,12 +37,18 @@ camera frame ──> depth predictor (~1 Hz) ─────┐
                                               │
 ultrasonic (panned, swept) ──> local scan ───┤
                                               ├──> 2D occupancy grid
-motor PWM ──┐                                 │       (robot frame)
-gyro ──┐    │                                 │
-       │    └──> motor model (MLP) ──> (v, ω) ──┴──> pose integrator
-       └──> ω label                       ▲
-ultrasonic Δd/Δt ──> v label ─────────────┘  (online SGD update)
+                                              │       (robot frame)
+controller / WebUI joystick                   │
+   ── desired (v, ω) ──> motor model (MLP) ──> (pwm_l, pwm_r) ──> motors
+                                ▲                       │
+   gyro (ω) + ultrasonic (v) ───┴── label stream ──> SGD step
+                                                        │
+   pose integrator ◄── (commanded v, gyro ω) ◄──────────┘
 ```
+
+The motor model is *inverse*: it takes desired motion in, emits PWM
+out. The pose integrator uses commanded `v_target` + gyro-measured ω,
+corrected by ultrasonic Δd/Δt when available.
 
 Persistence:
 
@@ -58,11 +64,14 @@ Each stage is a separately-mergeable commit / PR. Headless DoD
 (`cargo test --workspace --no-default-features`) must stay green
 at every stage; nothing in the non-libcamera path requires hardware.
 
-### Stage 1 — motor model: MLP, fit, persistence
+### Stage 1 — motor driver model: MLP, fit, persistence
 
 Wholly camera-free. Builds the foundation everything else needs:
-"given a motor command and the chassis's current state, what is it
-doing right now."
+**"to produce this desired motion from this chassis state, what PWM
+should I send."** This is an *inverse* dynamics model — its outputs are
+PWM commands, not predicted motion. The controller (Stage 4) and the
+WebUI joystick will both speak in `(v_target, ω_target)` and let this
+model translate to motor commands.
 
 New module `src/motion/model.rs`. Public API:
 
@@ -70,33 +79,51 @@ New module `src/motion/model.rs`. Public API:
 pub struct MotorModel { /* MLP weights + optimizer state + meta */ }
 
 impl MotorModel {
-    pub fn load_or_default(path: &Path) -> Result<Self>;
+    pub fn load_or_default(path: &Path, battery_v_now: f32) -> Result<Self>;
     pub fn save(&self, path: &Path) -> Result<()>;
 
-    /// Forward inference: motor command + current dynamic state → predicted motion.
-    pub fn predict(&self, x: ModelInput) -> Motion;
+    /// Inverse inference: desired motion + current state → PWM command.
+    pub fn predict(&self, x: ModelInput) -> PwmCommand;
 
     /// Online update from one labelled window. One SGD step.
     pub fn observe(&mut self, sample: LabelledSample);
 }
 
 pub struct ModelInput {
-    pub pwm_l: i32, pub pwm_r: i32,
-    pub pwm_l_prev: i32, pub pwm_r_prev: i32,  // last tick — captures Δcommand
-    pub v_prev: f32,         // last predicted v (or last gyro-confirmed pose Δ)
-    pub omega_prev: f32,     // last gyro-measured ω
+    pub pwm_l_prev: i32, pub pwm_r_prev: i32,  // last commanded — captures inertia / Δcommand
+    pub v_prev: f32,         // ultrasonic-measured if valid this window, else last v_target
+    pub omega_prev: f32,     // last gyro-measured ω (always available)
     pub battery_v: f32,
+    pub v_target: f32,       // desired forward velocity (m/s) this tick
+    pub omega_target: f32,   // desired angular velocity (rad/s) this tick
 }
 
-pub struct Motion { pub v: f32, pub omega: f32 }  // m/s, rad/s
+pub struct PwmCommand { pub pwm_l: i32, pub pwm_r: i32 }  // raw PCA9685 duty
 
 pub struct LabelledSample {
-    pub input: ModelInput,
-    pub omega_meas: f32,           // from gyro, always present
-    pub v_meas: Option<f32>,       // from ultrasonic, sometimes
+    pub input: ModelInput,             // v_target = v_meas if present, else commanded
+    pub pwm_l_obs: i32, pub pwm_r_obs: i32,  // PWM actually commanded for this window
+    pub v_meas: Option<f32>,           // ultrasonic Δd/Δt, sometimes
+    pub omega_meas: f32,               // gyro, always
+    pub v_label_present: bool,         // = v_meas.is_some(); used to weight the v-direction
     pub dt_s: f32,
 }
 ```
+
+A labelled window is built by Stage 2 like this:
+
+1. Observe what was commanded over the 200 ms window
+   (`pwm_l_obs, pwm_r_obs`).
+2. Measure what happened — `omega_meas` from gyro (always),
+   `v_meas` from ultrasonic Δd/Δt (sometimes).
+3. Construct `ModelInput` *with the measured motion as the target*:
+   `v_target = v_meas.unwrap_or(<commanded v at window start>)`,
+   `omega_target = omega_meas`. This is the key trick of inverse
+   training — the model learns "to achieve what actually happened,
+   the PWM was X."
+
+At inference the controller swaps in its *desired* `(v_target,
+ω_target)` and the model predicts the PWM that should produce it.
 
 #### Architecture
 
@@ -106,27 +133,41 @@ output. ≈ 430 trainable parameters total — small enough to inspect by
 eye in `motor-model.toml`, small enough to forward in ~µs on the Pi,
 big enough to capture the nonlinearities we care about (deadband at
 low PWM, saturation at high PWM, turning-radius dependence on speed,
-inertia from `(v_prev, ω_prev)`, Δcommand transients from
-`(pwm_*_prev)`, and battery droop).
+state inertia from `(v_prev, ω_prev, pwm_*_prev)`, and battery droop).
 
 Inputs are normalised before entering the network:
 
-* `pwm_l, pwm_r, pwm_l_prev, pwm_r_prev` → divide by `MAX_DUTY` (4095)
-  → roughly [-1, 1]
-* `v_prev` → divide by 1.0 m/s (a reasonable indoor max)
-* `omega_prev` → divide by 2.0 rad/s
+* `pwm_l_prev, pwm_r_prev` → divide by `MAX_DUTY` (4095) → roughly [-1, 1]
+* `v_prev, v_target` → divide by 1.0 m/s (a reasonable indoor max)
+* `omega_prev, omega_target` → divide by 2.0 rad/s
 * `battery_v` → `(V - 7.8) / 0.6` → roughly [-1, 1] across the
   usable battery range
+
+Outputs are denormalised on the way out: `pwm = clamp(tanh-scaled
+output · MAX_DUTY, -MAX_DUTY, MAX_DUTY)`. The output layer is linear
+(not tanh) so saturation is handled by the explicit clamp — that keeps
+gradients flowing during training even at the rails.
 
 Normaliser constants live in the file alongside the weights; never
 hard-coded in load paths.
 
 #### Training
 
-* **Loss.** Weighted MSE:
-  `L = (ω_pred - ω_meas)² + α · 𝟙[v_meas present] · (v_pred - v_meas)²`
-  with `α ≈ 3` because v-labelled windows are sparser than ω-labelled
-  windows and we want the v head to learn at a comparable rate.
+* **Loss.** MSE on PWM output + L2 regularisation:
+  `L = (pwm_l_pred - pwm_l_obs)² + (pwm_r_pred - pwm_r_obs)²
+      + λ · (pwm_l_pred² + pwm_r_pred²)`
+  with `λ ≈ 1e-4` (small but non-zero — this is the deadband
+  ambiguity resolver: among PWMs that all achieve the same observed
+  motion, prefer the smallest, which is the canonical zero-energy
+  command).
+* **v-label weighting.** When `v_label_present = false` (~80 % of
+  windows), `v_target` was filled with the commanded value rather
+  than a real measurement, so the v dimension of the input is noisy.
+  Reduce the loss weight for those samples to 0.3× (the ω signal is
+  still good — gyro is always present — but the v conditioning is
+  weaker, so we don't want the gradient to commit hard to those
+  samples). Implementation: multiply the per-sample loss by 1.0 if
+  `v_label_present` else 0.3.
 * **Optimiser.** Adam-lite (Adam without bias correction; one extra
   vector per parameter). Learning rate `1e-3`, β₁ `0.9`, β₂ `0.99`.
   Roll our own — no ML dep on the Pi.
@@ -135,7 +176,7 @@ hard-coded in load paths.
   overkill and adds aarch64 build pain.
 * **Step cadence.** One SGD step per `LabelledSample` (~5 Hz when
   driving). 5 Hz × 60 s = 300 steps/min — fast convergence for a
-  400-param model.
+  430-param model.
 
 #### Bootstrap
 
@@ -143,8 +184,15 @@ Random Xavier init + a synthetic warm-up so a fresh `motor-model.toml`
 doesn't make the robot drive blind for the first minute:
 
 1. On first boot (no model file), generate 2000 synthetic samples
-   from a hand-coded prior — a linear-with-deadband function that
-   matches the operator note in `CLAUDE.md` (PWM 1500 ≈ 0.6 m/s).
+   from a hand-coded prior — the *forward* relationship
+   `(pwm_avg, pwm_diff) → (v, ω)` is the easy direction to write
+   down (linear-with-deadband, PWM 1500 ≈ 0.6 m/s, per `CLAUDE.md`).
+   Construct each synthetic sample by picking a random PWM,
+   computing the prior's predicted motion, then **inverting the
+   sample for training**: feed `(v, ω)` as `(v_target, ω_target)`
+   inputs and use the original PWM as the regression target. The
+   model is learning the inverse, but we generate the data via the
+   easier forward direction.
 2. Run 2000 SGD steps against the synthetic data. Save.
 3. From there, the live label stream takes over.
 
@@ -193,53 +241,66 @@ bias = [...]
 
 * Persistence round-trip: `save` → `load_or_default` gives bit-identical
   predictions on a fixed input set (and the file is human-inspectable).
-* **MLP can fit a known nonlinear function.** Generate 5000 samples
-  from a synthetic ground-truth: `v = tanh(2·pwm_avg) · 0.6` plus a
-  deadband, `ω = 1.5 · (pwm_r - pwm_l) / MAX_DUTY · (1 + 0.3·v_prev)`
-  (turning rate depends on speed). After 5000 SGD steps assert
-  prediction RMSE < 20 % of target scale on a held-out set.
-* **Recurrence reaches steady state.** Feed back `(v_prev, ω_prev)`
-  from the previous prediction; with constant inputs the loop must
-  converge to a fixed point within 0.5 s of simulated time
-  (10 ticks @ 20 Hz).
+* **MLP can invert a known forward dynamics.** Generate 5000 samples
+  from a synthetic forward model
+  `v = tanh(2·pwm_avg) · 0.6` (with deadband),
+  `ω = 1.5 · (pwm_r − pwm_l) / MAX_DUTY`. Train the inverse — input
+  `(v, ω)` as the targets, regress to the originating PWM. After
+  5000 SGD steps, for a grid of held-out `(v_target, ω_target)`
+  inside the achievable envelope, assert that **the round-trip
+  motion** (run the inverse to get PWM, then run the forward truth
+  to get motion) lands within 15 % of the requested target. This
+  is the right metric — we don't care if the model predicts the
+  *exact* PWM that was used in training (deadband ambiguity), we
+  care that whatever PWM it predicts produces the desired motion.
+* **Deadband ambiguity resolved.** Train on samples that mix two
+  PWMs producing the same zero motion (e.g. `(50, 50)` and
+  `(80, 80)` both → 0). With L2 reg, assert
+  `predict(v_target=0, ω_target=0)` returns `|pwm| ≤ 30` (smaller
+  than either training PWM — regularisation pulled toward zero).
 * **Battery input has measurable effect.** Sweep `battery_v` from
-  7.2 to 8.4 with everything else fixed; the output must vary
-  (otherwise the model's ignoring the input).
-* **Sparse v labels still learn the v head.** Synthetic stream where
-  only 1 in 5 samples has `v_meas`; the v RMSE must still drop over
-  training.
+  7.2 to 8.4 with everything else fixed; the predicted PWM must
+  vary by at least 5 % of MAX_DUTY at a non-zero `v_target`
+  (otherwise the model is ignoring the input).
+* **Sparse v labels still train.** Synthetic stream where only
+  1 in 5 samples has `v_label_present = true`; the round-trip
+  v error on held-out targets still drops over training.
+* **Out-of-envelope clamping.** Ask for `v_target = 5.0` m/s
+  (impossible). The predicted PWM saturates at MAX_DUTY rather
+  than going to NaN / huge values.
 * **Bootstrap is deterministic.** Two fresh `MotorModel::default()`s
   with the same seed produce bit-identical weights.
 
 #### WebUI surface
 
 A new **"Motor model"** sidebar card. The model is the robot's
-self-belief about its own dynamics — the operator needs to see it
-both as health telemetry and as a tangible "what will happen if I
-drive at PWM X" map.
+internal "to get motion X, command Y" translator — the operator
+needs to see it as a tangible motion-command map.
 
 * **Health row:** `trained_steps`, time since last update, current
   battery_v vs. fit-time battery_v (green / amber / red badge for
   staleness), schema version.
-* **Loss row:** running mean ω-residual and v-residual over the
-  last 60 samples (sparkline if cheap, otherwise just the number
-  with a colour against an absolute target).
-* **Prediction heatmap:** a 9×9 grid where each cell `(i, j)`
-  shows the model's predicted `(v, ω)` for `pwm_l = -4095 + i·...`,
-  `pwm_r = -4095 + j·...` (with `v_prev = 0`, `ω_prev = 0`,
-  current `battery_v`). Colour by `v`, text by `ω`. This is the
-  one-look "is the model sane" view — the diagonal should show
-  smooth forward/reverse gradients, the off-diagonals should turn.
-* **Manual probe:** a tiny form (`pwm_l`, `pwm_r` sliders) → live
-  predicted `(v, ω)` text. Doesn't drive the motors; pure inspection.
+* **Loss row:** running mean PWM-residual over the last 60 samples
+  (RMS of `(pwm_obs − pwm_pred)`), with a sparkline. The "is it
+  converging" view.
+* **Inverse heatmap:** a 9×9 grid where each cell `(i, j)` shows the
+  model's predicted `(pwm_l, pwm_r)` for `v_target` in `[-0.6, 0.6]`
+  on one axis and `ω_target` in `[-1.5, 1.5]` on the other (with
+  `v_prev = 0`, `ω_prev = 0`, current `battery_v`, both `pwm_*_prev
+  = 0`). Colour by `pwm_avg` (forward/reverse intensity), text by
+  `pwm_diff` (turning). This is the one-look "is the model sane"
+  view — forward targets should show positive PWMs, left turns
+  should show `pwm_l < pwm_r`, etc.
+* **Manual probe:** sliders for `v_target` and `ω_target` → live
+  predicted `(pwm_l, pwm_r)` text. **Does not drive the motors** —
+  pure inspection.
 
 Endpoints:
 
 * `GET /api/motion/model` — `{ trained_steps, last_battery_v,
-  last_updated, residual_v, residual_omega, weights_summary }` for
-  the health rows.
-* `GET /api/motion/model/predict?pwm_l=…&pwm_r=…&...` — runs one
-  forward pass; backs both the heatmap and the manual probe.
+  last_updated, residual_pwm, weights_summary }` for the health rows.
+* `GET /api/motion/model/predict?v_target=…&omega_target=…&...` —
+  runs one forward pass; backs both the heatmap and the manual probe.
 * `POST /api/motion/model/reset` — re-runs synthetic warm-up;
   WebUI button for emergency recovery if the model goes off the
   rails on bad labels.
@@ -327,15 +388,24 @@ samples in a small JSON blob.
   straight-driving segments) and the loss sparkline trends down
   over the first ~2 minutes, then sits flat.
 
-### Stage 3 — pose integrator
+### Stage 3 — pose integrator + desired-motion drive endpoint
 
 First user-visible signal that the new stack does something useful.
 
-* `src/motion/pose.rs`. A worker at 20 Hz reads the latest commanded
-  PWM, predicts `(v_pred, ω_pred)`, **overrides ω with gyro-integrated
-  ω** (gyro is always more accurate; the model's ω prediction is kept
-  for monitoring only), and integrates `(v_pred, ω_actual)` into 2D
-  pose `(x, y, θ)`.
+* **`POST /api/motion/drive`** — new endpoint accepting
+  `{ v_target: f32, omega_target: f32 }` (m/s, rad/s). The handler
+  runs the motor model's `predict` and emits the resulting PWM via
+  the existing supervisor `Command::Drive` channel. The WebUI joystick
+  switches from `/api/drive` (raw PWM) to this. Raw `/api/drive`
+  stays around as a low-level escape hatch for diagnostics and the
+  curl recipes documented in `CLAUDE.md` — it just bypasses the model.
+* **Pose integrator** in `src/motion/pose.rs`. A worker at 20 Hz
+  reads the latest `(v_target, ω_target)` issued via the new endpoint,
+  **overrides ω with gyro-integrated ω** (gyro is always more
+  accurate), uses ultrasonic Δd/Δt as `v_meas` when valid (and
+  treats it as the "true" v for the integration step on those ticks,
+  falling back to `v_target` between), integrates `(v_used, ω_used)`
+  into 2D pose `(x, y, θ)`.
 * Operator endpoints: `GET /api/motion/pose` (current pose +
   trajectory ring), `POST /api/motion/reset` (zero the integrator).
 
@@ -352,9 +422,10 @@ robot's belief about its own location — the most important world-model
 view we have.
 
 * **Live pose readout:** `x` (m), `y` (m), `θ` (deg).
-  Plus: `|v|` (m/s) and `ω` (deg/s) live, with the model's prediction
-  shown alongside the gyro measurement for ω (visible disagreement
-  flags an unhealthy model).
+  Plus: live `v` (commanded vs. ultrasonic when measured) and `ω`
+  (commanded vs. gyro), with the residual highlighted if it exceeds
+  threshold — that's the diagnostic for "model is not achieving
+  desired motion."
 * **Top-down trajectory plot:** SVG canvas, ~5 m × 5 m bounded
   around the robot's start, robot drawn as a triangle pointing
   along θ, trail of the last ~5 min of poses. Auto-zooms if the

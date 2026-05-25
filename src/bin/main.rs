@@ -4,14 +4,27 @@ use std::thread;
 use log::{info, warn};
 use tokio::sync::mpsc;
 
+use std::path::Path;
+use std::time::Duration;
+
 use ginger_rs::{
     api::{Command, SensorSnapshot},
     camera::Camera,
     imu::{self, Imu},
+    motion::MotorModel,
     robot::supervisor,
     server::{self, AppState},
     slam::{self, MapSnapshot, SlamSnapshot},
 };
+
+/// Path to the persisted motor model (gitignored runtime state, see PLAN.md).
+const MOTOR_MODEL_PATH: &str = "motor-model.toml";
+
+/// Save the motor model to disk this often while the binary runs. The
+/// label stream (Stage 2) will be hitting `observe` at ~5 Hz once it's
+/// wired; this auto-save keeps a reasonably fresh snapshot in case of
+/// an ungraceful shutdown.
+const MOTOR_MODEL_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() {
@@ -60,6 +73,31 @@ async fn main() {
             .expect("spawn slam thread");
     }
 
+    // Motor model: load if non-stale, else bootstrap. The first battery
+    // read may not have happened yet — pass a sensible default; the live
+    // staleness check kicks in on the *next* boot once we've been running
+    // long enough to capture a real reading.
+    let battery_v_now = sensors.read().unwrap().battery_v.max(7.8);
+    let motor_model = Arc::new(RwLock::new(MotorModel::load_or_bootstrap(
+        Path::new(MOTOR_MODEL_PATH),
+        battery_v_now,
+    )));
+    {
+        // Periodic auto-save thread.
+        let model = motor_model.clone();
+        thread::Builder::new()
+            .name("motor-model-saver".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(MOTOR_MODEL_AUTOSAVE_INTERVAL);
+                    if let Err(e) = model.read().unwrap().save(Path::new(MOTOR_MODEL_PATH)) {
+                        warn!("motor-model: autosave failed: {e}");
+                    }
+                }
+            })
+            .expect("spawn motor-model saver");
+    }
+
     server::serve(AppState {
         cmd_tx,
         sensors,
@@ -67,6 +105,7 @@ async fn main() {
         slam,
         map,
         imu,
+        motor_model,
     })
     .await;
 }

@@ -11,3 +11,7 @@ calib-frames/
 
 # Python bytecode cache
 __pycache__/
+
+# Runtime-state file written by `src/motion/model.rs`. Machine-local
+# (battery-voltage-anchored fit) — never committed.
+/motor-model.toml
