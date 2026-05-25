@@ -63,8 +63,16 @@ const GYR_WAKEUP: Duration = Duration::from_millis(81);
 // undersampling), `bwp=2` (normal filter), `acc_odr=9` (200 Hz). At
 // 200 Hz we average ~6–7 samples per camera frame for pre-integration.
 const ACC_CONF_DEFAULT: u8 = (2 << 4) | 0x09;
-// `GYR_CONF` bits: `bwp<<4 | gyr_odr`. Same 200 Hz / normal filter.
-const GYR_CONF_DEFAULT: u8 = (2 << 4) | 0x09;
+// `GYR_CONF` bits: `bwp<<4 | gyr_odr`. ODR stays at 0x09 (200 Hz).
+// `bwp` set to `0x00` (OSR4 — 4× internal oversampling) instead of
+// `0x02` (normal mode). OSR4 averages four internal samples per
+// reported value, dropping the effective bandwidth from ~80 Hz to
+// ~50 Hz. Live observation (PR #65/66 session) showed gyro_z swinging
+// ±200 dps between consecutive samples during high-PWM motor activity
+// — the motors couple noise onto the chip well above the chassis's
+// real angular rate (~10 rad/s = 1.6 Hz max). 50 Hz of bandwidth has
+// 30× headroom over the real signal and rejects most of the noise.
+const GYR_CONF_DEFAULT: u8 = 0x09;
 // `ACC_RANGE = 0x05` → ±4 g (datasheet table 5). Robot acceleration is
 // modest; 4 g leaves headroom for impacts without losing resolution.
 const ACC_RANGE_DEFAULT: u8 = 0x05;
