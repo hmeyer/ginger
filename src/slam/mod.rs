@@ -273,9 +273,13 @@ mod tests {
     /// rotation of ~90° about the same axis as the gyro vector. Using
     /// 90 LSB → 90 · 500/32768 ≈ 1.37 dps, but stay calibration-clean
     /// by picking 5898 LSB → 90 dps exactly.
+    ///
+    /// Note: `RawSample::gyro_dps` negates `gyro_z` (chassis-frame
+    /// convention — see its doc comment). So a *raw* +5898 LSB on Z
+    /// becomes −90 dps in chassis frame; integrating for 1 s yields a
+    /// rotation about **−Z** by π/2.
     #[test]
     fn integrates_90deg_spin_about_z_to_pi_over_two() {
-        // 90 dps × (500/32768) = LSB → 90 / (500/32768) ≈ 5898.24
         let raw = (90.0 / (500.0 / 32768.0)) as i16;
         let dur = Duration::from_millis(1000);
         // Span the samples slightly past the "current" capture so the
@@ -286,13 +290,13 @@ mod tests {
         let t_curr = samples.last().unwrap().t_read + (dur / 200);
         let dr = gyro_pre_integrate(&samples, [0.0; 3], t_curr)
             .expect("integrator returns Some on a populated stream");
-        // Expect rotation about +Z by π/2 rad.
         let aa = dr.axis_angle().expect("non-identity rotation has an axis");
         let (axis, angle) = aa;
-        // Axis should be near [0,0,1] (sign-checked).
+        // Axis should be near [0,0,-1] (sign flipped by chassis-frame
+        // gyro_z negation).
         assert!(
-            (axis.z - 1.0).abs() < 1e-3,
-            "expected +Z axis, got {axis:?}"
+            (axis.z + 1.0).abs() < 1e-3,
+            "expected -Z axis (chassis-frame), got {axis:?}"
         );
         // Angle should be ~π/2 with ~1% tolerance (forward-Euler).
         let expected = std::f64::consts::FRAC_PI_2;
@@ -305,6 +309,9 @@ mod tests {
 
     /// Bias subtraction: the same constant raw stream integrated with
     /// that same constant as bias should yield identity (no rotation).
+    /// Z bias is *negated* in the input because `RawSample::gyro_dps`
+    /// negates `gyro_z` for chassis-frame convention — the bias array
+    /// must match the chassis-frame stream the integrator actually sees.
     #[test]
     fn bias_subtraction_zeros_a_pure_bias_stream() {
         // Derive `bias` from the LSB stream so quantization doesn't
@@ -315,7 +322,7 @@ mod tests {
         let dur = Duration::from_millis(1000);
         let samples = synth_stream(200, dur, [raw_lsb, raw_lsb, raw_lsb]);
         let t_curr = samples.last().unwrap().t_read + (dur / 200);
-        let dr = gyro_pre_integrate(&samples, [actual_dps; 3], t_curr)
+        let dr = gyro_pre_integrate(&samples, [actual_dps, actual_dps, -actual_dps], t_curr)
             .expect("Some on a populated stream");
         let angle = dr.angle();
         assert!(

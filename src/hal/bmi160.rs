@@ -130,13 +130,33 @@ pub struct RawSample {
 }
 
 impl RawSample {
-    /// Convert gyro to degrees per second at the default ±500 dps range.
+    /// Convert gyro to degrees per second at the default ±500 dps range,
+    /// in **chassis frame** (CCW about chassis-vertical = positive).
+    ///
+    /// `gyro_z` is **negated** vs the raw chip reading. Empirically
+    /// established on the live robot (see PR debugging session that
+    /// shipped this comment): driving the left wheels only physically
+    /// rotates the chassis clockwise (per camera), while the raw
+    /// `gyro_z` reads *positive* during that rotation. Either the BMI160
+    /// on this breakout has the Z-axis polarity opposite of the
+    /// datasheet's right-hand-rule convention, or the chip is mounted
+    /// with `+Z_body` axis flipped (the accelerometer still reads
+    /// `[~0, ~0, +g]`, so `+Z_body` is up in chassis frame; only the
+    /// gyro is reversed). Either way, fixing it once here keeps every
+    /// consumer (label worker, pose integrator) in a sane
+    /// `CCW = positive` chassis frame without needing to know about the
+    /// mounting quirk.
+    ///
+    /// `gyro_x` / `gyro_y` are passed through unmodified — they aren't
+    /// used by Stages 1–4 (only yaw matters), so we haven't validated
+    /// their polarity. Revisit if pitch or roll readings ever feed
+    /// motion code.
     #[inline]
     pub fn gyro_dps(&self) -> [f32; 3] {
         [
             self.gyro[0] as f32 * GYRO_DPS_PER_LSB,
             self.gyro[1] as f32 * GYRO_DPS_PER_LSB,
-            self.gyro[2] as f32 * GYRO_DPS_PER_LSB,
+            -(self.gyro[2] as f32) * GYRO_DPS_PER_LSB,
         ]
     }
     /// Convert accel to m/s² at the default ±4 g range.
