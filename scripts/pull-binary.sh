@@ -25,7 +25,10 @@
 set -euo pipefail
 
 REPO="hmeyer/ginger"
-WORKFLOW="rpi-build.yml"
+# PR #57 folded `rpi-build.yml` into `ci.yml` — the binary artifact is
+# now produced by the "Build + clippy ginger (aarch64, libcamera)" job
+# inside the unified workflow. The artifact name is unchanged.
+WORKFLOW="ci.yml"
 ARTIFACT="ginger-aarch64"
 BRANCH="main"
 
