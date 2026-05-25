@@ -29,7 +29,7 @@ use crate::{
     api::{AngleBody, Command, DriveBody, ImuSampleView, SensorConfig, SensorSnapshot},
     camera::Camera,
     imu::Imu,
-    motion::{ModelInput, MotionTarget, MotorModel, PoseState},
+    motion::{ExploreHandle, ModelInput, MotionTarget, MotorModel, PoseState},
     slam::{MapSnapshot, SlamSnapshot},
     video::webrtc,
 };
@@ -68,6 +68,10 @@ pub struct AppState {
     /// the `motion-pose` thread; read by `/api/motion/pose` and the
     /// WebUI Pose card.
     pub pose: Arc<RwLock<PoseState>>,
+    /// Stage 4: exploration controller handle. The worker thread polls
+    /// `handle.on()` and drives autonomously when set; the WebUI flips
+    /// it via `POST /api/motion/explore?on=1|0`.
+    pub explore: Arc<ExploreHandle>,
 }
 
 /// Build the axum router (all routes + shared state). Split out from
@@ -89,6 +93,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/motion/drive", post(motion_drive))
         .route("/api/motion/pose", get(motion_pose))
         .route("/api/motion/reset", post(motion_pose_reset))
+        .route("/api/motion/explore", get(motion_explore_status))
+        .route("/api/motion/explore", post(motion_explore_toggle))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -432,6 +438,29 @@ async fn motion_pose_reset(State(st): State<AppState>) -> StatusCode {
     StatusCode::OK
 }
 
+/// Stage 4: latest exploration state — current phase, last polar scan,
+/// scan counter. Powers the WebUI "Explore" card.
+async fn motion_explore_status(State(st): State<AppState>) -> Response {
+    Json(st.explore.status()).into_response()
+}
+
+/// Stage 4: toggle the autonomous controller. `?on=1` starts it,
+/// `?on=0` stops. Always returns 200; the operator can spam this
+/// without ill effect.
+async fn motion_explore_toggle(
+    State(st): State<AppState>,
+    Query(q): Query<ExploreToggle>,
+) -> StatusCode {
+    st.explore.set_on(q.on != 0);
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct ExploreToggle {
+    #[serde(default)]
+    on: u32,
+}
+
 #[derive(Deserialize)]
 struct MotionDriveBody {
     v_target: f32,
@@ -515,7 +544,7 @@ mod tests {
     use tower::ServiceExt; // `oneshot`
 
     use crate::camera::Camera;
-    use crate::motion::{LabelStats, MotionTarget, MotorModel, PoseState};
+    use crate::motion::{ExploreHandle, LabelStats, MotionTarget, MotorModel, PoseState};
     use crate::slam::{MapSnapshot, SlamSnapshot};
 
     /// Exercise the read + control endpoints end-to-end: real router,
@@ -536,6 +565,7 @@ mod tests {
             label_stats: Arc::new(RwLock::new(LabelStats::default())),
             motion_target: Arc::new(RwLock::new(MotionTarget::default())),
             pose: Arc::new(RwLock::new(PoseState::default())),
+            explore: Arc::new(ExploreHandle::new()),
         };
         // Distinctive values so the assertions check real serialization,
         // not just the `initial()` defaults.

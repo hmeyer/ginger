@@ -11,7 +11,9 @@ use ginger_rs::{
     api::{Command, SensorSnapshot},
     camera::Camera,
     imu::{self, Imu},
-    motion::{LabelStats, MotionTarget, MotorModel, PoseState, labels, pose},
+    motion::{
+        ExploreHandle, LabelStats, MotionTarget, MotorModel, PoseState, explore, labels, pose,
+    },
     robot::supervisor,
     server::{self, AppState},
     slam::{self, MapSnapshot, SlamSnapshot},
@@ -160,6 +162,18 @@ async fn main() {
         warn!("motion-pose: IMU absent — pose integrator not spawned");
     }
 
+    // Stage 4: exploration controller. Always spawned (cheap when off);
+    // the WebUI flips `on` via `/api/motion/explore?on=1`.
+    let explore_handle = Arc::new(ExploreHandle::new());
+    explore::spawn(
+        sensors.clone(),
+        motor_model.clone(),
+        motion_target.clone(),
+        pose_state.clone(),
+        cmd_tx.clone(),
+        &explore_handle,
+    );
+
     server::serve(AppState {
         cmd_tx,
         sensors,
@@ -171,6 +185,7 @@ async fn main() {
         label_stats,
         motion_target,
         pose: pose_state,
+        explore: explore_handle,
     })
     .await;
 }
