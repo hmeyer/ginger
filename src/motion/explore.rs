@@ -71,6 +71,17 @@ const HEADING_WINDOW_HALF_DEG: f32 = 20.0;
 /// Minimum max-min distance we'll consider "drivable". Below this the
 /// chassis is hemmed in; emit `BoxedIn`.
 const BOXED_IN_CM: f32 = 50.0;
+/// Anti-recency: the controller remembers the last `RECENCY_HISTORY`
+/// chosen pan angles and penalises picks that lie within
+/// `RECENCY_BLAST_HALF_DEG` of any of them. Without this, when the
+/// chassis sits in an open room one pan direction is always the
+/// "clearest" and the greedy picker loops on it (observed live).
+/// Penalty is linear in pan-distance from the recent pick, capped at
+/// `RECENCY_PENALTY_CM` per past pick — a few repeats build up enough
+/// cost to force a different heading on the next scan.
+const RECENCY_HISTORY: usize = 3;
+const RECENCY_BLAST_HALF_DEG: f32 = 25.0;
+const RECENCY_PENALTY_CM: f32 = 80.0;
 
 // ── Driving parameters ───────────────────────────────────────────────────────
 
@@ -182,6 +193,11 @@ struct ExploreWorker {
     cmd_tx: mpsc::Sender<Command>,
     on: Arc<AtomicBool>,
     status: Arc<RwLock<ExploreStatus>>,
+    /// Pan angles of the last `RECENCY_HISTORY` chosen headings, in
+    /// insertion order. Fed to `pick_best_heading` so the controller
+    /// avoids picking the same direction over and over. Cleared on
+    /// off-edge (turning the controller off then back on starts fresh).
+    recent_pans: std::collections::VecDeque<f32>,
 }
 
 impl ExploreWorker {
@@ -203,6 +219,7 @@ impl ExploreWorker {
                 // off-edge to clear any leftover non-zero command.
                 if was_on {
                     self.hard_stop();
+                    self.recent_pans.clear();
                 }
                 was_on = false;
                 self.set_phase(ExplorePhase::Idle);
@@ -252,7 +269,9 @@ impl ExploreWorker {
 
     /// Sweep the pan servo from `PAN_FIRST_DEG` to `PAN_LAST_DEG` in
     /// `PAN_STEP_DEG` increments, sampling ultrasonic at each angle.
-    /// Restores pan to `PAN_CENTER_DEG` on the way out.
+    /// Restores pan to `PAN_CENTER_DEG` on the way out. Records the
+    /// chosen pan into `recent_pans` so the next scan's heading pick
+    /// is biased away from repeats.
     fn do_scan(&mut self) -> PolarScan {
         let mut rays: Vec<ScanRay> = Vec::new();
         let mut a = PAN_FIRST_DEG;
@@ -270,7 +289,18 @@ impl ExploreWorker {
         // scan starts from a known centre.
         let _ = self.cmd_tx.blocking_send(Command::SetPan(PAN_CENTER_DEG));
 
-        let (chosen_idx, chosen_clearance_cm) = pick_best_heading(&rays);
+        // Pass the recency history so repeated picks get penalised.
+        let recent: Vec<f32> = self.recent_pans.iter().copied().collect();
+        let (chosen_idx, chosen_clearance_cm) = pick_best_heading(&rays, &recent);
+        // Record this pick (only when it's a "real" choice — boxed-in
+        // is handled in run(); we don't want to poison the history with
+        // a no-clearance pick).
+        if chosen_clearance_cm >= BOXED_IN_CM {
+            self.recent_pans.push_back(rays[chosen_idx].pan_deg);
+            while self.recent_pans.len() > RECENCY_HISTORY {
+                self.recent_pans.pop_front();
+            }
+        }
         PolarScan {
             rays,
             chosen_idx,
@@ -431,11 +461,17 @@ fn wrap_pi(a: f32) -> f32 {
 /// `±HEADING_WINDOW_HALF_DEG` window centred on `rays[i].pan_deg`.
 /// Treat `None` readings as infinitely far (the worst-case missing
 /// data is a false-positive "free" — the supervisor's collision stop
-/// catches surprises). Pick the bin with the largest such min;
-/// tiebreak toward `PAN_CENTER_DEG`.
-fn pick_best_heading(rays: &[ScanRay]) -> (usize, f32) {
+/// catches surprises). Pick the bin with the largest such min minus
+/// the anti-recency penalty derived from `recent_pans`; tiebreak
+/// toward `PAN_CENTER_DEG`.
+///
+/// Returns `(chosen_idx, raw_clearance_cm)`. The clearance returned is
+/// the *un-penalised* min — used by the boxed-in check. The penalty
+/// only influences *which* bin wins, never the clearance number.
+fn pick_best_heading(rays: &[ScanRay], recent_pans: &[f32]) -> (usize, f32) {
     let mut best_idx = 0usize;
-    let mut best_min: f32 = -1.0;
+    let mut best_score: f32 = f32::NEG_INFINITY;
+    let mut best_clearance: f32 = 0.0;
     let mut best_centerness: f32 = f32::INFINITY;
     for (i, r) in rays.iter().enumerate() {
         let mut min_dist = f32::INFINITY;
@@ -447,15 +483,26 @@ fn pick_best_heading(rays: &[ScanRay]) -> (usize, f32) {
                 }
             }
         }
+        // Anti-recency: linear-falloff penalty for each past pick
+        // within `RECENCY_BLAST_HALF_DEG` of this bin. Full penalty at
+        // same pan, zero at the edge of the blast radius.
+        let mut penalty: f32 = 0.0;
+        for &past_pan in recent_pans {
+            let dp = (r.pan_deg - past_pan).abs();
+            if dp <= RECENCY_BLAST_HALF_DEG {
+                penalty += RECENCY_PENALTY_CM * (1.0 - dp / RECENCY_BLAST_HALF_DEG);
+            }
+        }
+        let score = min_dist - penalty;
         let centerness = (r.pan_deg - PAN_CENTER_DEG).abs();
-        if min_dist > best_min || (min_dist == best_min && centerness < best_centerness) {
+        if score > best_score || (score == best_score && centerness < best_centerness) {
             best_idx = i;
-            best_min = min_dist;
+            best_score = score;
+            best_clearance = if min_dist.is_finite() { min_dist } else { 0.0 };
             best_centerness = centerness;
         }
     }
-    let chosen_clearance = if best_min.is_finite() { best_min } else { 0.0 };
-    (best_idx, chosen_clearance)
+    (best_idx, best_clearance)
 }
 
 // ── Spawning ────────────────────────────────────────────────────────────────
@@ -478,6 +525,7 @@ pub fn spawn(
                 sensors,
                 motor_model,
                 motion_target,
+                recent_pans: std::collections::VecDeque::with_capacity(RECENCY_HISTORY + 1),
                 pose,
                 cmd_tx,
                 on,
@@ -517,7 +565,7 @@ mod tests {
             };
             rays.push(ray(p, d));
         }
-        let (idx, clearance) = pick_best_heading(&rays);
+        let (idx, clearance) = pick_best_heading(&rays, &[]);
         assert!(
             (rays[idx].pan_deg - 90.0).abs() < 20.0,
             "expected near-centre, got pan={}",
@@ -537,11 +585,38 @@ mod tests {
         for p in (15..=165).step_by(10).map(|i| i as f32) {
             rays.push(ray(p, 150.0));
         }
-        let (idx, _) = pick_best_heading(&rays);
+        let (idx, _) = pick_best_heading(&rays, &[]);
         let picked = rays[idx].pan_deg;
         assert!(
             (picked - 85.0).abs() < 0.1 || (picked - 95.0).abs() < 0.1,
             "expected ~85° or ~95° (nearest to centre), got {picked}"
+        );
+    }
+
+    #[test]
+    fn pick_best_heading_recency_forces_different_choice() {
+        // All bins equal clearance — without history, picker stays near
+        // the centre (85° / 95°). With centre angles in the recency
+        // history, picker must pick somewhere outside the ±25° blast.
+        let mut rays = vec![];
+        for p in (15..=165).step_by(10).map(|i| i as f32) {
+            rays.push(ray(p, 150.0));
+        }
+        // No history: defaults to near centre.
+        let (idx_no_history, _) = pick_best_heading(&rays, &[]);
+        let picked = rays[idx_no_history].pan_deg;
+        assert!(
+            (picked - 85.0).abs() < 0.1 || (picked - 95.0).abs() < 0.1,
+            "baseline: expected ~85°/95°, got {picked}"
+        );
+        // Penalise the centre area heavily by listing it 3× in history
+        // (full history saturated on centre). Picker must now choose a
+        // bin outside the ±25° blast around 90°.
+        let (idx_with_history, _) = pick_best_heading(&rays, &[85.0, 95.0, 90.0]);
+        let picked2 = rays[idx_with_history].pan_deg;
+        assert!(
+            (picked2 - 90.0).abs() > 25.0,
+            "expected pick outside ±25° blast around 90°, got {picked2}"
         );
     }
 
@@ -553,7 +628,7 @@ mod tests {
         for p in (15..=165).step_by(10).map(|i| i as f32) {
             rays.push(ray(p, 30.0));
         }
-        let (_, clearance) = pick_best_heading(&rays);
+        let (_, clearance) = pick_best_heading(&rays, &[]);
         assert!(clearance < BOXED_IN_CM);
     }
 
