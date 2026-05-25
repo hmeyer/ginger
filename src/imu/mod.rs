@@ -569,10 +569,15 @@ mod tests {
         let imu = Imu::spawn(chip);
         wait_for_bias_settled(&imu);
         let bias = imu.gyro_bias_dps();
+        // `RawSample::gyro_dps` returns chassis-frame values with `gyro_z`
+        // negated (this board's BMI160 has Z polarity opposite of the
+        // right-hand-rule convention everything downstream assumes — see
+        // the comment on `gyro_dps`). The bias collector averages those
+        // chassis-frame values, so the Z expectation negates too.
         let expected = [
             50.0 * (500.0 / 32768.0),
             -30.0 * (500.0 / 32768.0),
-            20.0 * (500.0 / 32768.0),
+            -20.0 * (500.0 / 32768.0),
         ];
         // Tolerate ~5% — the estimator averages over a finite window
         // and the constant gyro reading is exact, but timing jitter in
