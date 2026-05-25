@@ -70,6 +70,14 @@ const STATIC_PWM_AVG_THRESHOLD: i32 = 200;
 /// "essentially stationary", so a small wrong-sign jitter doesn't
 /// reject an otherwise-good window.
 const US_NOISE_FLOOR_CM: f32 = 1.0;
+/// Reject v_meas if the pan servo is not within this many degrees of
+/// 90° (chassis-forward). Without this, Stage-4 explore's swept-scan
+/// would feed the model bogus v labels: pan sweeps 15°→165° while the
+/// chassis is stationary, every label window sees a different
+/// ultrasonic ray, and the implied Δd/Δt becomes a fictitious
+/// "forward velocity" the model learns from.
+const PAN_CENTERED_TOLERANCE_DEG: f32 = 5.0;
+const PAN_FORWARD_DEG: f32 = 90.0;
 
 // ── Telemetry ─────────────────────────────────────────────────────────────────
 
@@ -200,6 +208,7 @@ impl LabelWorker {
             self.initial_us_cm,
             us_end,
             dt_s,
+            snap.pan,
         );
         let v_label_present = v_meas.is_some();
 
@@ -259,9 +268,19 @@ impl LabelWorker {
         us_start: Option<f32>,
         us_end: Option<f32>,
         dt_s: f32,
+        pan_deg: f32,
     ) -> Option<f32> {
         // Straight?
         if (pwm_l - pwm_r).abs() >= STRAIGHT_PWM_DIFF_THRESHOLD {
+            self.stats.write().unwrap().rejections.v_not_straight += 1;
+            return None;
+        }
+        // Pan not centred → ultrasonic isn't reading chassis-forward,
+        // so Δd/Δt isn't forward velocity. Bucket the rejection under
+        // `v_not_straight` (closest existing reason) to keep the JSON
+        // schema stable — operator distinguishes by context (pan
+        // sweeps happen during Stage-4 scans only).
+        if (pan_deg - PAN_FORWARD_DEG).abs() > PAN_CENTERED_TOLERANCE_DEG {
             self.stats.write().unwrap().rejections.v_not_straight += 1;
             return None;
         }
@@ -335,8 +354,24 @@ mod tests {
     // or sensor snapshot.
 
     fn v_label_test(pwm_l: i32, pwm_r: i32, us_start: f32, us_end: f32, dt_s: f32) -> VResult {
+        // Helpers default pan to centred (90°). The pan-off case has
+        // its own test below.
+        v_label_test_pan(pwm_l, pwm_r, us_start, us_end, dt_s, 90.0)
+    }
+
+    fn v_label_test_pan(
+        pwm_l: i32,
+        pwm_r: i32,
+        us_start: f32,
+        us_end: f32,
+        dt_s: f32,
+        pan_deg: f32,
+    ) -> VResult {
         if (pwm_l - pwm_r).abs() >= STRAIGHT_PWM_DIFF_THRESHOLD {
             return VResult::NotStraight;
+        }
+        if (pan_deg - PAN_FORWARD_DEG).abs() > PAN_CENTERED_TOLERANCE_DEG {
+            return VResult::NotStraight; // bucketed under not-straight
         }
         if !(US_MIN_CM..=US_MAX_CM).contains(&us_start)
             || !(US_MIN_CM..=US_MAX_CM).contains(&us_end)
@@ -431,6 +466,26 @@ mod tests {
         match v_label_test(1500, 1500, 30.0, 30.5, 0.2) {
             VResult::Ok(_) => {}
             other => panic!("expected Ok with sub-noise jitter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v_label_rejects_when_pan_off_centre() {
+        // Even an otherwise-valid window must reject when the pan
+        // servo isn't centred. Catches Stage 4's swept-scan poisoning
+        // of the v-label stream.
+        assert_eq!(
+            v_label_test_pan(1500, 1500, 30.0, 20.0, 0.2, 60.0),
+            VResult::NotStraight
+        );
+        assert_eq!(
+            v_label_test_pan(1500, 1500, 30.0, 20.0, 0.2, 120.0),
+            VResult::NotStraight
+        );
+        // Within ±5° tolerance still passes.
+        match v_label_test_pan(1500, 1500, 30.0, 20.0, 0.2, 87.0) {
+            VResult::Ok(_) => {}
+            other => panic!("expected Ok at pan=87°, got {other:?}"),
         }
     }
 
