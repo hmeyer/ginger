@@ -5,108 +5,40 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
+  headless:
+    name: Headless (mock camera, native aarch64)
+    # Native aarch64 runner so the crates/fast NEON paths actually
+    # execute in tests. On x86 only the scalar reference ran and the
+    # `parity` tests compared the scalar to itself.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-
-      # Ubuntu 24.04 ships libcamera 0.2.0; the Rust crate requires >= 0.4.0.
-      # Build 0.4.0 from source and cache the install tree.
-      - name: Cache libcamera
-        id: libcamera-cache
-        uses: actions/cache@v4
-        with:
-          path: /opt/libcamera
-          key: libcamera-0.4.0-${{ runner.os }}
-
-      - name: Install libcamera build deps
-        if: steps.libcamera-cache.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            meson ninja-build \
-            python3-yaml python3-ply python3-jinja2 \
-            libudev-dev
-
-      - name: Build libcamera 0.4.0 from source
-        if: steps.libcamera-cache.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch v0.4.0 \
-            https://git.libcamera.org/libcamera/libcamera.git lc-src
-          meson setup lc-src/build lc-src \
-            --prefix=/opt/libcamera \
-            -Dgstreamer=disabled \
-            -Dlc-compliance=disabled \
-            -Dcam=disabled \
-            -Dqcam=disabled \
-            -Ddocumentation=disabled \
-            -Dtest=false
-          ninja -C lc-src/build
-          ninja -C lc-src/build install
-
-      - name: Set libcamera env paths
-        run: |
-          # meson installs .pc files under lib/ or lib/<arch>/pkgconfig/
-          echo "PKG_CONFIG_PATH=/opt/libcamera/lib/pkgconfig:/opt/libcamera/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=/opt/libcamera/lib:/opt/libcamera/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
-
-      # bindgen (via libcamera-sys) only needs libclang at build time,
-      # and clang-sys honours LIBCLANG_PATH. The runner already ships
-      # LLVM 16/17/18, so point bindgen at the preinstalled toolchain
-      # instead of apt-installing the whole libclang-dev tree (~7 min).
-      # Fall back to apt only if libclang is somehow absent, so this can
-      # never be slower than the previous unconditional install.
-      - name: Provide libclang for bindgen
-        run: |
-          set -eu
-          found=""
-          for d in \
-            "$(llvm-config-18 --libdir 2>/dev/null || true)" \
-            "$(llvm-config --libdir 2>/dev/null || true)" \
-            /usr/lib/llvm-18/lib /usr/lib/llvm-17/lib /usr/lib/llvm-16/lib \
-            /usr/lib/x86_64-linux-gnu; do
-            if [ -n "$d" ] && ls "$d"/libclang*.so* >/dev/null 2>&1; then
-              found="$d"; break
-            fi
-          done
-          if [ -n "$found" ]; then
-            echo "Using preinstalled libclang at $found"
-            echo "LIBCLANG_PATH=$found" >> "$GITHUB_ENV"
-          else
-            echo "Preinstalled libclang not found; installing libclang-dev"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends libclang-dev
-          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      - run: make lint
-
-  headless:
-    name: Headless (mock camera)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          key: headless-arm
 
-      - uses: Swatinem/rust-cache@v2
+      - name: fmt --check
+        run: cargo fmt --check
 
       # `--no-default-features` drops libcamera and swaps in the mock
       # camera, so the whole crate (server, SLAM frontend, replay
-      # harness) builds and tests headless — no from-source libcamera.
+      # harness) builds and tests headless on a bare runner — no
+      # libcamera install needed here.
       - name: Test + clippy (no libcamera)
         run: |
           cargo test --workspace --no-default-features
@@ -127,24 +59,91 @@ jobs:
           PY
           cargo run --no-default-features --example slam_replay -- /tmp/rt
 
-  aarch64-check:
-    name: aarch64 cross-check
-    runs-on: ubuntu-latest
+  build:
+    name: Build + clippy ginger (aarch64, libcamera)
+    # Native aarch64 + Debian Trixie container so we link against the
+    # exact Raspberry Pi libcamera the deployed binary will load. This
+    # is also the only job in CI with libcamera headers, so the
+    # default-features clippy runs here too (replacing the old `lint`
+    # job's from-source libcamera 0.4 build).
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie-slim
+    env:
+      # libcamera version installed on the target Raspberry Pi (Raspberry
+      # Pi OS Trixie). The deployed binary dynamically links libcamera,
+      # whose ABI / soname is version-specific, so the build must link
+      # the *same* build the Pi runs. Keep this equal to `dpkg -l
+      # libcamera0.7` on the Pi; bump it (and `sudo apt full-upgrade`
+      # the Pi) whenever the rpi apt pool rotates — it drops dated
+      # builds quickly, so the Pi and this pin must move together or
+      # the install step below 404s.
+      LIBCAMERA_VERSION: 0.7.1+rpt20260429-1
     steps:
+      - name: Install build dependencies
+        run: |
+          set -eux
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git file \
+            build-essential pkg-config cmake \
+            clang libclang-dev \
+            libv4l-dev libudev-dev
+          # Raspberry Pi apt archive — source of the exact libcamera build
+          # the Pi runs, so the linked ABI matches. Marked `trusted=yes`
+          # because Debian Trixie's apt (Sequoia/sqv) rejects the rpi
+          # archive's SHA1-self-signed GPG key under its 2026-02-01
+          # hardening (rpi has not yet republished a SHA256 key). The
+          # container is ephemeral, the URL is HTTPS, and the final
+          # binary is verified end-to-end via SHA-256 by the Pi-side pull
+          # script, so skipping apt-level signature verification on this
+          # one archive is an acceptable trade.
+          echo "deb [trusted=yes] https://archive.raspberrypi.com/debian trixie main" \
+            > /etc/apt/sources.list.d/raspberrypi.list
+          apt-get update -qq
+          # libcamera-dev depends on the exact-versioned runtime package,
+          # so pinning the -dev package pulls a matching libcamera0.7.
+          apt-get install -y --no-install-recommends \
+            "libcamera-dev=${LIBCAMERA_VERSION}"
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-gnu
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-arm
 
-      # Compile-only check of the NEON / geometry paths. `ginger-fast`
-      # and `ginger-slam-core` are dependency-light (no libcamera/v4l,
-      # no linker — cargo check does not link). Correctness is verified
-      # by the differential / unit tests run natively + in `headless`.
-      - run: cargo check -p ginger-fast --target aarch64-unknown-linux-gnu
-      - run: cargo check -p ginger-slam-core --target aarch64-unknown-linux-gnu
+      # Default-features clippy — only place in CI with libcamera headers.
+      # `--release` matches the build profile below so target/ is reused.
+      - name: Clippy (libcamera default features)
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
+
+      # Native aarch64 release build. `.cargo/config.toml` applies the
+      # cortex-a72 tuning because the host triple is the build target.
+      - name: Build release binary
+        run: cargo build --release --bin ginger
+
+      - name: Package binary + checksum
+        run: |
+          set -eux
+          mkdir -p dist
+          cp target/release/ginger dist/ginger
+          ( cd dist && sha256sum ginger > ginger.sha256 )
+          file dist/ginger
+
+      # Only publish artifacts from main; the Pi-side pull script
+      # (scripts/pull-binary.sh) reads from main. Skipping uploads on
+      # PRs avoids retaining a binary per push.
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ginger-aarch64
+          path: dist/
+          retention-days: 90
+          if-no-files-found: error
 
   audit:
     name: Audit
