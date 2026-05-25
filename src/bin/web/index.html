@@ -268,6 +268,23 @@ footer{
         <span class="lbl" style="min-width:48px">v-rej</span><span class="val" id="v-mm-rej-vonly">—</span>
       </div>
     </div>
+    <div class="card" id="pose-card" title="Chassis pose integrator (Stage 3). x/y in m, θ in deg, drift = √(x²+y²).">
+      <div class="card-title">Pose
+        <button id="pose-reset-btn" title="Reset pose to (0,0,0)" style="margin-left:auto;font-size:.65rem;background:var(--bg4);color:var(--fg);border:0;border-radius:4px;padding:2px 6px;cursor:pointer">reset</button>
+      </div>
+      <div class="row"><span class="lbl" style="min-width:32px">x,y</span><span class="val" id="v-pose-xy">—</span><span style="color:var(--dim2);font-size:.75rem">m</span></div>
+      <div class="row"><span class="lbl" style="min-width:32px">θ</span><span class="val" id="v-pose-theta">—</span><span style="color:var(--dim2);font-size:.75rem">°</span></div>
+      <div class="row" title="Euclidean distance from origin — useful gate for the 1×1 m square test">
+        <span class="lbl" style="min-width:32px">drift</span><span class="val" id="v-pose-drift">—</span><span style="color:var(--dim2);font-size:.75rem">m</span>
+      </div>
+      <div class="row" title="Commanded v_target vs ultrasonic-measured v (when in 8–80 cm range)">
+        <span class="lbl" style="min-width:32px">v</span><span class="val" id="v-pose-v">—</span><span style="color:var(--dim2);font-size:.75rem">m/s</span>
+      </div>
+      <div class="row" title="Commanded ω_target vs gyro-measured ω">
+        <span class="lbl" style="min-width:32px">ω</span><span class="val" id="v-pose-omega">—</span><span style="color:var(--dim2);font-size:.75rem">°/s</span>
+      </div>
+      <canvas id="pose-trail" width="180" height="180" style="display:block;margin:6px auto;border-radius:4px;background:#222"></canvas>
+    </div>
   </aside>
 </div>
 
@@ -461,28 +478,42 @@ function makeJoystick(el, { onMove, onEnd }) {
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
 // ── Drive joystick — momentary, spring-back, keyboard only when focused ───────
+//
+// Stage 3: joystick speaks in *motion* units (v_target m/s + ω_target
+// rad/s) and posts to `/api/motion/drive`. The motor model translates
+// to PWM server-side. Raw `/api/drive` (PWM units) stays alive for
+// diagnostics and CLAUDE.md curl recipes.
 const driveEl   = document.getElementById('drive-joy');
 const driveHint = document.getElementById('drive-hint');
-let driveCmd = null;                       // last {left,right} dispatched
+let driveCmd = null;                       // last {v_target, omega_target} dispatched
+
+// Caps for the motion-units mapping. V_MAX matches CLAUDE.md's
+// operator note (PWM ~1500 ≈ 0.6 m/s) clipped slightly for safety.
+// W_MAX is the gentle-spin envelope from session 2 (differential 1200
+// PWM ≈ 1.2 rad/s; 1.5 gives a little headroom).
+const V_MAX = 0.6;   // m/s
+const W_MAX = 1.5;   // rad/s
 
 function driveMix(nx, ny) {
-  // Arcade mixing. Up = forward (ny < 0); x = turn. Full-rim deflection
-  // still reaches DUTY (full-left → {+DUTY,-DUTY}, full-fwd → {+DUTY,+DUTY}),
-  // but `expo` makes the approach to it gradual instead of near-binary.
-  if (Math.hypot(nx, ny) < 0.10) return { left: 0, right: 0 };   // center deadzone
-  let throttle = curve(-ny, DRIVE_EXPO);
-  let turn     = curve(nx, TURN_EXPO) * TURN_GAIN;
-  let l = throttle - turn, r = throttle + turn;
-  const m = Math.max(1, Math.abs(l), Math.abs(r));
-  return { left: Math.round(l / m * DUTY), right: Math.round(r / m * DUTY) };
+  // Center deadzone unchanged — same UX as the old PWM mapping.
+  if (Math.hypot(nx, ny) < 0.10) return { v_target: 0, omega_target: 0 };
+  // Throttle → v_target. Up on the joystick = forward (ny < 0).
+  const v_target = curve(-ny, DRIVE_EXPO) * V_MAX;
+  // x → omega_target. Right on joystick = clockwise; gyro/integrator
+  // convention is CCW positive, so we negate (right turn = ω < 0).
+  // The supervisor doesn't care about sign; the pose plot does.
+  const omega_target = -curve(nx, TURN_EXPO) * TURN_GAIN * W_MAX;
+  return { v_target, omega_target };
 }
 function driveSend(nx, ny) {
   const cmd = driveMix(nx, ny);
-  const changed = !driveCmd || cmd.left !== driveCmd.left || cmd.right !== driveCmd.right;
+  const changed = !driveCmd
+    || Math.abs(cmd.v_target - driveCmd.v_target) > 1e-3
+    || Math.abs(cmd.omega_target - driveCmd.omega_target) > 1e-3;
   driveCmd = cmd;
-  if (changed) post('/api/drive', cmd);
+  if (changed) post('/api/motion/drive', cmd);
   if (!driveTimer) driveTimer = setInterval(() => {
-    if (driveCmd) post('/api/drive', driveCmd);   // dead-man heartbeat
+    if (driveCmd) post('/api/motion/drive', driveCmd);   // dead-man heartbeat
   }, 150);
 }
 function driveStop() {
@@ -865,6 +896,97 @@ sse.onmessage = e => {
   refreshHealth();
   refreshProbe();
   setInterval(refreshHealth, 1000);
+}
+
+// ── Pose card (Stage 3) ───────────────────────────────────────────────────────
+//
+// Polls /api/motion/pose at 2 Hz. The card shows the integrator state
+// (x, y, θ, drift) + live v / ω with commanded vs measured side by side,
+// and a top-down SVG-on-canvas trail centered on the robot.
+{
+  const trailCanvas = document.getElementById('pose-trail');
+  const ctx = trailCanvas.getContext('2d');
+  // Auto-zoom: track the half-extent of the trail and add a margin.
+  // Starts at 0.5 m half-extent (1×1 m visible), grows as needed.
+  let halfExtent = 0.5;
+
+  function renderTrail(p) {
+    const W = trailCanvas.width, H = trailCanvas.height;
+    // Grow halfExtent to keep the robot + trail visible.
+    const need = Math.max(Math.abs(p.x), Math.abs(p.y),
+                         ...p.trail.map(t => Math.max(Math.abs(t.x), Math.abs(t.y))));
+    if (need * 1.15 > halfExtent) halfExtent = Math.max(halfExtent, need * 1.15);
+    const scale = (W / 2 - 6) / halfExtent;  // px per metre
+    // Screen origin = canvas center; +X right, +Y up (so we negate y).
+    const sx = m => W / 2 + m * scale;
+    const sy = m => H / 2 - m * scale;
+
+    ctx.clearRect(0, 0, W, H);
+    // Axes
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.beginPath();
+    ctx.moveTo(0, H/2); ctx.lineTo(W, H/2);
+    ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H);
+    ctx.stroke();
+    // Trail polyline
+    if (p.trail.length > 1) {
+      ctx.strokeStyle = 'var(--accent, #4af)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(sx(p.trail[0].x), sy(p.trail[0].y));
+      for (let i = 1; i < p.trail.length; i++) {
+        ctx.lineTo(sx(p.trail[i].x), sy(p.trail[i].y));
+      }
+      ctx.stroke();
+    }
+    // Robot triangle at (x, y) pointing along θ
+    const rx = sx(p.x), ry = sy(p.y);
+    const r = 7;
+    const c = Math.cos(p.theta), s = Math.sin(p.theta);
+    ctx.fillStyle = '#fc6';
+    ctx.beginPath();
+    ctx.moveTo(rx + c * r, ry - s * r);
+    ctx.lineTo(rx + (-c * 0.5 + s * 0.6) * r, ry - (-s * 0.5 - c * 0.6) * r);
+    ctx.lineTo(rx + (-c * 0.5 - s * 0.6) * r, ry - (-s * 0.5 + c * 0.6) * r);
+    ctx.closePath();
+    ctx.fill();
+    // Extent label
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.font = '10px monospace';
+    ctx.fillText(`±${halfExtent.toFixed(1)} m`, 4, H - 4);
+  }
+
+  async function refreshPose() {
+    try {
+      const p = await (await fetch('/api/motion/pose')).json();
+      document.getElementById('v-pose-xy').textContent =
+        `${p.x.toFixed(2)}, ${p.y.toFixed(2)}`;
+      document.getElementById('v-pose-theta').textContent =
+        (p.theta * 180 / Math.PI).toFixed(1);
+      document.getElementById('v-pose-drift').textContent = p.drift_m.toFixed(2);
+      // v: commanded vs measured (only when ultrasonic is in range)
+      const vMeas = p.v_us == null ? '—' : p.v_us.toFixed(2);
+      document.getElementById('v-pose-v').textContent =
+        `cmd ${p.v_cmd.toFixed(2)} · us ${vMeas}`;
+      // ω: commanded vs gyro
+      const wCmd = (p.omega_cmd * 180 / Math.PI).toFixed(0);
+      const wGyro = (p.omega_gyro * 180 / Math.PI).toFixed(0);
+      document.getElementById('v-pose-omega').textContent =
+        `cmd ${wCmd} · gyro ${wGyro}`;
+      renderTrail(p);
+    } catch (_) {}
+  }
+
+  document.getElementById('pose-reset-btn').addEventListener('click', async () => {
+    try {
+      await fetch('/api/motion/reset', { method: 'POST' });
+      halfExtent = 0.5;
+      await refreshPose();
+    } catch (_) {}
+  });
+
+  refreshPose();
+  setInterval(refreshPose, 500);
 }
 
 // ── Camera H.264 stream via WebRTC ────────────────────────────────────────────

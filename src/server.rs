@@ -29,7 +29,7 @@ use crate::{
     api::{AngleBody, Command, DriveBody, ImuSampleView, SensorConfig, SensorSnapshot},
     camera::Camera,
     imu::Imu,
-    motion::{ModelInput, MotorModel},
+    motion::{ModelInput, MotionTarget, MotorModel, PoseState},
     slam::{MapSnapshot, SlamSnapshot},
     video::webrtc,
 };
@@ -60,6 +60,14 @@ pub struct AppState {
     /// worker. Always present even when the IMU isn't (in which case
     /// the counters never advance — the operator sees the silence).
     pub label_stats: Arc<RwLock<crate::motion::LabelStats>>,
+    /// Stage 3: latest desired motion + the PWM the model predicted
+    /// from it. Written by `/api/motion/drive`, read by the pose
+    /// integrator and the WebUI residual display.
+    pub motion_target: Arc<RwLock<MotionTarget>>,
+    /// Stage 3: chassis pose `(x, y, θ)` + trail. Updated at 20 Hz by
+    /// the `motion-pose` thread; read by `/api/motion/pose` and the
+    /// WebUI Pose card.
+    pub pose: Arc<RwLock<PoseState>>,
 }
 
 /// Build the axum router (all routes + shared state). Split out from
@@ -78,6 +86,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/motion/model/predict", get(motion_model_predict))
         .route("/api/motion/model/reset", post(motion_model_reset))
         .route("/api/motion/labels", get(motion_labels))
+        .route("/api/motion/drive", post(motion_drive))
+        .route("/api/motion/pose", get(motion_pose))
+        .route("/api/motion/reset", post(motion_pose_reset))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -365,6 +376,68 @@ async fn motion_labels(State(st): State<AppState>) -> Response {
     Json(stats).into_response()
 }
 
+/// Stage 3: drive in motion units. POST body `{ v_target, omega_target }`
+/// (m/s and rad/s). The handler runs `MotorModel::predict` to translate
+/// into PWM and forwards it via the supervisor's existing `SetMotors`
+/// channel. The latest target + the PWM the model produced are stored
+/// in `AppState.motion_target` so the pose integrator and WebUI can
+/// read them.
+///
+/// This is the path the WebUI joystick uses. `POST /api/drive` (raw
+/// PWM) stays alive for diagnostics and the curl recipes in
+/// `CLAUDE.md` — it just bypasses the model.
+async fn motion_drive(State(st): State<AppState>, Json(b): Json<MotionDriveBody>) -> StatusCode {
+    let (pwm_l_prev, pwm_r_prev, v_prev, omega_prev) = {
+        let p = st.pose.read().unwrap();
+        let t = st.motion_target.read().unwrap();
+        (t.pwm_l, t.pwm_r, p.v_us.unwrap_or(p.v_cmd), p.omega_gyro)
+    };
+    let battery_v = st.sensors.read().unwrap().battery_v;
+    let input = ModelInput {
+        pwm_l_prev,
+        pwm_r_prev,
+        v_prev,
+        omega_prev,
+        battery_v,
+        v_target: b.v_target,
+        omega_target: b.omega_target,
+    };
+    let pwm = st.motor_model.read().unwrap().predict(input);
+    *st.motion_target.write().unwrap() = MotionTarget {
+        v_target: b.v_target,
+        omega_target: b.omega_target,
+        pwm_l: pwm.pwm_l,
+        pwm_r: pwm.pwm_r,
+    };
+    st.cmd_tx
+        .send(Command::SetMotors {
+            left: pwm.pwm_l,
+            right: pwm.pwm_r,
+        })
+        .await
+        .ok();
+    StatusCode::OK
+}
+
+/// Stage 3: chassis pose + recent trail. The trail is the deque kept
+/// inside [`PoseState`]; the JSON serialises it as an array.
+async fn motion_pose(State(st): State<AppState>) -> Response {
+    let p = st.pose.read().unwrap().clone();
+    Json(p).into_response()
+}
+
+/// Stage 3: zero the pose integrator (back to `(0, 0, 0)`, empty trail).
+async fn motion_pose_reset(State(st): State<AppState>) -> StatusCode {
+    st.pose.write().unwrap().reset();
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct MotionDriveBody {
+    v_target: f32,
+    omega_target: f32,
+}
+
 #[derive(Deserialize)]
 struct MotionPredictQuery {
     v_target: f32,
@@ -442,7 +515,7 @@ mod tests {
     use tower::ServiceExt; // `oneshot`
 
     use crate::camera::Camera;
-    use crate::motion::{LabelStats, MotorModel};
+    use crate::motion::{LabelStats, MotionTarget, MotorModel, PoseState};
     use crate::slam::{MapSnapshot, SlamSnapshot};
 
     /// Exercise the read + control endpoints end-to-end: real router,
@@ -461,6 +534,8 @@ mod tests {
             imu: None,
             motor_model: Arc::new(RwLock::new(MotorModel::default_bootstrap(7.8))),
             label_stats: Arc::new(RwLock::new(LabelStats::default())),
+            motion_target: Arc::new(RwLock::new(MotionTarget::default())),
+            pose: Arc::new(RwLock::new(PoseState::default())),
         };
         // Distinctive values so the assertions check real serialization,
         // not just the `initial()` defaults.

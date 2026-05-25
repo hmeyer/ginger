@@ -11,7 +11,7 @@ use ginger_rs::{
     api::{Command, SensorSnapshot},
     camera::Camera,
     imu::{self, Imu},
-    motion::{LabelStats, MotorModel, labels},
+    motion::{LabelStats, MotionTarget, MotorModel, PoseState, labels, pose},
     robot::supervisor,
     server::{self, AppState},
     slam::{self, MapSnapshot, SlamSnapshot},
@@ -145,6 +145,21 @@ async fn main() {
         warn!("motion-labels: IMU absent — label worker not spawned");
     }
 
+    // Stage 3: pose integrator. Same IMU dependency as the label
+    // worker — without gyro we'd integrate trash.
+    let motion_target: Arc<RwLock<MotionTarget>> = Arc::new(RwLock::new(MotionTarget::default()));
+    let pose_state: Arc<RwLock<PoseState>> = Arc::new(RwLock::new(PoseState::default()));
+    if let Some(imu_arc) = imu.as_ref() {
+        pose::spawn(
+            sensors.clone(),
+            imu_arc.clone(),
+            motion_target.clone(),
+            pose_state.clone(),
+        );
+    } else {
+        warn!("motion-pose: IMU absent — pose integrator not spawned");
+    }
+
     server::serve(AppState {
         cmd_tx,
         sensors,
@@ -154,6 +169,8 @@ async fn main() {
         imu,
         motor_model,
         label_stats,
+        motion_target,
+        pose: pose_state,
     })
     .await;
 }
