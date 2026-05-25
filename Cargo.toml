@@ -22,6 +22,11 @@ rppal = "0.22"
 log = "0.4"
 env_logger = "0.11"
 thiserror = "2"
+# Used for the motor-model persistence file (`motor-model.toml`) — see
+# `src/motion/model.rs`. Already a transitive dep via `ginger-slam-core`
+# (where it parses `slam.toml`); promoting it to a direct dep here so the
+# main crate doesn't rely on a transitive path.
+toml = "0.8"
 libcamera = { version = "0.7", optional = true }
 
 # Web server
@@ -43,6 +48,8 @@ jpeg-encoder = "0.6"
 [dev-dependencies]
 # In-process HTTP testing of the axum router (`tower`'s `oneshot`).
 tower = "0.5"
+# Temp files for motor-model persistence round-trip tests.
+tempfile = "3"
 
 # `libcamera` is the only system-coupled dep; making it an opt-out
 # default feature lets CI / dev machines build and run the full crate

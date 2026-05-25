@@ -29,6 +29,7 @@ use crate::{
     api::{AngleBody, Command, DriveBody, ImuSampleView, SensorConfig, SensorSnapshot},
     camera::Camera,
     imu::Imu,
+    motion::{ModelInput, MotorModel},
     slam::{MapSnapshot, SlamSnapshot},
     video::webrtc,
 };
@@ -48,6 +49,11 @@ pub struct AppState {
     /// flaky bus, headless dev / test). Endpoints that depend on it
     /// answer 503 in that case rather than panicking.
     pub imu: Option<Arc<Imu>>,
+    /// Inverse motor model (Stage 1 of `PLAN.md`). Stays passive in
+    /// Stage 1 — `/api/motion/model/predict` reads it but nothing
+    /// drives the motors through it yet. Stage 2 wires the label stream
+    /// → `MotorModel::observe`; Stage 3 wires the WebUI joystick → predict.
+    pub motor_model: Arc<RwLock<MotorModel>>,
 }
 
 /// Build the axum router (all routes + shared state). Split out from
@@ -62,6 +68,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/camera/frame", get(camera_frame))
         .route("/api/imu/sample", get(imu_sample))
         .route("/api/imu/calibrate", post(imu_calibrate))
+        .route("/api/motion/model", get(motion_model_info))
+        .route("/api/motion/model/predict", get(motion_model_predict))
+        .route("/api/motion/model/reset", post(motion_model_reset))
         .route("/api/webrtc/whep", post(webrtc_whep))
         .route("/api/drive", post(drive))
         .route("/api/stop", post(stop_car))
@@ -288,6 +297,70 @@ async fn imu_calibrate(State(st): State<AppState>) -> Response {
     StatusCode::OK.into_response()
 }
 
+// ── Motor-model endpoints (Stage 1 of PLAN.md) ────────────────────────────────
+
+/// Health + telemetry for the `Motor model` WebUI card.
+async fn motion_model_info(State(st): State<AppState>) -> Response {
+    let m = st.motor_model.read().unwrap();
+    Json(serde_json::json!({
+        "trained_steps": m.trained_steps(),
+        "last_battery_v": m.last_battery_v(),
+        "last_updated_unix": m.last_updated_unix(),
+        "residual_pwm": m.residual_pwm(),
+    }))
+    .into_response()
+}
+
+/// Inverse forward pass: desired motion → PWM command. Used by both
+/// the WebUI manual probe and the prediction heatmap (which queries
+/// this endpoint once per grid cell on render).
+///
+/// All inputs are optional except `v_target` and `omega_target`; the
+/// rest default to neutral chassis state (zero PWM history, zero
+/// previous motion, 7.8 V battery). That keeps the heatmap call
+/// cheap (`?v_target=…&omega_target=…`).
+async fn motion_model_predict(
+    State(st): State<AppState>,
+    Query(q): Query<MotionPredictQuery>,
+) -> Response {
+    let input = ModelInput {
+        pwm_l_prev: q.pwm_l_prev.unwrap_or(0),
+        pwm_r_prev: q.pwm_r_prev.unwrap_or(0),
+        v_prev: q.v_prev.unwrap_or(0.0),
+        omega_prev: q.omega_prev.unwrap_or(0.0),
+        battery_v: q.battery_v.unwrap_or(7.8),
+        v_target: q.v_target,
+        omega_target: q.omega_target,
+    };
+    let cmd = st.motor_model.read().unwrap().predict(input);
+    Json(serde_json::json!({
+        "pwm_l": cmd.pwm_l,
+        "pwm_r": cmd.pwm_r,
+    }))
+    .into_response()
+}
+
+/// Re-bootstrap the model from scratch (synthetic warm-up). Wired to
+/// a WebUI button — emergency reset if the live label stream poisoned
+/// the model. Uses the latest battery reading as the new fit context.
+async fn motion_model_reset(State(st): State<AppState>) -> Response {
+    let battery_v = st.sensors.read().unwrap().battery_v;
+    let fresh = MotorModel::default_bootstrap(battery_v);
+    *st.motor_model.write().unwrap() = fresh;
+    StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct MotionPredictQuery {
+    v_target: f32,
+    omega_target: f32,
+    pwm_l_prev: Option<i32>,
+    pwm_r_prev: Option<i32>,
+    v_prev: Option<f32>,
+    omega_prev: Option<f32>,
+    battery_v: Option<f32>,
+}
+
 // ── WebRTC signalling ─────────────────────────────────────────────────────────
 
 async fn webrtc_whep(State(st): State<AppState>, body: String) -> Response {
@@ -354,6 +427,7 @@ mod tests {
     use tower::ServiceExt; // `oneshot`
 
     use crate::camera::Camera;
+    use crate::motion::MotorModel;
     use crate::slam::{MapSnapshot, SlamSnapshot};
 
     /// Exercise the read + control endpoints end-to-end: real router,
@@ -370,6 +444,7 @@ mod tests {
             // Headless: no chip on the bus. /api/imu/sample returns 503,
             // which the next test asserts on.
             imu: None,
+            motor_model: Arc::new(RwLock::new(MotorModel::default_bootstrap(7.8))),
         };
         // Distinctive values so the assertions check real serialization,
         // not just the `initial()` defaults.
@@ -454,9 +529,55 @@ mod tests {
         // Option<Imu> fallback path; the populated path is exercised by
         // `crate::imu::tests` and a manual on-Pi curl per PLAN.md.
         let resp = app
+            .clone()
             .oneshot(Request::get("/api/imu/sample").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // GET /api/motion/model — health endpoint, always responds 200
+        // once the bootstrap has run.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/motion/model")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The bootstrap ran 2000 SGD steps; the endpoint should reflect that.
+        assert!(v["trained_steps"].as_u64().unwrap() > 0);
+        // Battery anchored to the value we passed at construction.
+        assert!((v["last_battery_v"].as_f64().unwrap() - 7.8).abs() < 1e-3);
+
+        // GET /api/motion/model/predict — bare query (only target).
+        let resp = app
+            .oneshot(
+                Request::get("/api/motion/model/predict?v_target=0.3&omega_target=0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Forward motion request → both PWMs should be positive after
+        // bootstrap (deadband-corrected). Tolerant of model noise; the
+        // strict per-MLP behaviour is covered in motion::model tests.
+        let pwm_l = v["pwm_l"].as_i64().unwrap();
+        let pwm_r = v["pwm_r"].as_i64().unwrap();
+        assert!(
+            pwm_l > 0 && pwm_r > 0,
+            "expected forward PWMs, got ({pwm_l}, {pwm_r})"
+        );
     }
 }

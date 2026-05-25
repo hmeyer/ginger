@@ -16,6 +16,10 @@ pub enum Error {
     Camera(String),
     #[error("IMU: {0}")]
     Imu(String),
+    #[error("Motion: {0}")]
+    Motion(String),
+    #[error("IO: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -140,12 +140,23 @@ non-decreasing. New behavior needs new tests in the same change.
 
 ## Git
 
-- Develop on the assigned feature branch; commit per logical unit with a
+- Develop on a feature branch; commit per logical unit with a
   descriptive message; push with `git push -u origin <branch>`.
-- Do not create a PR unless explicitly asked.
+- **Push and open a PR as early as possible** — even on the first
+  commit that builds and lints. CI on GitHub Actions runs on x86_64
+  and is *much* faster than the Pi (workspace debug builds here take
+  5–10 min; CI finishes in a fraction of that). Iterate on the PR by
+  **force-pushing** to the same branch
+  (`git push --force-with-lease origin <branch>`) rather than opening
+  a new PR per round.
+- Treat CI as the primary test runner. Local `cargo test` on the Pi
+  is for tight single-test iteration; the full
+  `cargo test --workspace --no-default-features` definition-of-done
+  belongs to CI.
 - Pre-commit hook runs `make lint`; never bypass with `--no-verify`.
 - Publishing to `main` on the Pi: use `make deploy` (not bare `git push`)
-  so the CI build is auto-pulled — see *Deploying to the Pi*.
+  so the CI build is auto-pulled — see *Deploying to the Pi*. (Pure
+  docs PRs to `main` can skip `make deploy` — there's no binary to pull.)
 
 ## TODO / status tracking
 
