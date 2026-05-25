@@ -183,12 +183,14 @@ the `exec 1>`, the `comm -13` diff, and the gate test.
 A change is not done until all of these pass (this is what CI gates on):
 
 1. `cargo test --workspace --no-default-features` — green, no
-   regressions vs. the prior count.
+   regressions vs. the prior count. CI runs this natively on aarch64,
+   so the `crates/fast` NEON paths execute (not just the scalar
+   reference); a local x86 run only exercises the scalar branch.
 2. `cargo clippy --workspace --no-default-features --all-targets -- -D warnings`.
-3. `make lint` (fmt + clippy).
-4. `cargo check` for both camera-free crates on
-   `aarch64-unknown-linux-gnu`.
-5. WebUI changes: the Playwright harness in `webui-tests/` still passes.
+3. `make lint` (fmt + clippy). The default-features clippy needs
+   libcamera headers; on a non-Pi dev box without libcamera, lean on
+   CI's `build` job for that coverage.
+4. WebUI changes: the Playwright harness in `webui-tests/` still passes.
 
 Refactors must be behavior-preserving and keep the test count
 non-decreasing. New behavior needs new tests in the same change.

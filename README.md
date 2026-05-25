@@ -267,11 +267,11 @@ journalctl --user -u ginger -f
 
 ## Deploying CI builds (no on-Pi compile)
 
-Compiling on the Pi is slow. The [`RPi build`](.github/workflows/rpi-build.yml)
-workflow builds the release binary on a GitHub-hosted arm64 runner on every
-push to `main` (or via *Run workflow*) and uploads it as a `ginger-aarch64`
-artifact. The build runs in a Debian Trixie container so glibc and the
-pinned libcamera version match the Pi — the artifact is a drop-in binary.
+Compiling on the Pi is slow. The [`CI`](.github/workflows/ci.yml) workflow
+builds the release binary on a GitHub-hosted arm64 runner on every push to
+`main` (or via *Run workflow*) and uploads it as a `ginger-aarch64` artifact.
+The build runs in a Debian Trixie container so glibc and the pinned libcamera
+version match the Pi — the artifact is a drop-in binary.
 
 The Pi-side deploy is trigger-driven, not polled:
 
