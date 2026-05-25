@@ -7,10 +7,12 @@
 //! a `(pwm_l, pwm_r)` command. Camera-free, no hardware dependency;
 //! the whole module unit-tests headless.
 
+pub mod explore;
 pub mod labels;
 pub mod model;
 pub mod pose;
 
+pub use explore::{ExploreHandle, ExplorePhase, ExploreStatus, PolarScan, ScanRay};
 pub use labels::{LabelStats, RejectionCounts};
 pub use model::{LabelledSample, ModelInput, MotorModel, PwmCommand};
 pub use pose::{MotionTarget, PoseState, TrailPoint};

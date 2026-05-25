@@ -285,6 +285,14 @@ footer{
       </div>
       <canvas id="pose-trail" width="180" height="180" style="display:block;margin:6px auto;border-radius:4px;background:#222"></canvas>
     </div>
+    <div class="card" id="explore-card" title="Stage 4: greedy autonomous exploration (swept ultrasonic + pose-tracked driving)">
+      <div class="card-title">Explore
+        <button id="explore-toggle-btn" title="Toggle autonomous driving" style="margin-left:auto;font-size:.7rem;background:var(--bg4);color:var(--fg);border:0;border-radius:4px;padding:2px 8px;cursor:pointer">start</button>
+      </div>
+      <div class="row"><span class="lbl" style="min-width:48px">phase</span><span class="val" id="v-exp-phase">idle</span></div>
+      <div class="row"><span class="lbl" style="min-width:48px">scans</span><span class="val" id="v-exp-scans">0</span></div>
+      <canvas id="explore-scan" width="180" height="100" style="display:block;margin:6px auto;border-radius:4px;background:#222" title="Polar scan: half-disc 15°→165°. Each ray = one ultrasonic reading; green wedge = chosen heading."></canvas>
+    </div>
   </aside>
 </div>
 
@@ -987,6 +995,78 @@ sse.onmessage = e => {
 
   refreshPose();
   setInterval(refreshPose, 500);
+}
+
+// ── Explore card (Stage 4) ────────────────────────────────────────────────────
+{
+  const scanCanvas = document.getElementById('explore-scan');
+  const ctx = scanCanvas.getContext('2d');
+  const W = scanCanvas.width, H = scanCanvas.height;
+  // Polar plot: half-disc with the robot at the bottom-center, rays
+  // fanning up. Pan 15° goes hard-left, 90° straight up, 165° hard-right.
+  const MAX_RANGE_CM = 200;
+
+  function renderScan(scan) {
+    ctx.clearRect(0, 0, W, H);
+    if (!scan) return;
+    const cx = W / 2, cy = H - 4;
+    const rMax = Math.min(W / 2 - 4, H - 8);
+    // Backdrop arc(s)
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    for (const f of [0.33, 0.66, 1.0]) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, rMax * f, Math.PI, 2 * Math.PI);
+      ctx.stroke();
+    }
+    // Rays
+    for (let i = 0; i < scan.rays.length; i++) {
+      const r = scan.rays[i];
+      const d = r.distance_cm == null ? MAX_RANGE_CM : Math.min(r.distance_cm, MAX_RANGE_CM);
+      // pan_deg 15 → -75° from straight up; 165 → +75°
+      const phi = (r.pan_deg - 90) * Math.PI / 180;  // 0 = up
+      const ex = cx + Math.sin(phi) * d / MAX_RANGE_CM * rMax;
+      const ey = cy - Math.cos(phi) * d / MAX_RANGE_CM * rMax;
+      const isChosen = i === scan.chosen_idx;
+      ctx.strokeStyle = isChosen ? '#7d4'
+                       : (r.distance_cm != null && r.distance_cm < 30) ? '#f44'
+                       : '#6af';
+      ctx.lineWidth = isChosen ? 2.5 : 1.2;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+    }
+    // Robot dot
+    ctx.fillStyle = '#fc6';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  async function refreshExplore() {
+    try {
+      const s = await (await fetch('/api/motion/explore')).json();
+      document.getElementById('v-exp-scans').textContent = s.scans_completed;
+      let phaseTxt = s.phase.phase;
+      if (s.phase.phase === 'turning') phaseTxt += ` → ${(s.phase.target_theta_rad * 180 / Math.PI).toFixed(0)}°`;
+      if (s.phase.phase === 'driving') phaseTxt += ` (${s.phase.distance_remaining_m.toFixed(2)} m left)`;
+      document.getElementById('v-exp-phase').textContent = phaseTxt;
+      document.getElementById('explore-toggle-btn').textContent = s.on ? 'stop' : 'start';
+      document.getElementById('explore-toggle-btn').style.background = s.on ? 'var(--err)' : 'var(--bg4)';
+      renderScan(s.last_scan);
+    } catch (_) {}
+  }
+
+  document.getElementById('explore-toggle-btn').addEventListener('click', async () => {
+    const cur = document.getElementById('explore-toggle-btn').textContent.trim();
+    const on = cur === 'start' ? 1 : 0;
+    try { await fetch(`/api/motion/explore?on=${on}`, { method: 'POST' }); } catch (_) {}
+    await refreshExplore();
+  });
+
+  refreshExplore();
+  setInterval(refreshExplore, 500);
 }
 
 // ── Camera H.264 stream via WebRTC ────────────────────────────────────────────
