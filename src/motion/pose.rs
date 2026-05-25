@@ -54,6 +54,14 @@ const US_MAX_CM: f32 = 80.0;
 const STRAIGHT_PWM_DIFF_THRESHOLD: i32 = 200;
 const STATIC_PWM_AVG_THRESHOLD: i32 = 200;
 const US_NOISE_FLOOR_CM: f32 = 1.0;
+/// Reject v_us if the pan servo is not within this many degrees of
+/// 90° (chassis-forward). Without this gate, the Stage-4 explore
+/// swept scan moves the ultrasonic across the room while the chassis
+/// is stationary — each pose tick sees a different `us_cm` (different
+/// ray) and the integrator reads the jumps as forward velocity,
+/// drifting pose.x by several metres in 30 s of explore.
+const PAN_CENTERED_TOLERANCE_DEG: f32 = 5.0;
+const PAN_FORWARD_DEG: f32 = 90.0;
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -188,6 +196,7 @@ impl PoseWorker {
             self.initial_us_cm,
             us_end,
             dt_s,
+            snap.pan,
         );
         let v_used = v_us.unwrap_or(target.v_target);
 
@@ -248,8 +257,18 @@ fn try_v_us(
     us_start: Option<f32>,
     us_end: Option<f32>,
     dt_s: f32,
+    pan_deg: f32,
 ) -> Option<f32> {
     if (pwm_l - pwm_r).abs() >= STRAIGHT_PWM_DIFF_THRESHOLD {
+        return None;
+    }
+    // Pan not centred → the ultrasonic isn't reading distance along
+    // chassis-forward, so Δd/Δt is not chassis forward velocity. Also
+    // catches the Stage-4 explore scan: pan sweeps 15°→165° while the
+    // chassis is stationary; each tick sees a wildly different
+    // `us_cm`, and naive integration drifts pose.x by metres in
+    // seconds (live observation, 30 s explore → ~7 m fake travel).
+    if (pan_deg - PAN_FORWARD_DEG).abs() > PAN_CENTERED_TOLERANCE_DEG {
         return None;
     }
     let us_start = us_start?;
@@ -391,10 +410,14 @@ mod tests {
         );
     }
 
+    /// Pan-centred (90°) is the precondition for v_us to mean
+    /// "chassis-forward velocity". Helper to keep tests readable.
+    const PAN: f32 = 90.0;
+
     #[test]
     fn v_us_gate_forward_straight() {
         // Forward, in-range, monotonic Δd → returns metric v.
-        let v = try_v_us(1500, 1500, Some(30.0), Some(20.0), 0.05);
+        let v = try_v_us(1500, 1500, Some(30.0), Some(20.0), 0.05, PAN);
         match v {
             Some(x) => assert!((x - 2.0).abs() < 1e-3, "v = {x}"),
             None => panic!("expected Some, got None"),
@@ -403,24 +426,37 @@ mod tests {
 
     #[test]
     fn v_us_gate_turning_rejects() {
-        assert!(try_v_us(2000, 1000, Some(30.0), Some(29.0), 0.05).is_none());
+        assert!(try_v_us(2000, 1000, Some(30.0), Some(29.0), 0.05, PAN).is_none());
     }
 
     #[test]
     fn v_us_gate_range_rejects() {
-        assert!(try_v_us(1500, 1500, Some(5.0), Some(4.0), 0.05).is_none());
-        assert!(try_v_us(1500, 1500, Some(70.0), Some(85.0), 0.05).is_none());
+        assert!(try_v_us(1500, 1500, Some(5.0), Some(4.0), 0.05, PAN).is_none());
+        assert!(try_v_us(1500, 1500, Some(70.0), Some(85.0), 0.05, PAN).is_none());
     }
 
     #[test]
     fn v_us_gate_non_monotonic_rejects() {
         // Commanded forward, distance grew — reject.
-        assert!(try_v_us(1500, 1500, Some(30.0), Some(35.0), 0.05).is_none());
+        assert!(try_v_us(1500, 1500, Some(30.0), Some(35.0), 0.05, PAN).is_none());
     }
 
     #[test]
     fn v_us_gate_static_command_tolerates_jitter() {
         // Zero command, distance jittered → accept.
-        assert!(try_v_us(0, 0, Some(30.0), Some(30.5), 0.05).is_some());
+        assert!(try_v_us(0, 0, Some(30.0), Some(30.5), 0.05, PAN).is_some());
+    }
+
+    #[test]
+    fn v_us_gate_rejects_when_pan_off_centre() {
+        // Even an otherwise-valid window (straight, in-range, monotonic)
+        // must reject when the pan servo is sweeping. This is the
+        // Stage-4 fix — without it, swept-scan ultrasonic jumps drift
+        // pose.x by metres in 30 s.
+        assert!(try_v_us(1500, 1500, Some(30.0), Some(20.0), 0.05, 60.0).is_none());
+        assert!(try_v_us(1500, 1500, Some(30.0), Some(20.0), 0.05, 120.0).is_none());
+        // Within the ±5° tolerance still passes.
+        assert!(try_v_us(1500, 1500, Some(30.0), Some(20.0), 0.05, 87.0).is_some());
+        assert!(try_v_us(1500, 1500, Some(30.0), Some(20.0), 0.05, 93.0).is_some());
     }
 }
