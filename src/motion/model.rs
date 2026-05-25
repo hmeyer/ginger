@@ -453,9 +453,31 @@ impl MotorModel {
         self.normalizer.decode_pwm([a3[0], a3[1]])
     }
 
-    /// One SGD step on a labelled window. Updates Adam state and the
-    /// running residual EWMA. Bumps `trained_steps`.
+    /// One labelled window → **two** SGD steps: the sample as observed,
+    /// and its left/right mirror. The chassis is mechanically symmetric,
+    /// so for every `(v, ω, pwm_l, pwm_r)` example there's an equally
+    /// valid mirror `(v, -ω, pwm_r, pwm_l)` with `pwm_*_prev` and
+    /// `ω_prev` mirrored too. Training on both forces the learned
+    /// mapping to be symmetric in left/right and prevents the
+    /// degenerate "I only learn the turn direction the chassis actually
+    /// rotates in" loop observed live (battery 32 %, ~30 s of driving
+    /// asymmetrised ω=-1.0 prediction so badly the right wheel fell
+    /// below the deadband and the chassis couldn't turn right at all).
+    ///
+    /// Updates Adam state, EWMA residual, and `trained_steps` (counts
+    /// the input window — i.e. +1 per call, not +2 even though two
+    /// gradient steps land).
     pub fn observe(&mut self, s: LabelledSample) {
+        self.step(&s, false);
+        let mirrored = mirror_sample(&s);
+        self.step(&mirrored, true);
+        self.meta.trained_steps = self.meta.trained_steps.saturating_add(1);
+        self.meta.last_battery_v = s.input.battery_v;
+    }
+
+    /// One SGD step. `is_mirror` is a hook for future diagnostic
+    /// gating; today both real and mirror samples take the same path.
+    fn step(&mut self, s: &LabelledSample, _is_mirror: bool) {
         // Forward, saving intermediates needed for backprop.
         let z0 = self.normalizer.encode(&s.input);
         let a1 = self.layer_1.forward(&z0);
@@ -500,10 +522,30 @@ impl MotorModel {
         self.layer_1.adam_step(&dw1, &db1);
         self.layer_2.adam_step(&dw2, &db2);
         self.layer_3.adam_step(&dw3, &db3);
+    }
+}
 
-        self.meta.trained_steps = self.meta.trained_steps.saturating_add(1);
-        // Track last_battery_v so the save reflects the most recent regime.
-        self.meta.last_battery_v = s.input.battery_v;
+/// Mirror a labelled window across the chassis's left/right axis:
+/// swap `pwm_l`/`pwm_r` (both observed PWM and the `_prev` history),
+/// negate ω (both target and prev). `v_target` / `v_prev` /
+/// `battery_v` are unchanged — they don't have a left/right sign. The
+/// chassis kinematics are mechanically symmetric so this is a
+/// genuinely valid second sample, not a hack.
+fn mirror_sample(s: &LabelledSample) -> LabelledSample {
+    LabelledSample {
+        input: ModelInput {
+            pwm_l_prev: s.input.pwm_r_prev,
+            pwm_r_prev: s.input.pwm_l_prev,
+            v_prev: s.input.v_prev,
+            omega_prev: -s.input.omega_prev,
+            battery_v: s.input.battery_v,
+            v_target: s.input.v_target,
+            omega_target: -s.input.omega_target,
+        },
+        pwm_l_obs: s.pwm_r_obs,
+        pwm_r_obs: s.pwm_l_obs,
+        v_label_present: s.v_label_present,
+        dt_s: s.dt_s,
     }
 }
 
@@ -793,5 +835,63 @@ mod tests {
                 "ω target {w_t} → got {w_got} after sparse-v training"
             );
         }
+    }
+
+    #[test]
+    fn training_remains_symmetric_under_asymmetric_data() {
+        // Reproduce the live failure mode that motivated the mirror
+        // augmentation: train only on LEFT-turn samples (omega > 0) for
+        // 1000 steps. Without augmentation, the model would forget how
+        // to predict RIGHT turns (right-wheel command falls below the
+        // deadband). With augmentation, every left sample is mirrored
+        // into a right sample, so the model stays symmetric.
+        let mut m = MotorModel::default_bootstrap(7.8);
+        let mut rng = SmallRng::seed_from_u64(0xA51C_1971);
+        for _ in 0..1000 {
+            // Only positive-omega synthetic samples — left turns only.
+            let pwm_diff = rng.random_range(400..1500);
+            let pwm_avg = rng.random_range(-300..300); // mostly small avg
+            let pwm_r = pwm_avg + pwm_diff / 2;
+            let pwm_l = pwm_avg - pwm_diff / 2;
+            let (v, omega) = synthetic_forward(pwm_l, pwm_r);
+            assert!(omega > 0.0, "training sample should be CCW");
+            m.observe(LabelledSample {
+                input: ModelInput {
+                    pwm_l_prev: 0,
+                    pwm_r_prev: 0,
+                    v_prev: 0.0,
+                    omega_prev: 0.0,
+                    battery_v: 7.8,
+                    v_target: v,
+                    omega_target: omega,
+                },
+                pwm_l_obs: pwm_l,
+                pwm_r_obs: pwm_r,
+                v_label_present: true,
+                dt_s: 0.2,
+            });
+        }
+        // Symmetry assertion: predict for +ω and -ω; the right-turn
+        // prediction should mirror the left-turn prediction within
+        // reasonable tolerance.
+        let cmd_left = m.predict(neutral_state(0.0, 0.5, 7.8));
+        let cmd_right = m.predict(neutral_state(0.0, -0.5, 7.8));
+        // Mirror property: cmd_right ≈ (cmd_left.pwm_r, cmd_left.pwm_l).
+        let mirror_l = cmd_left.pwm_r;
+        let mirror_r = cmd_left.pwm_l;
+        let dl = (cmd_right.pwm_l - mirror_l).abs();
+        let dr = (cmd_right.pwm_r - mirror_r).abs();
+        assert!(
+            dl < 200 && dr < 200,
+            "symmetry broken: predict(+ω)={cmd_left:?}, predict(-ω)={cmd_right:?} \
+             (expected mirror within ±200 PWM each)"
+        );
+        // And concretely: right-turn prediction must keep at least one
+        // wheel above the deadband (~200), so the chassis can actually
+        // pivot. This is the live failure mode the fix targets.
+        assert!(
+            cmd_right.pwm_l.abs() > 200 || cmd_right.pwm_r.abs() > 200,
+            "right-turn prediction has BOTH wheels below the deadband: {cmd_right:?}"
+        );
     }
 }
