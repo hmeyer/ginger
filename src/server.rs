@@ -29,7 +29,7 @@ use crate::{
     api::{AngleBody, Command, DriveBody, ImuSampleView, SensorConfig, SensorSnapshot},
     camera::Camera,
     imu::Imu,
-    motion::{ExploreHandle, ModelInput, MotionTarget, MotorModel, PoseState},
+    motion::{ExploreHandle, ModelInput, MotionTarget, MotorModel, PoseState, arcade_drive},
     slam::{MapSnapshot, SlamSnapshot},
     video::webrtc,
 };
@@ -49,10 +49,11 @@ pub struct AppState {
     /// flaky bus, headless dev / test). Endpoints that depend on it
     /// answer 503 in that case rather than panicking.
     pub imu: Option<Arc<Imu>>,
-    /// Inverse motor model (Stage 1 of `PLAN.md`). Stays passive in
-    /// Stage 1 — `/api/motion/model/predict` reads it but nothing
-    /// drives the motors through it yet. Stage 2 wires the label stream
-    /// → `MotorModel::observe`; Stage 3 wires the WebUI joystick → predict.
+    /// Forward motor model — predicts (Δs, Δθ) over a 200 ms window
+    /// from PWMs + chassis state. Trained continuously by the
+    /// `motion::labels` worker. Read out at `/api/motion/model` and
+    /// `/api/motion/model/predict`; **not** on the drive path (which
+    /// uses `arcade_drive`).
     pub motor_model: Arc<RwLock<MotorModel>>,
     /// Telemetry from the Stage-2 label worker
     /// (`src/motion/labels.rs`). Counters + rejection breakdown surfaced
@@ -327,7 +328,12 @@ async fn imu_calib(State(st): State<AppState>) -> Response {
     Json(imu.calib_status()).into_response()
 }
 
-// ── Motor-model endpoints (Stage 1 of PLAN.md) ────────────────────────────────
+// ── Motor-model endpoints ─────────────────────────────────────────────────────
+//
+// The forward model predicts `(Δs, Δθ)` over a 200 ms window from PWMs
+// + chassis state. It is **not on the drive path** — `/api/motion/drive`
+// uses the pure-math `arcade_drive` mapping. The model is read out for
+// diagnostics, planning, and the WebUI probe.
 
 /// Health + telemetry for the `Motor model` WebUI card.
 async fn motion_model_info(State(st): State<AppState>) -> Response {
@@ -336,43 +342,37 @@ async fn motion_model_info(State(st): State<AppState>) -> Response {
         "trained_steps": m.trained_steps(),
         "last_battery_v": m.last_battery_v(),
         "last_updated_unix": m.last_updated_unix(),
-        "residual_pwm": m.residual_pwm(),
+        "residual_motion": m.residual_motion(),
     }))
     .into_response()
 }
 
-/// Inverse forward pass: desired motion → PWM command. Used by both
-/// the WebUI manual probe and the prediction heatmap (which queries
-/// this endpoint once per grid cell on render).
-///
-/// All inputs are optional except `v_target` and `omega_target`; the
-/// rest default to neutral chassis state (zero PWM history, zero
-/// previous motion, 7.8 V battery). That keeps the heatmap call
-/// cheap (`?v_target=…&omega_target=…`).
+/// Forward pass: PWMs + state → predicted `(Δs_m, Δθ_rad)` over the
+/// next 200 ms label window. All state inputs default to neutral
+/// (zero history, zero previous motion, 7.8 V battery); `pwm_l` and
+/// `pwm_r` are required.
 async fn motion_model_predict(
     State(st): State<AppState>,
     Query(q): Query<MotionPredictQuery>,
 ) -> Response {
     let input = ModelInput {
+        pwm_l: q.pwm_l,
+        pwm_r: q.pwm_r,
         pwm_l_prev: q.pwm_l_prev.unwrap_or(0),
         pwm_r_prev: q.pwm_r_prev.unwrap_or(0),
         v_prev: q.v_prev.unwrap_or(0.0),
         omega_prev: q.omega_prev.unwrap_or(0.0),
         battery_v: q.battery_v.unwrap_or(7.8),
-        v_target: q.v_target,
-        omega_target: q.omega_target,
     };
-    let cmd = st.motor_model.read().unwrap().predict(input);
+    let pred = st.motor_model.read().unwrap().predict(input);
     Json(serde_json::json!({
-        "pwm_l": cmd.pwm_l,
-        "pwm_r": cmd.pwm_r,
+        "ds_m": pred.ds_m,
+        "dtheta_rad": pred.dtheta_rad,
     }))
     .into_response()
 }
 
-/// Re-bootstrap the model from scratch (synthetic warm-up). Wired to
-/// a WebUI button — emergency reset if the live label stream poisoned
-/// the model. Uses the latest battery reading as the new fit context.
+/// Re-bootstrap the forward model. Wired to a WebUI button.
 async fn motion_model_reset(State(st): State<AppState>) -> Response {
     let battery_v = st.sensors.read().unwrap().battery_v;
     let fresh = MotorModel::default_bootstrap(battery_v);
@@ -380,51 +380,33 @@ async fn motion_model_reset(State(st): State<AppState>) -> Response {
     StatusCode::OK.into_response()
 }
 
-/// Stage-2 label-worker telemetry. Counters of observed/v-labelled
-/// windows and rejection breakdown by reason — backs the "Labels"
-/// subsection of the WebUI Motor model card.
+/// Label-worker telemetry. Counters of observed / Δs-labelled
+/// windows and rejection breakdown — backs the WebUI "Labels" card.
 async fn motion_labels(State(st): State<AppState>) -> Response {
     let stats = *st.label_stats.read().unwrap();
     Json(stats).into_response()
 }
 
-/// Stage 3: drive in motion units. POST body `{ v_target, omega_target }`
-/// (m/s and rad/s). The handler runs `MotorModel::predict` to translate
-/// into PWM and forwards it via the supervisor's existing `SetMotors`
-/// channel. The latest target + the PWM the model produced are stored
-/// in `AppState.motion_target` so the pose integrator and WebUI can
-/// read them.
+/// Drive in motion units. POST body `{ v_target, omega_target }`
+/// (m/s, rad/s). The mapping is **pure math** (arcade-drive): no
+/// learned model in the drive path, robust by construction. The
+/// commanded intent + resulting PWMs are stored in `motion_target` so
+/// the pose integrator and label worker can read them.
 ///
-/// This is the path the WebUI joystick uses. `POST /api/drive` (raw
-/// PWM) stays alive for diagnostics and the curl recipes in
-/// `CLAUDE.md` — it just bypasses the model.
+/// `POST /api/drive` (raw PWM) remains for diagnostics and the curl
+/// recipes in `CLAUDE.md`.
 async fn motion_drive(State(st): State<AppState>, Json(b): Json<MotionDriveBody>) -> StatusCode {
-    let (pwm_l_prev, pwm_r_prev, v_prev, omega_prev) = {
-        let p = st.pose.read().unwrap();
-        let t = st.motion_target.read().unwrap();
-        (t.pwm_l, t.pwm_r, p.v_us.unwrap_or(p.v_cmd), p.omega_gyro)
-    };
-    let battery_v = st.sensors.read().unwrap().battery_v;
-    let input = ModelInput {
-        pwm_l_prev,
-        pwm_r_prev,
-        v_prev,
-        omega_prev,
-        battery_v,
-        v_target: b.v_target,
-        omega_target: b.omega_target,
-    };
-    let pwm = st.motor_model.read().unwrap().predict(input);
+    let (pwm_l, pwm_r) = arcade_drive(b.v_target, b.omega_target);
     *st.motion_target.write().unwrap() = MotionTarget {
         v_target: b.v_target,
         omega_target: b.omega_target,
-        pwm_l: pwm.pwm_l,
-        pwm_r: pwm.pwm_r,
+        pwm_l,
+        pwm_r,
     };
     st.cmd_tx
         .send(Command::SetMotors {
-            left: pwm.pwm_l,
-            right: pwm.pwm_r,
+            left: pwm_l,
+            right: pwm_r,
         })
         .await
         .ok();
@@ -475,8 +457,8 @@ struct MotionDriveBody {
 
 #[derive(Deserialize)]
 struct MotionPredictQuery {
-    v_target: f32,
-    omega_target: f32,
+    pwm_l: i32,
+    pwm_r: i32,
     pwm_l_prev: Option<i32>,
     pwm_r_prev: Option<i32>,
     v_prev: Option<f32>,
@@ -683,10 +665,12 @@ mod tests {
         // Battery anchored to the value we passed at construction.
         assert!((v["last_battery_v"].as_f64().unwrap() - 7.8).abs() < 1e-3);
 
-        // GET /api/motion/model/predict — bare query (only target).
+        // GET /api/motion/model/predict — forward direction: PWMs in,
+        // (Δs, Δθ) out. PWM 1500 forward symmetric should predict
+        // positive Δs and near-zero Δθ after bootstrap.
         let resp = app
             .oneshot(
-                Request::get("/api/motion/model/predict?v_target=0.3&omega_target=0.0")
+                Request::get("/api/motion/model/predict?pwm_l=1500&pwm_r=1500")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -697,14 +681,15 @@ mod tests {
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Forward motion request → both PWMs should be positive after
-        // bootstrap (deadband-corrected). Tolerant of model noise; the
-        // strict per-MLP behaviour is covered in motion::model tests.
-        let pwm_l = v["pwm_l"].as_i64().unwrap();
-        let pwm_r = v["pwm_r"].as_i64().unwrap();
+        let ds = v["ds_m"].as_f64().unwrap();
+        let dtheta = v["dtheta_rad"].as_f64().unwrap();
         assert!(
-            pwm_l > 0 && pwm_r > 0,
-            "expected forward PWMs, got ({pwm_l}, {pwm_r})"
+            ds > 0.0,
+            "forward PWMs should predict positive Δs, got {ds}"
+        );
+        assert!(
+            dtheta.abs() < 0.05,
+            "forward PWMs should predict near-zero Δθ, got {dtheta}"
         );
     }
 }
