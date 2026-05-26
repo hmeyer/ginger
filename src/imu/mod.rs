@@ -74,9 +74,8 @@ pub struct ImuSample {
     /// **Same clock** as `camera::Frame::t_capture` — they can be
     /// subtracted directly.
     pub t_read: Instant,
-    /// Monotonically incrementing per-sample counter. Replaces the
-    /// BMI160's chip-internal sensortime; a stalled stream shows as
-    /// this not advancing across requests.
+    /// Monotonically incrementing per-sample counter; a stalled stream
+    /// shows as this not advancing across requests.
     pub sample_index: u32,
 }
 

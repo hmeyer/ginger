@@ -179,9 +179,9 @@ pub struct ImuSampleView {
     pub calib: CalibStatus,
     /// Achieved fusion polling rate EWMA in Hz.
     pub rate_hz: f32,
-    /// Monotonic per-sample counter — replaces the BMI160's chip-internal
-    /// sensortime. A stalled sample stream shows as this not advancing
-    /// across requests.
+    /// Monotonic per-sample counter incremented by the polling thread.
+    /// A stalled sample stream shows as this not advancing across
+    /// requests — cheapest "is the IMU thread alive" check we have.
     pub sample_index: u32,
     /// Milliseconds between the IMU sample and "now" at request time.
     pub t_sample_ago_ms: f32,
