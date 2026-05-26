@@ -1,36 +1,26 @@
-//! IMU sample loop: own a thread that polls the BMI160 at the configured
-//! ODR, timestamp each sample on the **same monotonic clock** the camera
-//! uses (`std::time::Instant`), and publish the stream into both a
-//! latest-sample slot (for the `/api/imu/sample` debug endpoint) and a
-//! short ring buffer (Stage 4 will consume this from the SLAM frontend
-//! for gyro pre-integration between camera frames).
+//! IMU sample loop: own a thread that polls the BNO055 at the chip's
+//! 100 Hz fusion rate, timestamp each sample on the **same monotonic
+//! clock** the camera uses (`std::time::Instant`), and publish the
+//! stream into both a latest-sample slot and a short ring buffer.
 //!
 //! ### Why the two clocks are the same
 //!
 //! Frame capture times (`camera::Frame::t_capture`) and IMU sample times
 //! (`ImuSample::t_read`) both come from `Instant::now()` on the host's
-//! `CLOCK_MONOTONIC`. That's the load-bearing invariant for stage 4: the
-//! SLAM frontend computes `frame_now.t_capture - frame_prev.t_capture`
-//! to get the camera-frame interval, then sums gyro samples whose
-//! `t_read` falls inside that interval. Both stamps are observation
-//! moments on the **host**, so a direct `Duration` subtraction is the
-//! gap between events with **no clock-domain conversion required**.
+//! `CLOCK_MONOTONIC`. The SLAM frontend computes
+//! `frame_now.t_capture - frame_prev.t_capture` to get the camera-frame
+//! interval, then pulls the orientation samples whose `t_read` falls
+//! inside that interval and computes a single ΔR = `q_curr * q_prev⁻¹`
+//! — no clock-domain conversion required.
 //!
-//! The BMI160's chip-internal `sensortime` (39.0625 µs/tick) is *also*
-//! captured per sample, but only for sanity / drift detection — it lives
-//! on a completely separate clock domain and is not used for sync.
+//! ### Fusion warm-up gate
 //!
-//! ### What's not in this module (yet)
-//!
-//! * Consumption by the SLAM frontend's tracking-predict — Stage 4
-//!   (`src/slam/frontend.rs` will `recent_since(t_prev_frame)` from this
-//!   ring and pre-integrate, with `gyro_bias_dps()` subtracted per sample).
-//! * IMU-as-BA-constraint factors — Stage 6+ per `PLAN.md`.
-//!
-//! Auto-bias-on-boot is in place (`BiasState` FSM below): no on-disk
-//! persistence — the bias is temperature-dependent, and re-estimating
-//! every boot is more accurate than reloading a stale value. The
-//! `POST /api/imu/calibrate` endpoint restarts the window on demand.
+//! After power-up the BNO055 spends a few seconds doing stillness-based
+//! gyro auto-zeroing. While `CALIB_STAT.gyr == 0` the orientation it
+//! reports is meaningless. Both [`Imu::latest`] and [`Imu::recent_since`]
+//! return empty results during that window, so every consumer's
+//! existing "IMU absent" path handles the warm-up automatically. The
+//! WebUI surfaces the calibration status via [`Imu::calib_status`].
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -38,121 +28,76 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
+use nalgebra::UnitQuaternion;
 
 use crate::Result;
-use crate::hal::bmi160::{Bmi160, I2cBus, RawSample, RppalI2c};
+use crate::hal::bno055::{Bno055, CalibStatus, I2cBus, RppalI2c};
 
-/// Default I²C address for the BMI160 on this robot (SDO tied to VCC).
-/// See `PLAN.md`'s hardware section: 0x68 is the alternative when SDO=GND.
-pub const DEFAULT_ADDR: u16 = 0x69;
+/// Default I²C address for the BNO055 on this robot (`COM3` tied to GND).
+/// 0x29 is the alternate when COM3 is pulled high.
+pub const DEFAULT_ADDR: u16 = 0x28;
 
-/// Target sample period. 200 Hz → 5 ms — matches the chip ODR configured
-/// in [`crate::hal::bmi160`]. The polling thread sleeps for whatever
-/// remains of this period after each I²C transaction; if the bus is busy
-/// (PCA9685 motor updates, ADS7830 battery polls) the slip is logged
-/// once a second so it's visible in the journal.
-const SAMPLE_PERIOD: Duration = Duration::from_millis(5);
+/// Target sample period. 100 Hz → 10 ms — matches the BNO055's fixed
+/// fusion-output rate. Polling faster only re-reads stale registers;
+/// polling slower drops fusion frames.
+const SAMPLE_PERIOD: Duration = Duration::from_millis(10);
 
-/// Ring capacity: 10 s at 200 Hz, which dominates any plausible
-/// camera-frame interval (30 fps = 33 ms; even a stalled frontend at 1
-/// fps keeps fewer than 200 samples worth of work). Overflows drop the
-/// oldest sample — Stage 4 only ever wants the recent tail, and an
-/// unbounded ring would mask a stuck consumer.
-const RING_CAPACITY: usize = 2000;
+/// How often to re-read the 1-byte `CALIB_STAT`. The chip updates this
+/// at fusion rate, but consumers only care about it for the warm-up
+/// gate and the WebUI badge, so a 1 Hz re-read is plenty.
+const CALIB_PERIOD: Duration = Duration::from_secs(1);
 
-/// Bias-calibration window: collect ~1 s of samples after boot, then
-/// the same after each `recalibrate_bias()` call. At 142–200 Hz this is
-/// 140–200 samples, well over the law-of-large-numbers floor for the
-/// chip's ±0.05 dps RMS noise.
-const BIAS_WINDOW: Duration = Duration::from_millis(1000);
+/// Ring capacity: 10 s at 100 Hz, which dominates any plausible
+/// camera-frame interval. Overflows drop the oldest sample.
+const RING_CAPACITY: usize = 1000;
 
-/// Stationarity gate. Any single-sample gyro axis exceeding this magnitude
-/// during the bias window aborts the calibration — the chassis was moved
-/// while we were trying to learn the bias. Chosen well above the chip's
-/// noise floor (~0.05 dps RMS) but well below any deliberate motion
-/// (the slow-spin failure mode in session 2 used ±100 dps).
-const STATIONARY_DPS: f32 = 2.0;
+/// Minimum `CALIB_STAT.gyr` value (0..=3) at which the chip's fusion
+/// output is trustworthy. `1` is the first non-zero rung — the chip has
+/// completed at least one stillness-based gyro-zero pass. `2` would be
+/// tighter but takes much longer to reach on a chassis that's never
+/// fully still (motor vibration, fans, etc.).
+const MIN_GYR_CALIB: u8 = 1;
 
 // ── Sample type ──────────────────────────────────────────────────────────────
 
-/// One IMU sample with both host and chip timestamps.
+/// One IMU sample with the chip's fused orientation + linear-accel.
 #[derive(Debug, Clone, Copy)]
 pub struct ImuSample {
-    /// Raw gyro/accel in IMU body frame (LSB counts; see
-    /// [`crate::hal::bmi160`] for the scale factors at the default
-    /// ±500 dps / ±4 g ranges).
-    pub raw: RawSample,
-    /// Host monotonic clock at the moment the I²C burst returned. **Same
-    /// clock** as `camera::Frame::t_capture` — they can be subtracted
-    /// directly.
+    /// Chip-frame orientation. Identity at the chip's boot pose; tracks
+    /// rotations the chassis has made since then via the BNO's IMUPLUS
+    /// fusion. Yaw component is the primary signal for pose / SLAM.
+    pub orientation: UnitQuaternion<f32>,
+    /// Linear acceleration (gravity removed by the chip) in m/s²,
+    /// chip body frame. Drives spike rejection in the label worker.
+    pub linear_accel: [f32; 3],
+    /// Host monotonic clock at the moment the I²C burst returned.
+    /// **Same clock** as `camera::Frame::t_capture` — they can be
+    /// subtracted directly.
     pub t_read: Instant,
-    /// Chip-internal 24-bit counter at 39.0625 µs/tick, wraps every
-    /// ~655 s. Compare deltas across consecutive samples to detect a
-    /// stalled / dropped I²C read.
-    pub sensortime: u32,
+    /// Monotonically incrementing per-sample counter. Replaces the
+    /// BMI160's chip-internal sensortime; a stalled stream shows as
+    /// this not advancing across requests.
+    pub sample_index: u32,
 }
 
 // ── Shared state between the polling thread and HTTP consumers ───────────────
 
-/// Bias-estimator FSM. `Collecting` and `Failed` both behave as "bias
-/// is zero" for the consumer; `Ready` returns the learned offset.
-#[derive(Debug, Clone, Copy)]
-enum BiasState {
-    /// First `BIAS_WINDOW` after boot / after a recalibrate request.
-    /// Samples are accumulated; movement aborts to `Failed`.
-    Collecting {
-        started_at: Instant,
-        sum_dps: [f32; 3],
-        n: u32,
-        aborted: bool,
-    },
-    /// Settled. Consumers subtract this from raw gyro before use.
-    Ready { bias_dps: [f32; 3] },
-    /// Window saw motion. Bias stays at zero until the operator
-    /// re-triggers via `recalibrate_bias()`; the predict eats the
-    /// resulting per-frame drift (negligible — see PLAN.md Stage 3).
-    Failed,
-}
-
-impl Default for BiasState {
-    fn default() -> Self {
-        BiasState::Collecting {
-            started_at: Instant::now(),
-            sum_dps: [0.0; 3],
-            n: 0,
-            aborted: false,
-        }
-    }
-}
-
 #[derive(Default)]
 struct State {
-    /// Most-recently-read sample, populated after the first successful poll.
+    /// Most-recently-read sample, populated after the first successful
+    /// poll that landed *after* the chip's fusion warm-up.
     latest: Option<ImuSample>,
     /// Bounded ring of recent samples in insertion order (oldest at the
-    /// front). Stage 4 reads the tail with `recent_since`.
+    /// front). Only contains samples taken once `calib.gyr >= MIN_GYR_CALIB`.
     ring: VecDeque<ImuSample>,
-    /// Rolling EWMA of the achieved sample rate, in Hz. Updated on every
-    /// poll so the 1 Hz status log can report it without re-computing.
+    /// Rolling EWMA of the achieved sample rate, in Hz.
     rate_hz: f32,
-    /// Total I²C read failures since boot — logged at the 1 Hz tick if
-    /// non-zero so a flaky bus is visible.
+    /// Total I²C read failures since boot.
     read_failures: u64,
-    /// Auto-bias estimator. Starts `Collecting`; transitions to `Ready`
-    /// after one `BIAS_WINDOW` of stationary samples, or `Failed` if
-    /// motion was detected during the window.
-    bias: BiasState,
-}
-
-impl State {
-    /// The learned bias (zeros until `Ready`). Cheap; safe to call on
-    /// every poll. Consumers subtract this before reporting / integrating.
-    fn current_bias_dps(&self) -> [f32; 3] {
-        match self.bias {
-            BiasState::Ready { bias_dps } => bias_dps,
-            _ => [0.0; 3],
-        }
-    }
+    /// Most-recent calibration status. Re-read once per second.
+    calib: CalibStatus,
+    /// Monotonic counter shared with [`ImuSample::sample_index`].
+    next_sample_index: u32,
 }
 
 // ── Public handle ────────────────────────────────────────────────────────────
@@ -165,20 +110,19 @@ pub struct Imu {
 }
 
 impl Imu {
-    /// Open the chip at `addr`, bring it up, and start the polling
-    /// thread. Returns once the chip is configured but **before** the
-    /// first sample lands (a few ms later, after the chip's first ODR
-    /// tick) — callers wanting to wait for a real sample should poll
-    /// `latest()`.
+    /// Open the chip at `addr`, bring it up in IMUPLUS mode, and start
+    /// the polling thread. Returns once the chip is configured but
+    /// **before** the first sample lands — callers that need a real
+    /// sample should poll [`Self::latest`].
     pub fn open(addr: u16) -> Result<Self> {
         let bus = RppalI2c::open(addr)?;
-        let chip = Bmi160::open(bus)?;
+        let chip = Bno055::open(bus)?;
         Ok(Self::spawn(chip))
     }
 
-    /// Generic constructor used by tests with a [`MockI2cBus`]; production
+    /// Generic constructor used by tests with a mock bus; production
     /// callers want [`Imu::open`].
-    fn spawn<B: I2cBus + Send + 'static>(chip: Bmi160<B>) -> Self {
+    fn spawn<B: I2cBus + Send + 'static>(chip: Bno055<B>) -> Self {
         let state = Arc::new(Mutex::new(State::default()));
         let state_thread = state.clone();
         let thread = thread::Builder::new()
@@ -191,15 +135,16 @@ impl Imu {
         }
     }
 
-    /// Most-recent sample, or `None` if the thread hasn't produced one yet.
+    /// Most-recent sample, or `None` if the chip hasn't completed its
+    /// fusion warm-up yet (`calib.gyr < 1`). Consumers' existing
+    /// "IMU absent" paths handle the warm-up correctly without any
+    /// per-consumer gating.
     pub fn latest(&self) -> Option<ImuSample> {
         self.state.lock().unwrap().latest
     }
 
-    /// All ring samples whose `t_read >= since`, oldest first. Stage 4
-    /// will call this with the previous camera frame's `t_capture` to
-    /// pull the gyro samples for that inter-frame interval. Returned
-    /// vector is owned (cheap: a `Vec<ImuSample>`, each sample is 36 B).
+    /// All ring samples whose `t_read >= since`, oldest first. Empty
+    /// before the chip's fusion warm-up completes.
     pub fn recent_since(&self, since: Instant) -> Vec<ImuSample> {
         let st = self.state.lock().unwrap();
         st.ring
@@ -209,55 +154,44 @@ impl Imu {
             .collect()
     }
 
-    /// Rolling EWMA of achieved sample rate (Hz) — what the 1 Hz log
-    /// reports. Useful for tests / debug.
+    /// Most-recent sample whose `t_read <= at` — the chip's best
+    /// orientation estimate *at-or-before* the queried instant. `None`
+    /// before the chip's fusion warm-up, or if the ring contains no
+    /// sample older than `at` (consumer queried with a `t` older than
+    /// anything we still have).
+    ///
+    /// The SLAM rotation hint and the label worker's ω endpoints use
+    /// this to pull the two orientation snapshots bracketing a camera
+    /// frame or a 200 ms label window — `Δyaw / Δt` from those is the
+    /// fusion-engine's drift-compensated answer.
+    pub fn latest_before(&self, at: Instant) -> Option<ImuSample> {
+        let st = self.state.lock().unwrap();
+        st.ring.iter().rev().find(|s| s.t_read <= at).copied()
+    }
+
+    /// Rolling EWMA of achieved sample rate (Hz). Should sit near 100 on
+    /// the live bus; sagging means I²C contention.
     pub fn rate_hz(&self) -> f32 {
         self.state.lock().unwrap().rate_hz
     }
 
-    /// Learned gyro bias in dps. Zeros until the calibrator transitions
-    /// to `Ready` (~1 s after boot, longer if motion was detected). Safe
-    /// to subtract unconditionally — pre-learning it's just a no-op
-    /// rather than wildly wrong.
-    pub fn gyro_bias_dps(&self) -> [f32; 3] {
-        self.state.lock().unwrap().current_bias_dps()
-    }
-
-    /// Restart the bias-collection window. Used by `POST /api/imu/calibrate`
-    /// after the operator places the chassis still — the auto-on-boot
-    /// attempt may have aborted because something was being adjusted.
-    pub fn recalibrate_bias(&self) {
-        let mut st = self.state.lock().unwrap();
-        st.bias = BiasState::Collecting {
-            started_at: Instant::now(),
-            sum_dps: [0.0; 3],
-            n: 0,
-            aborted: false,
-        };
-        info!("imu: bias recalibration requested");
-    }
-
-    /// `true` once auto-bias has settled (one of `Ready` / `Failed`).
-    /// Used in tests; not surfaced yet (the WebUI just shows the bias
-    /// value, which is zero in both `Collecting` and `Failed` states —
-    /// indistinguishable for human-eyeball purposes).
-    #[cfg(test)]
-    fn bias_settled(&self) -> bool {
-        !matches!(
-            self.state.lock().unwrap().bias,
-            BiasState::Collecting { .. }
-        )
+    /// Latest per-subsystem calibration status. `mag` always zero in
+    /// IMUPLUS (magnetometer disabled). Surfaced to the WebUI as a
+    /// "fusion ready" badge.
+    pub fn calib_status(&self) -> CalibStatus {
+        self.state.lock().unwrap().calib
     }
 }
 
 // ── Polling thread ───────────────────────────────────────────────────────────
 
-fn sample_loop<B: I2cBus>(mut chip: Bmi160<B>, state: Arc<Mutex<State>>) {
+fn sample_loop<B: I2cBus>(mut chip: Bno055<B>, state: Arc<Mutex<State>>) {
     info!(
-        "imu: sample loop started at {:?} target period",
+        "imu: sample loop started at {:?} target period (BNO055 IMUPLUS, 100 Hz fusion)",
         SAMPLE_PERIOD
     );
     let mut last_log = Instant::now();
+    let mut last_calib_read = Instant::now() - CALIB_PERIOD; // force first read
     let mut samples_this_sec: u32 = 0;
     let mut last_read = Instant::now();
 
@@ -267,78 +201,62 @@ fn sample_loop<B: I2cBus>(mut chip: Bmi160<B>, state: Arc<Mutex<State>>) {
         if next_deadline > now {
             thread::sleep(next_deadline - now);
         }
-        // Read first, *then* stamp — `t_read` should be as close as
-        // possible to the moment the chip's data registers were latched
-        // into our buffer, not the start of the I²C transaction. The
-        // sensortime read is a separate transaction; it adds ~125 µs of
-        // skew on a 400 kHz bus, acceptable for the drift-detection
-        // role it serves.
-        match chip.read_both() {
-            Ok(raw) => {
+
+        // Re-read calibration status at the slow cadence. Doing it here
+        // (in the same thread as the fusion read) avoids any I²C bus
+        // races with the fusion polling.
+        if last_calib_read.elapsed() >= CALIB_PERIOD {
+            match chip.read_calib() {
+                Ok(c) => {
+                    state.lock().unwrap().calib = c;
+                }
+                Err(e) => warn!("imu: read_calib failed: {e}"),
+            }
+            last_calib_read = Instant::now();
+        }
+
+        match chip.read_fusion() {
+            Ok(Some(fusion)) => {
                 let t_read = Instant::now();
-                let sensortime = chip.read_sensortime().unwrap_or(0);
                 last_read = t_read;
                 samples_this_sec += 1;
 
-                let sample = ImuSample {
-                    raw,
-                    t_read,
-                    sensortime,
-                };
-
                 let mut st = state.lock().unwrap();
+                let idx = st.next_sample_index;
+                st.next_sample_index = idx.wrapping_add(1);
+
+                // Gate publication on the chip's fusion warm-up. While
+                // `calib.gyr == 0` the quaternion is meaningless; we
+                // still increment the counter (so `sample_index` keeps
+                // advancing for diagnostics) but don't expose the
+                // sample to consumers.
+                if st.calib.gyr < MIN_GYR_CALIB {
+                    continue;
+                }
+
+                let sample = ImuSample {
+                    orientation: fusion.orientation,
+                    linear_accel: fusion.linear_accel,
+                    t_read,
+                    sample_index: idx,
+                };
                 st.latest = Some(sample);
                 if st.ring.len() == RING_CAPACITY {
                     st.ring.pop_front();
                 }
                 st.ring.push_back(sample);
-                // Bias estimator. Cheap to evaluate even when settled;
-                // keeping the match here (not behind an early-return)
-                // means a future `recalibrate_bias()` instantly resumes
-                // collection without coordinating with the sample loop.
-                if let BiasState::Collecting {
-                    started_at,
-                    sum_dps,
-                    n,
-                    aborted,
-                } = &mut st.bias
-                {
-                    let g = sample.raw.gyro_dps();
-                    if g.iter().any(|c| c.abs() > STATIONARY_DPS) {
-                        *aborted = true;
-                    } else {
-                        for k in 0..3 {
-                            sum_dps[k] += g[k];
-                        }
-                        *n += 1;
-                    }
-                    if started_at.elapsed() >= BIAS_WINDOW {
-                        if *aborted || *n == 0 {
-                            warn!(
-                                "imu: bias calibration aborted — motion detected \
-                                 during the {BIAS_WINDOW:?} stationary window; \
-                                 bias stays at zero (POST /api/imu/calibrate to retry)"
-                            );
-                            st.bias = BiasState::Failed;
-                        } else {
-                            let nf = *n as f32;
-                            let bias_dps = [sum_dps[0] / nf, sum_dps[1] / nf, sum_dps[2] / nf];
-                            info!(
-                                "imu: bias learned from {n} samples — \
-                                 [{:+.3} {:+.3} {:+.3}] dps",
-                                bias_dps[0], bias_dps[1], bias_dps[2]
-                            );
-                            st.bias = BiasState::Ready { bias_dps };
-                        }
-                    }
-                }
+            }
+            Ok(None) => {
+                // Chip hasn't produced its first fusion frame yet
+                // (post-bring-up, ~7 ms window). Skip silently — the
+                // next poll will land it.
+                last_read = Instant::now();
             }
             Err(e) => {
                 let mut st = state.lock().unwrap();
                 st.read_failures += 1;
                 drop(st);
-                warn!("imu: read_both failed: {e}");
-                // Don't tight-loop on a busted bus.
+                warn!("imu: read_fusion failed: {e}");
                 thread::sleep(SAMPLE_PERIOD);
                 last_read = Instant::now();
             }
@@ -347,23 +265,36 @@ fn sample_loop<B: I2cBus>(mut chip: Bmi160<B>, state: Arc<Mutex<State>>) {
         let elapsed = last_log.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let rate = samples_this_sec as f32 / elapsed.as_secs_f32();
-            let (latest, failures) = {
+            let (latest, failures, calib) = {
                 let mut st = state.lock().unwrap();
-                // EWMA so a one-off bus stall doesn't make the readout jumpy.
                 st.rate_hz = if st.rate_hz == 0.0 {
                     rate
                 } else {
                     0.2 * rate + 0.8 * st.rate_hz
                 };
-                (st.latest, st.read_failures)
+                (st.latest, st.read_failures, st.calib)
             };
             if let Some(s) = latest {
-                let g = s.raw.gyro_dps();
-                let a = s.raw.accel_mps2();
+                let (roll, pitch, yaw) = s.orientation.euler_angles();
+                let a = s.linear_accel;
                 info!(
-                    "imu: {rate:.0} Hz | gyro {:+6.1} {:+6.1} {:+6.1} dps | \
-                     accel {:+5.2} {:+5.2} {:+5.2} m/s² | failures {failures}",
-                    g[0], g[1], g[2], a[0], a[1], a[2],
+                    "imu: {rate:.0} Hz | yaw {:+6.1}° pitch {:+5.1}° roll {:+5.1}° | \
+                     lin_accel {:+5.2} {:+5.2} {:+5.2} m/s² | \
+                     cal sys/gyr/acc {}/{}/{} | failures {failures}",
+                    yaw.to_degrees(),
+                    pitch.to_degrees(),
+                    roll.to_degrees(),
+                    a[0],
+                    a[1],
+                    a[2],
+                    calib.sys,
+                    calib.gyr,
+                    calib.acc,
+                );
+            } else {
+                info!(
+                    "imu: {rate:.0} Hz | warming up (cal sys/gyr/acc {}/{}/{}) | failures {failures}",
+                    calib.sys, calib.gyr, calib.acc,
                 );
             }
             last_log = Instant::now();
@@ -377,15 +308,16 @@ fn sample_loop<B: I2cBus>(mut chip: Bmi160<B>, state: Arc<Mutex<State>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hal::bmi160::{CHIP_ID_BMI160, REG_CHIP_ID, REG_DATA_GYR, REG_SENSORTIME};
+    use crate::hal::bno055::{CHIP_ID_BNO055, REG_CALIB_STAT, REG_CHIP_ID, REG_QUA_DATA};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// Counter-driven mock: every burst read returns a small unique
-    /// sample so we can verify the polling thread actually pumps samples
-    /// into the ring (not just the same one repeatedly). Sensortime
-    /// counts up alongside the sample index.
+    /// Counter-driven mock: every burst returns the identity quaternion
+    /// plus a small linear-accel that ticks up with the counter, so the
+    /// polling thread is observably pumping data. Stocks `CALIB_STAT`
+    /// with `gyr = 3` so `latest()` is not gated.
     struct CounterBus {
         i: Arc<AtomicU32>,
+        calib_byte: u8,
     }
 
     impl I2cBus for CounterBus {
@@ -393,234 +325,120 @@ mod tests {
             Ok(())
         }
         fn read_byte(&mut self, reg: u8) -> crate::Result<u8> {
-            if reg == REG_CHIP_ID {
-                Ok(CHIP_ID_BMI160)
-            } else {
-                Ok(0)
+            match reg {
+                REG_CHIP_ID => Ok(CHIP_ID_BNO055),
+                REG_CALIB_STAT => Ok(self.calib_byte),
+                _ => Ok(0),
             }
         }
         fn read_block(&mut self, reg: u8, buf: &mut [u8]) -> crate::Result<()> {
-            if reg == REG_DATA_GYR && buf.len() == 12 {
+            for b in buf.iter_mut() {
+                *b = 0;
+            }
+            if reg == REG_QUA_DATA && buf.len() == 14 {
+                // Identity quaternion: w = 16384.
+                buf[0..2].copy_from_slice(&16384i16.to_le_bytes());
+                // linear-accel x ticks up with the counter so consecutive
+                // samples are distinguishable.
                 let n = self.i.fetch_add(1, Ordering::SeqCst) as i16;
-                // Gyro x = n, y = z = 0; accel z = n.
-                let gx = n.to_le_bytes();
-                buf[0..2].copy_from_slice(&gx);
-                for b in &mut buf[2..10] {
-                    *b = 0;
-                }
-                let az = n.to_le_bytes();
-                buf[10..12].copy_from_slice(&az);
-            } else if reg == REG_SENSORTIME && buf.len() == 3 {
-                let n = self.i.load(Ordering::SeqCst);
-                buf[0] = (n & 0xff) as u8;
-                buf[1] = ((n >> 8) & 0xff) as u8;
-                buf[2] = ((n >> 16) & 0xff) as u8;
-            } else {
-                for b in buf.iter_mut() {
-                    *b = 0;
-                }
+                buf[8..10].copy_from_slice(&n.to_le_bytes());
             }
             Ok(())
         }
     }
 
-    fn build_imu() -> (Imu, Arc<AtomicU32>) {
+    fn build_imu_calibrated() -> (Imu, Arc<AtomicU32>) {
         let i = Arc::new(AtomicU32::new(0));
-        let bus = CounterBus { i: i.clone() };
-        let chip = Bmi160::open(bus).expect("mock CHIP_ID is stocked");
+        // calib_byte = 0xC0 → sys=3, gyr=0, acc=0, mag=0 — gyr is the gate.
+        // We want gyr=3 → byte 0x30 (bits [5:4]=11).
+        let bus = CounterBus {
+            i: i.clone(),
+            calib_byte: 0x30,
+        };
+        let chip = Bno055::open(bus).expect("mock CHIP_ID is stocked");
         (Imu::spawn(chip), i)
     }
 
-    /// Run the thread for a short while and assert it produced multiple
-    /// distinct samples — i.e. the polling loop actually loops.
-    #[test]
-    fn polling_thread_produces_a_stream_of_samples() {
-        let (imu, _counter) = build_imu();
-        // 50 ms ≥ 5 ms target period × ~10 — plenty for several samples.
-        thread::sleep(Duration::from_millis(120));
-        let latest = imu.latest().expect("latest sample available after polling");
-        assert!(
-            latest.raw.gyro[0] >= 2,
-            "expected several distinct samples; got gyro[0] = {}",
-            latest.raw.gyro[0]
-        );
+    fn build_imu_warming_up() -> (Imu, Arc<AtomicU32>) {
+        let i = Arc::new(AtomicU32::new(0));
+        let bus = CounterBus {
+            i: i.clone(),
+            calib_byte: 0x00, // gyr=0 → warm-up gate closed
+        };
+        let chip = Bno055::open(bus).expect("mock CHIP_ID is stocked");
+        (Imu::spawn(chip), i)
     }
 
-    /// The frame-IMU sync invariant: a sample taken just *after* we
-    /// snapshot `Instant::now()` has `t_read > t_snap`. This is the
-    /// property Stage 4 relies on to bucket gyro samples into the
-    /// `[t_prev_frame, t_curr_frame]` interval.
+    /// Drives the loop for ~120 ms — enough for the 1 Hz calib re-read
+    /// to *not* fire (so the calib status the thread learned at startup
+    /// stays in effect) and for ~10 fusion polls to happen.
+    fn brief_warmup() {
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    #[test]
+    fn polling_thread_produces_a_stream_of_samples() {
+        let (imu, counter) = build_imu_calibrated();
+        brief_warmup();
+        let latest = imu.latest().expect("latest sample after polling");
+        // `sample_index` should be advancing. We can't assert an exact
+        // number (thread scheduling jitter), but ≥ 2 means we pumped
+        // more than one sample.
+        assert!(
+            latest.sample_index >= 2,
+            "sample_index = {}",
+            latest.sample_index
+        );
+        assert!(counter.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn latest_is_none_until_calibrated() {
+        let (imu, _) = build_imu_warming_up();
+        brief_warmup();
+        assert!(
+            imu.latest().is_none(),
+            "latest() should be None while gyr=0"
+        );
+        assert!(
+            imu.recent_since(Instant::now() - Duration::from_secs(1))
+                .is_empty()
+        );
+        // calib_status() still surfaces the raw byte for the WebUI badge.
+        let c = imu.calib_status();
+        assert_eq!(c.gyr, 0);
+    }
+
     #[test]
     fn imu_timestamps_are_on_the_host_monotonic_clock() {
-        let (imu, _counter) = build_imu();
+        let (imu, _) = build_imu_calibrated();
         thread::sleep(Duration::from_millis(40));
         let t_query = Instant::now();
         thread::sleep(Duration::from_millis(40));
         let after = imu.recent_since(t_query);
         assert!(
             !after.is_empty(),
-            "expected at least one sample after the query instant"
+            "expected samples after the query instant"
         );
-        // All returned samples must lie strictly after the query instant.
         for s in &after {
-            assert!(
-                s.t_read >= t_query,
-                "recent_since returned a sample older than the query instant"
-            );
+            assert!(s.t_read >= t_query);
         }
     }
 
-    /// `recent_since(now())` returns nothing (no samples after a fresh
-    /// query instant), confirming the time filter actually filters.
     #[test]
     fn recent_since_future_instant_is_empty() {
-        let (imu, _counter) = build_imu();
-        thread::sleep(Duration::from_millis(40));
+        let (imu, _) = build_imu_calibrated();
+        brief_warmup();
         let future = Instant::now() + Duration::from_secs(60);
         assert!(imu.recent_since(future).is_empty());
     }
 
-    /// At-rest bus that returns a constant non-zero gyro reading on
-    /// every burst — i.e. pure bias, no motion. The estimator must
-    /// converge to ≈ that value within one BIAS_WINDOW.
-    struct ConstantBiasBus {
-        gyro_raw: [i16; 3],
-    }
-
-    impl I2cBus for ConstantBiasBus {
-        fn write_byte(&mut self, _: u8, _: u8) -> crate::Result<()> {
-            Ok(())
-        }
-        fn read_byte(&mut self, reg: u8) -> crate::Result<u8> {
-            if reg == REG_CHIP_ID {
-                Ok(CHIP_ID_BMI160)
-            } else {
-                Ok(0)
-            }
-        }
-        fn read_block(&mut self, reg: u8, buf: &mut [u8]) -> crate::Result<()> {
-            for b in buf.iter_mut() {
-                *b = 0;
-            }
-            if reg == REG_DATA_GYR && buf.len() == 12 {
-                for (i, &raw) in self.gyro_raw.iter().enumerate() {
-                    buf[2 * i..2 * i + 2].copy_from_slice(&raw.to_le_bytes());
-                }
-            }
-            Ok(())
-        }
-    }
-
-    /// Bus that ramps gyro magnitude up over time so the bias window
-    /// sees clearly-non-stationary samples — the estimator must abort.
-    struct MovingBus {
-        i: Arc<AtomicU32>,
-    }
-
-    impl I2cBus for MovingBus {
-        fn write_byte(&mut self, _: u8, _: u8) -> crate::Result<()> {
-            Ok(())
-        }
-        fn read_byte(&mut self, reg: u8) -> crate::Result<u8> {
-            if reg == REG_CHIP_ID {
-                Ok(CHIP_ID_BMI160)
-            } else {
-                Ok(0)
-            }
-        }
-        fn read_block(&mut self, reg: u8, buf: &mut [u8]) -> crate::Result<()> {
-            for b in buf.iter_mut() {
-                *b = 0;
-            }
-            if reg == REG_DATA_GYR && buf.len() == 12 {
-                // raw of 10000 LSB → ~152 dps, well above STATIONARY_DPS.
-                let raw = 10_000i16.to_le_bytes();
-                buf[0..2].copy_from_slice(&raw);
-                self.i.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(())
-        }
-    }
-
-    /// Wait for the bias FSM to settle (Ready or Failed). Fails the test
-    /// if the window doesn't close within 2× BIAS_WINDOW + a generous
-    /// slack — that would indicate the estimator state machine is stuck.
-    fn wait_for_bias_settled(imu: &Imu) {
-        let deadline = Instant::now() + Duration::from_millis(2500);
-        while Instant::now() < deadline {
-            if imu.bias_settled() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("bias estimator never settled");
-    }
-
     #[test]
-    fn auto_bias_converges_to_constant_offset_when_stationary() {
-        // 200 LSB ≈ 200 · 500/32768 ≈ 3.05 dps. Above the chip's noise
-        // floor, well below STATIONARY_DPS (2.0) so... wait, that's
-        // above it. Use a smaller value so the gate passes.
-        // 50 LSB ≈ 0.76 dps, comfortably under STATIONARY_DPS.
-        let bus = ConstantBiasBus {
-            gyro_raw: [50, -30, 20],
-        };
-        let chip = Bmi160::open(bus).unwrap();
-        let imu = Imu::spawn(chip);
-        wait_for_bias_settled(&imu);
-        let bias = imu.gyro_bias_dps();
-        // `RawSample::gyro_dps` returns chassis-frame values with `gyro_z`
-        // negated (this board's BMI160 has Z polarity opposite of the
-        // right-hand-rule convention everything downstream assumes — see
-        // the comment on `gyro_dps`). The bias collector averages those
-        // chassis-frame values, so the Z expectation negates too.
-        let expected = [
-            50.0 * (500.0 / 32768.0),
-            -30.0 * (500.0 / 32768.0),
-            -20.0 * (500.0 / 32768.0),
-        ];
-        // Tolerate ~5% — the estimator averages over a finite window
-        // and the constant gyro reading is exact, but timing jitter in
-        // the wait may include a partial first sample.
-        for k in 0..3 {
-            assert!(
-                (bias[k] - expected[k]).abs() < 0.05,
-                "axis {k}: bias {} vs expected {}",
-                bias[k],
-                expected[k]
-            );
-        }
-    }
-
-    #[test]
-    fn auto_bias_aborts_when_chassis_moves() {
-        let i = Arc::new(AtomicU32::new(0));
-        let bus = MovingBus { i: i.clone() };
-        let chip = Bmi160::open(bus).unwrap();
-        let imu = Imu::spawn(chip);
-        wait_for_bias_settled(&imu);
-        // Failed state surfaces as zero bias — same as Collecting — so
-        // we can't distinguish via gyro_bias_dps() alone. The settled
-        // check is the load-bearing assertion: the FSM transitioned out
-        // of Collecting (and to Failed since samples were non-stationary).
-        assert_eq!(imu.gyro_bias_dps(), [0.0; 3]);
-        // Sanity: the polling thread really did keep producing samples.
-        assert!(i.load(Ordering::SeqCst) > 10);
-    }
-
-    #[test]
-    fn recalibrate_resets_a_failed_window() {
-        let i = Arc::new(AtomicU32::new(0));
-        let bus = MovingBus { i: i.clone() };
-        let chip = Bmi160::open(bus).unwrap();
-        let imu = Imu::spawn(chip);
-        wait_for_bias_settled(&imu); // → Failed
-        imu.recalibrate_bias();
-        // After recalibrate the FSM is back to Collecting, so
-        // bias_settled() should be false immediately.
-        assert!(
-            !imu.bias_settled(),
-            "recalibrate should put the FSM back into Collecting"
-        );
+    fn calib_status_surfaces_to_consumers() {
+        let (imu, _) = build_imu_calibrated();
+        brief_warmup();
+        let c = imu.calib_status();
+        assert_eq!(c.gyr, 3, "calibrated mock should report gyr=3");
+        assert_eq!(c.mag, 0, "IMUPLUS leaves mag at 0");
     }
 }

@@ -43,65 +43,50 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use log::{info, warn};
-use nalgebra::{Matrix3, UnitQuaternion, Vector3};
+use nalgebra::{Quaternion, UnitQuaternion};
 
 use crate::camera::Camera;
 use crate::imu::{Imu, ImuSample};
 use detect::{N_LEVELS, ms};
-use ginger_slam_core::lie::so3_exp;
 use image::gray_from_yuyv;
 
-/// Camera-frame ΔR predicted from a stream of IMU samples bracketing
-/// `(t_prev_capture, t_curr_capture]`, with the learned gyro bias
-/// subtracted per sample. Returns `None` if there aren't enough samples
-/// in the interval to be meaningful (chip just booted, the polling
-/// thread stalled, the camera frame is older than the ring window).
+/// Compute ΔR = `q_curr * q_prev⁻¹` from two BNO055 fusion samples,
+/// promoted to `f64` for the frontend's downstream math.
 ///
-/// **Extrinsic.** We default to `R_camera_imu = I` — see PLAN.md Stage 3
-/// for the gravity-vector argument (chip is Z-up, gyro_z = yaw, which is
-/// the dominant rotational DOF for an indoor robot). If validation shows
-/// the predict rotates the wrong axis, override here.
-///
-/// The integration is forward-Euler in SO(3): for each sample i we apply
-/// `ΔR_i = exp([(ω_i - bias) · dt_i]_×)` and compose right-to-left
-/// (`R_total = ΔR_n · ... · ΔR_1`), so the result is the rotation that
-/// takes the *body frame at t_prev_capture* to the *body frame at
-/// t_curr_capture*. `dt_i` is the gap from sample i to the next sample
-/// (or to `t_curr_capture` for the last sample). The mean-rate trapezoid
-/// would be marginally more accurate over a 33 ms interval, but at the
-/// chip's noise floor it doesn't matter and the trapezoid version
-/// requires sample i+1, which complicates the boundary.
-fn gyro_pre_integrate(
-    samples: &[ImuSample],
-    bias_dps: [f32; 3],
-    t_curr_capture: Instant,
-) -> Option<UnitQuaternion<f64>> {
-    if samples.len() < 2 {
+/// Returns `None` if the two samples are the same fusion frame (chip
+/// hasn't refreshed since the previous camera frame — predict gains
+/// nothing). Sign and frame conventions follow the chip: the orientation
+/// is in the BNO055 body frame relative to its boot pose; we default to
+/// `R_camera_imu = I` (camera and chip Z-axes both ≈ chassis-vertical).
+/// If validation shows the predict rotates the wrong axis, apply a
+/// fixed `ROT_CHIP_TO_CAMERA` rotation either here or in the driver.
+fn delta_rotation(prev: &ImuSample, curr: &ImuSample) -> Option<UnitQuaternion<f64>> {
+    if prev.sample_index == curr.sample_index {
         return None;
     }
-    let to_rad = std::f64::consts::PI / 180.0;
-    let mut r = Matrix3::<f64>::identity();
-    for i in 0..samples.len() {
-        let s = samples[i];
-        let next_t = if i + 1 < samples.len() {
-            samples[i + 1].t_read
-        } else {
-            t_curr_capture
-        };
-        let dt = next_t.saturating_duration_since(s.t_read).as_secs_f64();
-        if dt <= 0.0 {
-            continue;
-        }
-        let g = s.raw.gyro_dps();
-        let omega = Vector3::new(
-            (g[0] - bias_dps[0]) as f64 * to_rad,
-            (g[1] - bias_dps[1]) as f64 * to_rad,
-            (g[2] - bias_dps[2]) as f64 * to_rad,
-        );
-        let dr = so3_exp(&(omega * dt));
-        r = dr * r;
-    }
-    Some(UnitQuaternion::from_matrix(&r))
+    let to_f64 = |q: UnitQuaternion<f32>| {
+        let q = q.into_inner();
+        UnitQuaternion::new_unchecked(Quaternion::new(
+            q.w as f64, q.i as f64, q.j as f64, q.k as f64,
+        ))
+    };
+    Some(to_f64(curr.orientation) * to_f64(prev.orientation).inverse())
+}
+
+/// Camera-frame ΔR predicted from the BNO055's fusion engine over
+/// `(t_prev_capture, t_curr_capture]`. Pulls the chip's best orientation
+/// estimate at-or-before each camera capture instant and returns their
+/// quaternion delta. Returns `None` if either endpoint has no orientation
+/// (chip still warming up, or the camera frame is older than the IMU
+/// ring window).
+fn rotation_between(
+    imu: &Imu,
+    t_prev_capture: Instant,
+    t_curr_capture: Instant,
+) -> Option<UnitQuaternion<f64>> {
+    let prev = imu.latest_before(t_prev_capture)?;
+    let curr = imu.latest_before(t_curr_capture)?;
+    delta_rotation(&prev, &curr)
 }
 
 // ── Frontend thread ───────────────────────────────────────────────────────────
@@ -172,12 +157,12 @@ pub fn run(
         // if fewer than two samples landed in the interval (chip
         // starting up, polling stall). On `None` `on_frame` falls back
         // to CV — same code path as `GINGER_IMU_PREDICT=0`.
+        // IMU pre-integration replaced by the BNO055's fusion: read
+        // the chip's orientation at-or-before each camera capture and
+        // take the quaternion delta. No software integration, no bias
+        // tracking — the chip's IMUPLUS engine does both internally.
         let rotation_hint = match (&imu_for_predict, prev_capture) {
-            (Some(im), Some(t_prev)) => {
-                let bias = im.gyro_bias_dps();
-                let samples = im.recent_since(t_prev);
-                gyro_pre_integrate(&samples, bias, frame.t_capture)
-            }
+            (Some(im), Some(t_prev)) => rotation_between(im, t_prev, frame.t_capture),
             _ => None,
         };
         prev_capture = Some(frame.t_capture);
@@ -247,105 +232,57 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hal::bmi160::RawSample;
+    use nalgebra::{UnitQuaternion, Vector3};
     use std::time::Duration;
 
-    /// Build a synthetic stream of N IMU samples spanning `duration`,
-    /// each carrying a constant raw gyro `[gx,gy,gz]` in LSB. The
-    /// timestamps are evenly spaced; the test consumer treats them
-    /// exactly like a real stream from the polling thread.
-    fn synth_stream(n: usize, duration: Duration, gyro_raw: [i16; 3]) -> Vec<ImuSample> {
-        let t0 = Instant::now();
-        let step = duration / (n as u32);
-        (0..n)
-            .map(|i| ImuSample {
-                raw: RawSample {
-                    gyro: gyro_raw,
-                    accel: [0, 0, 0],
-                },
-                t_read: t0 + step * (i as u32),
-                sensortime: i as u32,
-            })
-            .collect()
+    fn sample(orientation: UnitQuaternion<f32>, index: u32) -> ImuSample {
+        ImuSample {
+            orientation,
+            linear_accel: [0.0; 3],
+            t_read: Instant::now() + Duration::from_millis(index as u64 * 10),
+            sample_index: index,
+        }
     }
 
-    /// A constant 90 dps stream integrated for 1 s should yield a
-    /// rotation of ~90° about the same axis as the gyro vector. Using
-    /// 90 LSB → 90 · 500/32768 ≈ 1.37 dps, but stay calibration-clean
-    /// by picking 5898 LSB → 90 dps exactly.
-    ///
-    /// Note: `RawSample::gyro_dps` negates `gyro_z` (chassis-frame
-    /// convention — see its doc comment). So a *raw* +5898 LSB on Z
-    /// becomes −90 dps in chassis frame; integrating for 1 s yields a
-    /// rotation about **−Z** by π/2.
+    /// Two orientation snapshots — identity and a 90° rotation about
+    /// chip-Z — should produce a delta whose yaw component is +π/2.
+    /// This is the BNO055 fusion replacement for the old gyro-integration
+    /// path: no integration, no bias, just `q_curr * q_prev⁻¹`.
     #[test]
-    fn integrates_90deg_spin_about_z_to_pi_over_two() {
-        let raw = (90.0 / (500.0 / 32768.0)) as i16;
-        let dur = Duration::from_millis(1000);
-        // Span the samples slightly past the "current" capture so the
-        // last `dt` is exact: synth stream ends at t0+dur−step; we pass
-        // t_curr_capture = t0+dur so the last gap closes the interval.
-        let samples = synth_stream(200, dur, [0, 0, raw]);
-        // Pick t_curr_capture deterministically from the synthetic stream.
-        let t_curr = samples.last().unwrap().t_read + (dur / 200);
-        let dr = gyro_pre_integrate(&samples, [0.0; 3], t_curr)
-            .expect("integrator returns Some on a populated stream");
-        let aa = dr.axis_angle().expect("non-identity rotation has an axis");
-        let (axis, angle) = aa;
-        // Axis should be near [0,0,-1] (sign flipped by chassis-frame
-        // gyro_z negation).
+    fn delta_rotation_recovers_90deg_yaw_between_snapshots() {
+        let q_prev = UnitQuaternion::identity();
+        let q_curr =
+            UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f32::consts::FRAC_PI_2);
+        let dr = delta_rotation(&sample(q_prev, 0), &sample(q_curr, 1))
+            .expect("distinct sample indices return Some");
+        let (_, _, yaw) = dr.euler_angles();
         assert!(
-            (axis.z + 1.0).abs() < 1e-3,
-            "expected -Z axis (chassis-frame), got {axis:?}"
+            (yaw - std::f64::consts::FRAC_PI_2).abs() < 1e-6,
+            "yaw = {yaw} (expected π/2)"
         );
-        // Angle should be ~π/2 with ~1% tolerance (forward-Euler).
-        let expected = std::f64::consts::FRAC_PI_2;
-        let err = (angle - expected).abs();
+        // Axis should be near +Z.
+        let (axis, _) = dr.axis_angle().expect("non-identity rotation has an axis");
+        assert!(axis.z > 0.999, "expected +Z axis, got {axis:?}");
+    }
+
+    /// Identical orientations from two distinct fusion frames produce
+    /// an (approximately) identity ΔR — no rotation between them.
+    #[test]
+    fn delta_rotation_identity_when_orientations_match() {
+        let q = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 0.3);
+        let dr = delta_rotation(&sample(q, 0), &sample(q, 1)).unwrap();
         assert!(
-            err < expected * 0.01,
-            "expected {expected} rad, got {angle} (err {err})"
+            dr.angle() < 1e-6,
+            "expected identity, got angle {}",
+            dr.angle()
         );
     }
 
-    /// Bias subtraction: the same constant raw stream integrated with
-    /// that same constant as bias should yield identity (no rotation).
-    /// Z bias is *negated* in the input because `RawSample::gyro_dps`
-    /// negates `gyro_z` for chassis-frame convention — the bias array
-    /// must match the chassis-frame stream the integrator actually sees.
+    /// Same fusion-frame index returns None so the frontend falls back
+    /// to CV — this is the "chip hasn't refreshed" / polling stall guard.
     #[test]
-    fn bias_subtraction_zeros_a_pure_bias_stream() {
-        // Derive `bias` from the LSB stream so quantization doesn't
-        // smuggle in a residual (raw stored as i16 truncates).
-        let raw_dps = 1.5_f32;
-        let raw_lsb = (raw_dps / (500.0 / 32768.0)) as i16;
-        let actual_dps = raw_lsb as f32 * (500.0 / 32768.0);
-        let dur = Duration::from_millis(1000);
-        let samples = synth_stream(200, dur, [raw_lsb, raw_lsb, raw_lsb]);
-        let t_curr = samples.last().unwrap().t_read + (dur / 200);
-        let dr = gyro_pre_integrate(&samples, [actual_dps, actual_dps, -actual_dps], t_curr)
-            .expect("Some on a populated stream");
-        let angle = dr.angle();
-        assert!(
-            angle < 1e-6,
-            "exactly-cancelled stream should integrate to identity; got angle {angle}"
-        );
-    }
-
-    /// Sparse stream (< 2 samples) returns None so the frontend falls
-    /// back to CV — this is the "first frame after boot" / "polling
-    /// stalled" guard the predict policy relies on.
-    #[test]
-    fn empty_or_singleton_stream_returns_none() {
-        let t0 = Instant::now();
-        assert!(gyro_pre_integrate(&[], [0.0; 3], t0).is_none());
-        let one = ImuSample {
-            raw: RawSample {
-                gyro: [1000, 0, 0],
-                accel: [0, 0, 0],
-            },
-            t_read: t0,
-            sensortime: 0,
-        };
-        assert!(gyro_pre_integrate(&[one], [0.0; 3], t0 + Duration::from_millis(33)).is_none());
+    fn same_sample_index_returns_none() {
+        let q = UnitQuaternion::identity();
+        assert!(delta_rotation(&sample(q, 7), &sample(q, 7)).is_none());
     }
 }

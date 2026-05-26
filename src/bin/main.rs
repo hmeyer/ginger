@@ -75,17 +75,22 @@ async fn main() {
     let camera = Arc::new(Camera::new().expect("camera init failed"));
     println!("Camera ready.");
 
-    // Best-effort: a missing/flaky BMI160 must not stop the rest of the
-    // robot booting. The SLAM tracking-predict (Stage 4) treats the IMU
-    // as an enrichment; when absent it falls back to constant-velocity.
+    // Best-effort: a missing/flaky BNO055 must not stop the rest of the
+    // robot booting. The SLAM tracking-predict treats the IMU as an
+    // enrichment; when absent it falls back to constant-velocity. The
+    // motion-pose and motion-labels workers refuse to spawn without an
+    // IMU on this hardware — there's no fallback ω/θ source.
     let imu = match Imu::open(imu::DEFAULT_ADDR) {
         Ok(i) => {
-            info!("imu: BMI160 opened at 0x{:02x}", imu::DEFAULT_ADDR);
+            info!(
+                "imu: BNO055 opened at 0x{:02x} (IMUPLUS 6-DoF fusion)",
+                imu::DEFAULT_ADDR
+            );
             Some(Arc::new(i))
         }
         Err(e) => {
             warn!(
-                "imu: BMI160 not available at 0x{:02x} ({e}); \
+                "imu: BNO055 not available at 0x{:02x} ({e}); \
                  /api/imu/sample will return 503",
                 imu::DEFAULT_ADDR
             );
