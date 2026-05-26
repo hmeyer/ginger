@@ -1,41 +1,58 @@
-//! Inverse motor-driver model: maps desired motion + chassis state to
-//! the `(pwm_l, pwm_r)` command that should produce it.
+//! Forward motor model: predicts the motion that results from a PWM
+//! command + chassis state over a fixed 200 ms label window.
 //!
-//! ## Why inverse?
+//! ## Why forward, not inverse?
 //!
-//! The controller (PLAN Stage 4) and the WebUI joystick both want to
-//! think in motion units ("drive at 0.4 m/s, ω = 0.3 rad/s"), not raw
-//! PWM. The model translates: input = desired `(v_target, ω_target)`
-//! plus the chassis's last state, output = `(pwm_l, pwm_r)`. At
-//! training time the *measured* motion from gyro / ultrasonic is fed
-//! in as the "desired" — the model learns "to produce this observed
-//! motion, the actual PWM that did it was X."
+//! The previous inverse model (`(v_target, ω_target) → (pwm_l, pwm_r)`)
+//! had a self-reinforcing feedback loop: at training time, labels paired
+//! each observed PWM with its measured motion as the input target; but
+//! at inference time, the model's own (possibly bad) predictions were
+//! what got sent to the motors, so it trained against its own output
+//! distribution. Once the model's predicted PWMs collapsed below the
+//! motor deadband, the chassis stopped moving, every fresh label became
+//! `(tiny pwms, no motion)`, and the loop locked the model into "output
+//! ~0 for every target." The session that drove this rewrite watched
+//! that exact collapse happen within ~30 s of live joystick driving.
+//!
+//! The forward direction has no such loop. Labels pair PWMs *that were
+//! actually sent* with the motion the BNO055 *actually measured*. Both
+//! sides are ground truth, observed independently of the model. The
+//! driving path is now a pure-math arcade-drive mapping (see
+//! [`crate::motion::arcade_drive`]); the forward model is read out for
+//! diagnostics, the explore controller's planning, and pose-integrator
+//! gain checks — but never on the critical drive path.
 //!
 //! ## Architecture
 //!
 //! A 7 → 16 → 16 → 2 fully-connected MLP, tanh on hidden layers, linear
-//! output, ~430 parameters total. Inputs normalised to roughly `[-1, 1]`
-//! before the network; outputs scaled back to physical PWM and clamped
-//! to `[-MAX_DUTY, MAX_DUTY]` on the way out.
+//! output. ~430 parameters total.
 //!
-//! Trained online via Adam-lite SGD (no bias correction) with MSE on
-//! PWM output plus L2 regularisation on the predicted PWMs. The L2 term
-//! is the **deadband-ambiguity resolver**: when multiple training PWMs
-//! produced the same observed motion, λ pulls the prediction toward the
-//! smallest-norm command — the canonical zero-energy answer.
+//! Inputs:
+//! * `pwm_l, pwm_r` — commanded PWMs (current window).
+//! * `pwm_l_prev, pwm_r_prev` — previous-window PWMs (captures inertia
+//!   and Δcommand effects).
+//! * `v_prev, ω_prev` — best estimate of previous-window motion.
+//! * `battery_v` — voltage now (lets the model learn voltage droop).
+//!
+//! Outputs (one fixed window, [`WINDOW_S`] = 0.2 s):
+//! * `Δs_m` — forward displacement in robot frame (m).
+//! * `Δθ_rad` — rotation about chassis-vertical (rad). The chassis is
+//!   left-right symmetric so labels are mirrored during training (see
+//!   [`mirror_sample`]).
+//!
+//! Trained online via Adam-lite SGD with MSE loss. The Δθ channel is
+//! always labelled (BNO055 quaternion delta); the Δs channel is missing
+//! whenever the ultrasonic Δd/Δt didn't yield a real measurement (most
+//! windows in an open room), and its loss is then zeroed — see
+//! [`LabelledSample::ds_obs_m`].
 //!
 //! ## Persistence
 //!
-//! `motor-model.toml` at the repo root, gitignored (machine-local
-//! runtime state, **not** committed). The loader runs a battery-voltage
-//! staleness check: if the saved-at voltage is more than
-//! [`BATTERY_STALE_THRESHOLD_V`] away from the live reading, the file
-//! is rejected and we re-bootstrap from the synthetic warm-up. Cheap
-//! insurance against the model file outliving its calibration regime.
-//!
-//! The Adam state (first / second moment vectors) is intentionally
-//! **not** persisted — Adam recovers fast and an out-of-date moment
-//! could mislead the first few steps after a reload.
+//! `motor-model.toml` at the repo root, gitignored (machine-local). The
+//! battery-voltage staleness gate is preserved from the prior design.
+//! [`SCHEMA_VERSION`] bumped to **2** — the file shape is incompatible
+//! with the inverse-model schema; on load the gate triggers a fresh
+//! bootstrap if an older file is encountered.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -54,109 +71,101 @@ pub const INPUT_DIM: usize = 7;
 pub const HIDDEN_1: usize = 16;
 pub const HIDDEN_2: usize = 16;
 pub const OUTPUT_DIM: usize = 2;
-pub const SCHEMA_VERSION: u32 = 1;
+/// Bumped from 1: the on-disk shape (input/output semantics, scale
+/// constants) is incompatible with the inverse-model schema.
+pub const SCHEMA_VERSION: u32 = 2;
 
-// Normalizer defaults (also persisted, so changing these later doesn't
-// break older files — the file's own values are used at load time).
+/// Label-window duration. Fixed across the worker, the bootstrap, and
+/// the model output's interpretation: the predicted (`Δs_m`, `Δθ_rad`)
+/// is the motion across exactly this much wall time.
+pub const WINDOW_S: f32 = 0.2;
+
+// Normalizer defaults. The forward output channels need their own
+// scales — chosen so a "full pulse" lands roughly at ±1 in normalised
+// space, which keeps the tanh-hidden network in its linear regime.
 const NORM_PWM_SCALE: f32 = MAX_DUTY as f32; // 4095
-const NORM_V_SCALE: f32 = 1.0; // m/s — a reasonable indoor max
+const NORM_V_SCALE: f32 = 1.0; // m/s — reasonable indoor max
 const NORM_OMEGA_SCALE: f32 = 2.0; // rad/s
 const NORM_BATT_MEAN: f32 = 7.8; // V — middle of a 2S LiPo's useful range
 const NORM_BATT_SCALE: f32 = 0.6; // V — half-span
+/// Max forward displacement per [`WINDOW_S`]: ~1 m/s × 0.2 s = 0.2 m.
+const NORM_DS_SCALE: f32 = 0.2;
+/// Max rotation per [`WINDOW_S`]: ~2 rad/s × 0.2 s = 0.4 rad.
+const NORM_DTHETA_SCALE: f32 = 0.4;
 
-// Optimizer (Adam-lite — no bias correction; one extra vector per param).
+// Optimiser (Adam-lite, no bias correction).
 const ADAM_LR: f32 = 1e-3;
 const ADAM_BETA1: f32 = 0.9;
 const ADAM_BETA2: f32 = 0.99;
 const ADAM_EPS: f32 = 1e-8;
 
-// Regularisation.
-//
-// `L2_LAMBDA` is the deadband-ambiguity resolver — see module docs. It
-// acts on the *normalised* PWM output (roughly `[-1, 1]`), so a value
-// of `1e-4` is a gentle pull toward zero, not a hard constraint.
-const L2_LAMBDA: f32 = 1e-4;
-
-// When the labelled window had no ultrasonic Δd/Δt (so `v_target` was
-// filled with the commanded value rather than a real measurement), the
-// v dimension of the input is noisy — weight the sample less so the
-// gradient doesn't commit hard to it. ω is still good (gyro is always
-// present).
-const V_MISSING_WEIGHT: f32 = 0.3;
-
 // Bootstrap.
-//
-// On first boot (no `motor-model.toml`), we generate `BOOTSTRAP_SAMPLES`
-// synthetic samples from a hand-coded forward prior, then *invert* each
-// one for training: feed the predicted motion as the target and the
-// originating PWM as the regression label. That gives the model a
-// sensible starting point in `~10 ms`.
-const BOOTSTRAP_SEED: u64 = 0x00C0_FFEE_0000_0001;
+const BOOTSTRAP_SEED: u64 = 0x00C0_FFEE_0000_0002;
 const BOOTSTRAP_SAMPLES: usize = 2000;
 const BOOTSTRAP_STEPS: usize = 2000;
 
-// Battery staleness gate — see module docs.
+// Battery staleness gate.
 pub const BATTERY_STALE_THRESHOLD_V: f32 = 0.3;
 
 // Running-residual EWMA factor (per-sample). 0.02 → ~50-sample horizon.
 const RESIDUAL_ALPHA: f32 = 0.02;
 
+/// Loss weight applied to the Δs channel when no ultrasonic v_meas was
+/// available for the window. The Δθ channel is always trusted.
+const DS_MISSING_WEIGHT: f32 = 0.0;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// Inputs to the model. All values are in physical / SI units; the
-/// model handles normalisation internally.
+/// Inputs to the forward model. All in physical / SI units; the
+/// normaliser handles scaling internally.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInput {
-    /// Last commanded left/right PWM (PCA9685 duty units in
-    /// `[-MAX_DUTY, MAX_DUTY]`). Captures inertia and Δcommand effects.
-    pub pwm_l_prev: i32,
-    pub pwm_r_prev: i32,
-    /// Best estimate of the chassis's previous forward velocity (m/s).
-    /// Per PLAN: ultrasonic-measured if the previous window had a valid
-    /// Δd/Δt label, else the previous `v_target` (closed-loop fallback).
-    pub v_prev: f32,
-    /// Previous angular velocity (rad/s) from gyro. Always available.
-    pub omega_prev: f32,
-    /// Battery voltage at this tick (V). Lets the model learn voltage
-    /// droop without a separate forgetting-factor mechanism.
-    pub battery_v: f32,
-    /// Desired forward velocity (m/s).
-    pub v_target: f32,
-    /// Desired angular velocity (rad/s).
-    pub omega_target: f32,
-}
-
-/// Model output. Physical PCA9685 duty, clamped to `[-MAX_DUTY, MAX_DUTY]`.
-#[derive(Debug, Clone, Copy)]
-pub struct PwmCommand {
+    /// Current-window commanded PWMs (PCA9685 duty in
+    /// `[-MAX_DUTY, MAX_DUTY]`). Positive = forward on this chassis.
     pub pwm_l: i32,
     pub pwm_r: i32,
+    /// Previous-window PWMs. Captures inertia and Δcommand effects —
+    /// the chassis decelerates differently from a fresh-from-zero pulse.
+    pub pwm_l_prev: i32,
+    pub pwm_r_prev: i32,
+    /// Best estimate of the previous-window forward velocity (m/s).
+    /// Ultrasonic-derived when the prior window had a valid Δd/Δt, else
+    /// the previous prediction's `Δs_m / WINDOW_S` (closed-loop estimate).
+    pub v_prev: f32,
+    /// Previous-window angular velocity (rad/s), from BNO055 fusion.
+    pub omega_prev: f32,
+    /// Battery voltage at this tick (V). Lets the model learn voltage
+    /// droop directly.
+    pub battery_v: f32,
 }
 
-/// One training window assembled by Stage 2 (`src/motion/labels.rs`).
+/// Model output. The motion the chassis is expected to make over the
+/// next [`WINDOW_S`] seconds, in the robot frame at the window's start.
+#[derive(Debug, Clone, Copy)]
+pub struct MotionPrediction {
+    pub ds_m: f32,
+    pub dtheta_rad: f32,
+}
+
+/// One training window assembled by `src/motion/labels.rs`.
 ///
-/// Construction recipe (the trick that makes inverse training work):
-///
-/// 1. Observe what PWM was commanded over the window (`pwm_*_obs`).
-/// 2. Measure what happened — `omega_meas` from gyro, optionally
-///    `v_meas` from ultrasonic Δd/Δt.
-/// 3. Build [`ModelInput`] with the *measured* motion as the target:
-///    `omega_target = omega_meas`, `v_target = v_meas.unwrap_or(<commanded v>)`.
-/// 4. Set `v_label_present = v_meas.is_some()`.
+/// * `pwm_l/r_obs` — the actual PWMs commanded during the window
+///   (mirrors `ModelInput::pwm_l/r` of the same sample).
+/// * `ds_obs_m` — measured forward displacement, **only when** the
+///   ultrasonic Δd/Δt window passed the straight + monotonic + in-range
+///   gate. `None` otherwise — the Δs loss is then zeroed (gated by
+///   [`DS_MISSING_WEIGHT`]) and only Δθ is trained.
+/// * `dtheta_obs_rad` — always populated from the BNO055 fusion quaternion
+///   delta across the window.
 #[derive(Debug, Clone, Copy)]
 pub struct LabelledSample {
     pub input: ModelInput,
-    pub pwm_l_obs: i32,
-    pub pwm_r_obs: i32,
-    /// `false` ⇒ the `v_target` field was filled from the commanded
-    /// value, not a real ultrasonic measurement. The optimiser
-    /// down-weights such samples ([`V_MISSING_WEIGHT`]) because the
-    /// v-direction of the input is then less trustworthy.
-    pub v_label_present: bool,
+    pub ds_obs_m: Option<f32>,
+    pub dtheta_obs_rad: f32,
     pub dt_s: f32,
 }
 
-// ── Normalizer ────────────────────────────────────────────────────────────────
+// ── Normaliser ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Normalizer {
@@ -165,6 +174,8 @@ struct Normalizer {
     omega_scale: f32,
     battery_mean: f32,
     battery_scale: f32,
+    ds_scale: f32,
+    dtheta_scale: f32,
 }
 
 impl Default for Normalizer {
@@ -175,6 +186,8 @@ impl Default for Normalizer {
             omega_scale: NORM_OMEGA_SCALE,
             battery_mean: NORM_BATT_MEAN,
             battery_scale: NORM_BATT_SCALE,
+            ds_scale: NORM_DS_SCALE,
+            dtheta_scale: NORM_DTHETA_SCALE,
         }
     }
 }
@@ -182,49 +195,42 @@ impl Default for Normalizer {
 impl Normalizer {
     fn encode(&self, x: &ModelInput) -> [f32; INPUT_DIM] {
         [
+            x.pwm_l as f32 / self.pwm_scale,
+            x.pwm_r as f32 / self.pwm_scale,
             x.pwm_l_prev as f32 / self.pwm_scale,
             x.pwm_r_prev as f32 / self.pwm_scale,
             x.v_prev / self.v_scale,
             x.omega_prev / self.omega_scale,
             (x.battery_v - self.battery_mean) / self.battery_scale,
-            x.v_target / self.v_scale,
-            x.omega_target / self.omega_scale,
         ]
     }
 
-    /// Maps the network's normalised output `y ∈ ℝ²` back to physical
-    /// PCA9685 duty, clamped to `[-MAX_DUTY, MAX_DUTY]`.
-    fn decode_pwm(&self, y: [f32; OUTPUT_DIM]) -> PwmCommand {
-        let pwm_l = (y[0] * self.pwm_scale).round() as i32;
-        let pwm_r = (y[1] * self.pwm_scale).round() as i32;
-        let max = MAX_DUTY as i32;
-        PwmCommand {
-            pwm_l: pwm_l.clamp(-max, max),
-            pwm_r: pwm_r.clamp(-max, max),
+    fn decode_motion(&self, y: [f32; OUTPUT_DIM]) -> MotionPrediction {
+        MotionPrediction {
+            ds_m: y[0] * self.ds_scale,
+            dtheta_rad: y[1] * self.dtheta_scale,
         }
     }
 
-    /// Encode a *target* PWM (in physical units) into normalised space
-    /// for use as a training target. Saturates inputs that fall outside
-    /// `[-pwm_scale, pwm_scale]` to keep loss gradients sane.
-    fn encode_pwm(&self, pwm_l: i32, pwm_r: i32) -> [f32; OUTPUT_DIM] {
-        let s = self.pwm_scale;
+    /// Encode a measured `(Δs, Δθ)` label into normalised target space.
+    /// Saturates inputs that fall outside `[-scale, +scale]` to keep
+    /// loss gradients sane.
+    fn encode_motion(&self, ds_m: f32, dtheta_rad: f32) -> [f32; OUTPUT_DIM] {
         [
-            (pwm_l as f32 / s).clamp(-1.0, 1.0),
-            (pwm_r as f32 / s).clamp(-1.0, 1.0),
+            (ds_m / self.ds_scale).clamp(-1.0, 1.0),
+            (dtheta_rad / self.dtheta_scale).clamp(-1.0, 1.0),
         ]
     }
 }
 
 // ── Layer ────────────────────────────────────────────────────────────────────
 
-/// A single fully-connected layer with its Adam state. Adam moments
-/// are not persisted (`#[serde(skip)]`); they reinitialise to zero on
-/// load and re-warm in a few SGD steps.
+/// A single fully-connected layer with its Adam state. Adam moments are
+/// not persisted (`#[serde(skip)]`); they reinitialise to zero on load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Layer {
-    weights: Vec<Vec<f32>>, // [out][in]
-    bias: Vec<f32>,         // [out]
+    weights: Vec<Vec<f32>>,
+    bias: Vec<f32>,
     #[serde(skip)]
     w_m: Vec<Vec<f32>>,
     #[serde(skip)]
@@ -237,7 +243,6 @@ struct Layer {
 
 impl Layer {
     fn new(in_dim: usize, out_dim: usize, rng: &mut SmallRng) -> Self {
-        // Xavier / Glorot for tanh: U(-bound, +bound), bound = √(6/(fan_in+fan_out)).
         let bound = (6.0 / (in_dim + out_dim) as f32).sqrt();
         let weights: Vec<Vec<f32>> = (0..out_dim)
             .map(|_| {
@@ -256,9 +261,6 @@ impl Layer {
         }
     }
 
-    /// Reinitialise Adam state to match the (possibly just-loaded)
-    /// weight shape. Called after deserialisation since Adam moments
-    /// aren't persisted.
     fn reset_adam_state(&mut self) {
         let out_dim = self.weights.len();
         let in_dim = self.weights.first().map(|r| r.len()).unwrap_or(0);
@@ -268,8 +270,6 @@ impl Layer {
         self.b_v = vec![0.0; out_dim];
     }
 
-    /// Pre-activation forward: `y = W·x + b`. Caller applies the
-    /// nonlinearity (or not, for the output layer).
     fn forward(&self, x: &[f32]) -> Vec<f32> {
         let out_dim = self.weights.len();
         let mut y = Vec::with_capacity(out_dim);
@@ -284,7 +284,6 @@ impl Layer {
         y
     }
 
-    /// One Adam-lite step on this layer given grads w.r.t. weights and bias.
     fn adam_step(&mut self, dw: &[Vec<f32>], db: &[f32]) {
         for (i, dw_row) in dw.iter().enumerate() {
             for (j, &g) in dw_row.iter().enumerate() {
@@ -327,10 +326,10 @@ pub struct MotorModel {
     layer_2: Layer,
     layer_3: Layer,
 
-    /// EWMA of the per-sample PWM-residual RMS, in normalised PWM units.
-    /// Useful telemetry for the WebUI; not persisted.
+    /// EWMA of per-sample motion-prediction residual (Euclidean norm in
+    /// normalised output space). Useful telemetry; not persisted.
     #[serde(skip, default = "default_residual")]
-    residual_pwm: f32,
+    residual_motion: f32,
 }
 
 fn default_residual() -> f32 {
@@ -338,9 +337,8 @@ fn default_residual() -> f32 {
 }
 
 impl MotorModel {
-    /// Construct a freshly-bootstrapped model: Xavier weights then
-    /// [`BOOTSTRAP_STEPS`] SGD steps against synthetic inverse-prior
-    /// samples. Deterministic in `BOOTSTRAP_SEED`.
+    /// Freshly bootstrap from synthetic forward dynamics. Deterministic
+    /// in [`BOOTSTRAP_SEED`].
     pub fn default_bootstrap(battery_v_now: f32) -> Self {
         let mut rng = SmallRng::seed_from_u64(BOOTSTRAP_SEED);
         let mut model = Self {
@@ -354,28 +352,21 @@ impl MotorModel {
             layer_1: Layer::new(INPUT_DIM, HIDDEN_1, &mut rng),
             layer_2: Layer::new(HIDDEN_1, HIDDEN_2, &mut rng),
             layer_3: Layer::new(HIDDEN_2, OUTPUT_DIM, &mut rng),
-            residual_pwm: 0.0,
+            residual_motion: 0.0,
         };
-        let samples = synthetic_inverse_samples(&mut rng, BOOTSTRAP_SAMPLES);
+        let samples = synthetic_forward_samples(&mut rng, BOOTSTRAP_SAMPLES);
         for _ in 0..BOOTSTRAP_STEPS {
-            // Take one random sample per step (mini-batch size 1; data is
-            // tiny so iterating in random order is fine).
             let i = rng.random_range(0..samples.len());
             model.observe(samples[i]);
         }
-        // `observe` updates `last_battery_v` to each sample's voltage; reset
-        // to the caller's live reading so the staleness check on the next
-        // boot anchors on actual hardware state, not the last synthetic.
         model.meta.last_battery_v = battery_v_now;
+        model.meta.trained_steps = BOOTSTRAP_STEPS as u64;
         model
     }
 
-    /// Load from disk if present and non-stale, else bootstrap.
-    ///
-    /// "Non-stale" means the saved `last_battery_v` is within
-    /// [`BATTERY_STALE_THRESHOLD_V`] of `battery_v_now`. On any failure
-    /// (missing, unparseable, wrong schema, stale battery) the function
-    /// falls through to [`Self::default_bootstrap`] and logs the reason.
+    /// Load from disk if present and non-stale, else bootstrap. A
+    /// schema-version mismatch — including any file written by the
+    /// previous inverse-model schema — re-bootstraps.
     pub fn load_or_bootstrap(path: &Path, battery_v_now: f32) -> Self {
         match std::fs::read_to_string(path) {
             Ok(s) => match toml::from_str::<MotorModel>(&s) {
@@ -438,121 +429,105 @@ impl MotorModel {
         self.meta.last_updated_unix
     }
 
-    pub fn residual_pwm(&self) -> f32 {
-        self.residual_pwm
+    /// EWMA of recent prediction error in normalised output units.
+    /// Roughly: 0.0 = predictions match labels, 1.0 = full-scale miss.
+    pub fn residual_motion(&self) -> f32 {
+        self.residual_motion
     }
 
-    /// Forward inference: desired motion + state → PWM command.
-    pub fn predict(&self, x: ModelInput) -> PwmCommand {
+    /// Forward inference: PWMs + state → predicted (Δs, Δθ) over the
+    /// next [`WINDOW_S`] seconds.
+    pub fn predict(&self, x: ModelInput) -> MotionPrediction {
         let z0 = self.normalizer.encode(&x);
         let a1 = self.layer_1.forward(&z0);
         let h1: Vec<f32> = a1.iter().map(|v| v.tanh()).collect();
         let a2 = self.layer_2.forward(&h1);
         let h2: Vec<f32> = a2.iter().map(|v| v.tanh()).collect();
         let a3 = self.layer_3.forward(&h2);
-        self.normalizer.decode_pwm([a3[0], a3[1]])
+        self.normalizer.decode_motion([a3[0], a3[1]])
     }
 
-    /// One labelled window → **two** SGD steps: the sample as observed,
-    /// and its left/right mirror. The chassis is mechanically symmetric,
-    /// so for every `(v, ω, pwm_l, pwm_r)` example there's an equally
-    /// valid mirror `(v, -ω, pwm_r, pwm_l)` with `pwm_*_prev` and
-    /// `ω_prev` mirrored too. Training on both forces the learned
-    /// mapping to be symmetric in left/right and prevents the
-    /// degenerate "I only learn the turn direction the chassis actually
-    /// rotates in" loop observed live (battery 32 %, ~30 s of driving
-    /// asymmetrised ω=-1.0 prediction so badly the right wheel fell
-    /// below the deadband and the chassis couldn't turn right at all).
-    ///
-    /// Updates Adam state, EWMA residual, and `trained_steps` (counts
-    /// the input window — i.e. +1 per call, not +2 even though two
-    /// gradient steps land).
+    /// One labelled window → two SGD steps (sample + left/right mirror;
+    /// the chassis is mechanically symmetric so each label is also a
+    /// mirror-axis label, which doubles the data and forces the learned
+    /// mapping to stay L/R-symmetric — important when one direction of
+    /// turning happens to dominate the recent driving distribution).
     pub fn observe(&mut self, s: LabelledSample) {
-        self.step(&s, false);
+        self.step(&s);
         let mirrored = mirror_sample(&s);
-        self.step(&mirrored, true);
+        self.step(&mirrored);
         self.meta.trained_steps = self.meta.trained_steps.saturating_add(1);
         self.meta.last_battery_v = s.input.battery_v;
     }
 
-    /// One SGD step. `is_mirror` is a hook for future diagnostic
-    /// gating; today both real and mirror samples take the same path.
-    fn step(&mut self, s: &LabelledSample, _is_mirror: bool) {
-        // Forward, saving intermediates needed for backprop.
+    fn step(&mut self, s: &LabelledSample) {
         let z0 = self.normalizer.encode(&s.input);
         let a1 = self.layer_1.forward(&z0);
         let h1: Vec<f32> = a1.iter().map(|v| v.tanh()).collect();
         let a2 = self.layer_2.forward(&h1);
         let h2: Vec<f32> = a2.iter().map(|v| v.tanh()).collect();
-        let a3 = self.layer_3.forward(&h2); // linear output, normalised PWM space
+        let a3 = self.layer_3.forward(&h2);
 
-        // Targets in normalised space.
-        let target = self.normalizer.encode_pwm(s.pwm_l_obs, s.pwm_r_obs);
-        let weight = if s.v_label_present {
+        // Build the normalised target. The Δs target is *known* only
+        // when the labeller actually observed it; otherwise we set the
+        // ds-channel loss weight to zero so the model is trained only
+        // on Δθ this step.
+        let ds_label = s.ds_obs_m.unwrap_or(0.0);
+        let target = self.normalizer.encode_motion(ds_label, s.dtheta_obs_rad);
+        let ds_weight = if s.ds_obs_m.is_some() {
             1.0
         } else {
-            V_MISSING_WEIGHT
+            DS_MISSING_WEIGHT
         };
 
-        // dL/da3 — MSE with weight + L2 regularisation, both on
-        // normalised output. Factor of 2 absorbed into LR.
-        let d_a3: Vec<f32> = (0..OUTPUT_DIM)
-            .map(|i| weight * (a3[i] - target[i]) + L2_LAMBDA * a3[i])
-            .collect();
+        // dL/da3 — MSE with per-channel weight. Factor of 2 absorbed into LR.
+        let d_a3: [f32; OUTPUT_DIM] = [ds_weight * (a3[0] - target[0]), (a3[1] - target[1])];
 
-        // Track residual EWMA in normalised PWM units.
-        let r2: f32 = (0..OUTPUT_DIM).map(|i| (a3[i] - target[i]).powi(2)).sum();
+        // Residual in normalised output space, Euclidean norm.
+        let r2: f32 = d_a3.iter().map(|&v| v * v).sum::<f32>();
         let r = (r2 / OUTPUT_DIM as f32).sqrt();
-        self.residual_pwm = (1.0 - RESIDUAL_ALPHA) * self.residual_pwm + RESIDUAL_ALPHA * r;
+        self.residual_motion = (1.0 - RESIDUAL_ALPHA) * self.residual_motion + RESIDUAL_ALPHA * r;
 
-        // Backprop layer 3 (linear output: dL/dh2 = W3ᵀ · dL/da3).
         let (dw3, db3, d_h2) = backprop_linear(&self.layer_3.weights, &d_a3, &h2);
-        // Layer 2 (tanh hidden: dL/da2 = dL/dh2 · (1 - h2²)).
         let d_a2: Vec<f32> = (0..HIDDEN_2)
             .map(|i| d_h2[i] * (1.0 - h2[i] * h2[i]))
             .collect();
         let (dw2, db2, d_h1) = backprop_linear(&self.layer_2.weights, &d_a2, &h1);
-        // Layer 1.
         let d_a1: Vec<f32> = (0..HIDDEN_1)
             .map(|i| d_h1[i] * (1.0 - h1[i] * h1[i]))
             .collect();
         let (dw1, db1, _d_z0) = backprop_linear(&self.layer_1.weights, &d_a1, &z0);
 
-        // Apply Adam-lite updates.
         self.layer_1.adam_step(&dw1, &db1);
         self.layer_2.adam_step(&dw2, &db2);
         self.layer_3.adam_step(&dw3, &db3);
     }
 }
 
-/// Mirror a labelled window across the chassis's left/right axis:
-/// swap `pwm_l`/`pwm_r` (both observed PWM and the `_prev` history),
-/// negate ω (both target and prev). `v_target` / `v_prev` /
-/// `battery_v` are unchanged — they don't have a left/right sign. The
-/// chassis kinematics are mechanically symmetric so this is a
-/// genuinely valid second sample, not a hack.
+/// Mirror a labelled window across the chassis's left/right axis: swap
+/// `pwm_l`/`pwm_r` (current + previous), negate `omega_prev` and the
+/// observed Δθ. Δs (forward) and `v_prev` don't have a left/right sign
+/// and stay put. The chassis kinematics are mechanically symmetric so
+/// this is a genuinely valid second sample.
 fn mirror_sample(s: &LabelledSample) -> LabelledSample {
     LabelledSample {
         input: ModelInput {
+            pwm_l: s.input.pwm_r,
+            pwm_r: s.input.pwm_l,
             pwm_l_prev: s.input.pwm_r_prev,
             pwm_r_prev: s.input.pwm_l_prev,
             v_prev: s.input.v_prev,
             omega_prev: -s.input.omega_prev,
             battery_v: s.input.battery_v,
-            v_target: s.input.v_target,
-            omega_target: -s.input.omega_target,
         },
-        pwm_l_obs: s.pwm_r_obs,
-        pwm_r_obs: s.pwm_l_obs,
-        v_label_present: s.v_label_present,
+        ds_obs_m: s.ds_obs_m,
+        dtheta_obs_rad: -s.dtheta_obs_rad,
         dt_s: s.dt_s,
     }
 }
 
 /// Backprop through one fully-connected layer with grad-of-output `d_y`
 /// and input `x_in`. Returns `(dW, db, dX_in)`.
-///
-/// `dW[i][j] = d_y[i] · x_in[j]`, `db[i] = d_y[i]`, `dX_in[j] = Σ_i W[i][j] · d_y[i]`.
 fn backprop_linear(
     weights: &[Vec<f32>],
     d_y: &[f32],
@@ -575,54 +550,54 @@ fn backprop_linear(
 
 // ── Synthetic forward prior (used only for bootstrap) ─────────────────────────
 
-/// Hand-coded forward dynamics used to bootstrap the model into a
-/// sensible starting region. Linear-with-deadband, matching the
-/// operator note in `CLAUDE.md` (PWM 1500 ≈ 0.6 m/s forward) and a
-/// simple skid-steer turning relationship.
+/// Hand-coded forward dynamics, **wiring-quirk-aware**: on this chassis
+/// `pwm_l > pwm_r` produces physical CCW = positive Δθ (chassis convention).
+/// The synthetic prior bakes this in so a fresh bootstrap is already in
+/// the correct sign convention without waiting for labels to flip it.
+///
+/// Per-window magnitudes calibrated from live observation:
+/// * Forward sensitivity: PWM 1500 ≈ 0.6 m/s ≈ 0.12 m / 200 ms window.
+/// * Turning sensitivity: PWM diff 1400 ≈ 0.26 rad/s ≈ 0.052 rad / window.
+///   → K_dtheta ≈ 3.78e-5 rad per (PWM-unit · per 200 ms window).
 fn synthetic_forward(pwm_l: i32, pwm_r: i32) -> (f32, f32) {
-    // pwm_avg ∈ ~ [-2000, 2000] over the operator's normal range.
     let pwm_avg = (pwm_l + pwm_r) as f32 * 0.5;
-    let pwm_diff = (pwm_r - pwm_l) as f32;
-    // Deadband: anything inside ±200 PWM produces no motion (static friction).
+    let pwm_diff = (pwm_l - pwm_r) as f32; // wiring-correct sign: l > r → CCW positive
     let dead = 200.0;
-    let v = if pwm_avg.abs() < dead {
+    let v_mps = if pwm_avg.abs() < dead {
         0.0
     } else {
-        // 1500 PWM → 0.6 m/s ⇒ slope ≈ 0.6 / (1500 − 200) ≈ 4.6e-4 m/s per PWM.
-        (pwm_avg.signum()) * (pwm_avg.abs() - dead) * 4.6e-4
+        pwm_avg.signum() * (pwm_avg.abs() - dead) * 4.6e-4
     };
-    // Turning: pwm_diff ≈ 1000 → ~1 rad/s.
-    let omega = pwm_diff * 1.0e-3;
-    (v, omega)
+    let ds_m = v_mps * WINDOW_S;
+    let dtheta_rad = pwm_diff * 3.78e-5;
+    (ds_m, dtheta_rad)
 }
 
-/// Generate inverse-training samples: pick a random PWM pair, compute
-/// its synthetic forward motion, then build a labelled sample where
-/// that motion is the `(v_target, ω_target)` input and the original
-/// PWM is the regression target. The model trains the inverse from
-/// these synthetic pairs.
-fn synthetic_inverse_samples(rng: &mut SmallRng, n: usize) -> Vec<LabelledSample> {
+/// Generate forward training samples for bootstrap: pick a random PWM
+/// pair, compute the synthetic (Δs, Δθ), package as a labelled sample.
+/// Both Δs and Δθ are "present" in synthetic samples — bootstrap trains
+/// against a complete distribution.
+fn synthetic_forward_samples(rng: &mut SmallRng, n: usize) -> Vec<LabelledSample> {
     let max = MAX_DUTY as i32;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let pwm_l = rng.random_range(-max..=max);
         let pwm_r = rng.random_range(-max..=max);
-        let (v, omega) = synthetic_forward(pwm_l, pwm_r);
+        let (ds_m, dtheta_rad) = synthetic_forward(pwm_l, pwm_r);
         let battery_v = rng.random_range(7.2..8.4);
         out.push(LabelledSample {
             input: ModelInput {
+                pwm_l,
+                pwm_r,
                 pwm_l_prev: 0,
                 pwm_r_prev: 0,
                 v_prev: 0.0,
                 omega_prev: 0.0,
                 battery_v,
-                v_target: v,
-                omega_target: omega,
             },
-            pwm_l_obs: pwm_l,
-            pwm_r_obs: pwm_r,
-            v_label_present: true,
-            dt_s: 0.2,
+            ds_obs_m: Some(ds_m),
+            dtheta_obs_rad: dtheta_rad,
+            dt_s: WINDOW_S,
         });
     }
     out
@@ -635,37 +610,31 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn neutral_state(v_target: f32, omega_target: f32, battery_v: f32) -> ModelInput {
+    fn input(pwm_l: i32, pwm_r: i32, battery_v: f32) -> ModelInput {
         ModelInput {
+            pwm_l,
+            pwm_r,
             pwm_l_prev: 0,
             pwm_r_prev: 0,
             v_prev: 0.0,
             omega_prev: 0.0,
             battery_v,
-            v_target,
-            omega_target,
         }
-    }
-
-    fn round_trip_motion(m: &MotorModel, v_target: f32, omega_target: f32) -> (f32, f32) {
-        let cmd = m.predict(neutral_state(v_target, omega_target, 7.8));
-        synthetic_forward(cmd.pwm_l, cmd.pwm_r)
     }
 
     #[test]
     fn bootstrap_is_deterministic() {
         let a = MotorModel::default_bootstrap(7.8);
         let b = MotorModel::default_bootstrap(7.8);
-        // Identical weights from identical seed.
         assert_eq!(a.layer_1.weights, b.layer_1.weights);
         assert_eq!(a.layer_2.weights, b.layer_2.weights);
         assert_eq!(a.layer_3.weights, b.layer_3.weights);
-        // Same predictions on a representative grid.
-        for v in [-0.4, 0.0, 0.4] {
-            for w in [-1.0, 0.0, 1.0] {
-                let pa = a.predict(neutral_state(v, w, 7.8));
-                let pb = b.predict(neutral_state(v, w, 7.8));
-                assert_eq!((pa.pwm_l, pa.pwm_r), (pb.pwm_l, pb.pwm_r));
+        for l in [-2000, 0, 2000] {
+            for r in [-2000, 0, 2000] {
+                let pa = a.predict(input(l, r, 7.8));
+                let pb = b.predict(input(l, r, 7.8));
+                assert_eq!(pa.ds_m, pb.ds_m);
+                assert_eq!(pa.dtheta_rad, pb.dtheta_rad);
             }
         }
     }
@@ -680,11 +649,12 @@ mod tests {
         let loaded = MotorModel::load_or_bootstrap(f.path(), 7.8);
         assert_eq!(loaded.meta.trained_steps, m.meta.trained_steps);
         assert_eq!(loaded.layer_1.weights, m.layer_1.weights);
-        for v in [-0.5, 0.0, 0.3] {
-            for w in [-0.5, 0.0, 0.5] {
-                let pa = m.predict(neutral_state(v, w, 7.8));
-                let pb = loaded.predict(neutral_state(v, w, 7.8));
-                assert_eq!((pa.pwm_l, pa.pwm_r), (pb.pwm_l, pb.pwm_r));
+        for l in [-1500, 0, 1500] {
+            for r in [-1500, 0, 1500] {
+                let pa = m.predict(input(l, r, 7.8));
+                let pb = loaded.predict(input(l, r, 7.8));
+                assert_eq!(pa.ds_m, pb.ds_m);
+                assert_eq!(pa.dtheta_rad, pb.dtheta_rad);
             }
         }
     }
@@ -696,202 +666,142 @@ mod tests {
         let toml_str = toml::to_string_pretty(&m).unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         f.flush().unwrap();
-        // Load with a battery 0.5 V away — past the 0.3 V threshold.
-        let reloaded = MotorModel::load_or_bootstrap(f.path(), 7.9);
-        // Re-bootstrapped → trained_steps from the fresh bootstrap, and
-        // last_battery_v reflects the new reading (not the file's 7.2).
-        assert!((reloaded.meta.last_battery_v - 7.9).abs() < 1e-3);
+        let loaded = MotorModel::load_or_bootstrap(f.path(), 8.4);
+        // 1.2 V drift past the 0.3 V threshold → fresh bootstrap (with
+        // last_battery_v anchored on the new voltage).
+        assert!((loaded.meta.last_battery_v - 8.4).abs() < 1e-3);
     }
 
+    /// Schema-version mismatch (e.g. an old inverse-model file) must
+    /// trigger a re-bootstrap rather than crash.
     #[test]
-    fn bootstrap_round_trip_motion_in_envelope() {
-        // After the bootstrap warm-up, the model should produce PWMs
-        // that — when run through the *same* synthetic forward — land
-        // close to the requested motion, at least inside the achievable
-        // envelope.
-        let m = MotorModel::default_bootstrap(7.8);
-        // Easy targets well inside what 4095 PWM can produce.
-        for (v_t, w_t) in [(0.3, 0.0), (-0.3, 0.0), (0.0, 0.5), (0.0, -0.5), (0.2, 0.3)] {
-            let (v_got, w_got) = round_trip_motion(&m, v_t, w_t);
-            // Loose tolerance — bootstrap is rough; later online learning
-            // tightens this. The real assertion is "not garbage."
-            assert!(
-                (v_got - v_t).abs() < 0.25 && (w_got - w_t).abs() < 0.4,
-                "target ({v_t}, {w_t}) → got ({v_got}, {w_got})"
-            );
-        }
-    }
-
-    #[test]
-    fn inverse_fits_synthetic_dynamics() {
-        // Train past the bootstrap with more synthetic data; the
-        // round-trip motion should tighten.
+    fn schema_version_mismatch_rebootstraps() {
         let mut m = MotorModel::default_bootstrap(7.8);
-        let mut rng = SmallRng::seed_from_u64(0xFEED_BEEF);
-        for _ in 0..5000 {
-            let samples = synthetic_inverse_samples(&mut rng, 1);
-            m.observe(samples[0]);
-        }
-        for (v_t, w_t) in [(0.3, 0.0), (0.0, 0.5), (-0.2, -0.3), (0.4, 0.2)] {
-            let (v_got, w_got) = round_trip_motion(&m, v_t, w_t);
-            assert!(
-                (v_got - v_t).abs() < 0.15 && (w_got - w_t).abs() < 0.25,
-                "after 5k extra steps: target ({v_t}, {w_t}) → got ({v_got}, {w_got})"
-            );
-        }
+        m.meta.schema_version = 1; // pretend an old inverse-model file
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let toml_str = toml::to_string_pretty(&m).unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let loaded = MotorModel::load_or_bootstrap(f.path(), 7.8);
+        assert_eq!(loaded.meta.schema_version, SCHEMA_VERSION);
     }
 
+    /// The bootstrap should already match the chassis's wiring quirk:
+    /// `pwm_l > pwm_r` drives CCW (positive Δθ) and a centred forward
+    /// PWM drives positive Δs. This is the "do something sensible
+    /// before any labels arrive" check.
     #[test]
-    fn zero_target_predicts_small_pwm() {
-        // Deadband regulariser: target = (0, 0) should produce a PWM
-        // close to zero. (Strict zero would require infinite training;
-        // ≤ 200 PWM is enough to confirm L2 is doing its job.)
+    fn bootstrap_signs_match_wiring() {
         let m = MotorModel::default_bootstrap(7.8);
-        let cmd = m.predict(neutral_state(0.0, 0.0, 7.8));
+        // Pure forward at firm PWM → positive Δs, ~zero Δθ.
+        let p = m.predict(input(1500, 1500, 7.8));
+        assert!(p.ds_m > 0.0, "expected forward ds_m > 0, got {}", p.ds_m);
         assert!(
-            cmd.pwm_l.abs() < 400 && cmd.pwm_r.abs() < 400,
-            "expected near-zero PWM for zero target, got ({}, {})",
-            cmd.pwm_l,
-            cmd.pwm_r
+            p.dtheta_rad.abs() < 0.05,
+            "expected near-zero dθ, got {}",
+            p.dtheta_rad
+        );
+        // Pure backward → negative Δs.
+        let p = m.predict(input(-1500, -1500, 7.8));
+        assert!(p.ds_m < 0.0, "expected backward ds_m < 0, got {}", p.ds_m);
+        // Pure CCW spin (pwm_l > pwm_r) → positive Δθ.
+        let p = m.predict(input(1500, -1500, 7.8));
+        assert!(
+            p.dtheta_rad > 0.0,
+            "expected CCW dθ > 0, got {}",
+            p.dtheta_rad
+        );
+        // Pure CW spin → negative Δθ.
+        let p = m.predict(input(-1500, 1500, 7.8));
+        assert!(
+            p.dtheta_rad < 0.0,
+            "expected CW dθ < 0, got {}",
+            p.dtheta_rad
         );
     }
 
+    /// Training on synthetic forward labels should land predictions
+    /// close to those labels (low residual).
     #[test]
-    fn battery_input_has_measurable_effect() {
-        // After training, the predicted PWM should vary across battery
-        // voltages (otherwise the model is ignoring that input).
+    fn trains_on_synthetic_forward_labels() {
         let mut m = MotorModel::default_bootstrap(7.8);
-        let mut rng = SmallRng::seed_from_u64(0xBADD_F00D);
-        // Synthesise samples where battery scales the achievable speed
-        // — train the model to associate low battery with higher PWM
-        // for the same target.
-        for _ in 0..3000 {
-            let pwm = rng.random_range(-3000..=3000);
-            let battery_v: f32 = rng.random_range(7.2..=8.4);
-            // Same forward, but the "effective" PWM is scaled by
-            // battery. Inverse target encodes this: same motion needs
-            // a higher PWM at lower battery.
-            let effective_pwm = (pwm as f32 * (battery_v / 8.4)) as i32;
-            let (v, omega) = synthetic_forward(effective_pwm, effective_pwm);
+        // Bootstrap already trained 2000 steps; add 1000 more on a
+        // fresh draw and confirm residual is small.
+        let mut rng = SmallRng::seed_from_u64(0xCAFE_F00D);
+        let samples = synthetic_forward_samples(&mut rng, 1000);
+        for s in &samples {
+            m.observe(*s);
+        }
+        // After 3000 SGD steps the residual on this synthetic
+        // distribution should be well under 0.05 (~ 1 cm Δs error,
+        // 0.02 rad Δθ error).
+        assert!(
+            m.residual_motion() < 0.05,
+            "residual too high: {}",
+            m.residual_motion()
+        );
+    }
+
+    /// Δs-missing samples should only train the Δθ channel — the Δs
+    /// loss weight is zero. Test: train on (random PWM, no Δs, Δθ=0)
+    /// many times; Δθ predictions should converge to ~0, Δs predictions
+    /// should stay roughly at their pre-training values (bootstrap state).
+    #[test]
+    fn ds_missing_samples_only_train_dtheta() {
+        let mut m = MotorModel::default_bootstrap(7.8);
+        let pwm_l = 1500;
+        let pwm_r = 1500;
+        let pre = m.predict(input(pwm_l, pwm_r, 7.8));
+
+        // Train 500 times on the same (pwm_l=pwm_r=1500, dθ=0, no ds).
+        // dθ should converge to 0; ds should not move much.
+        for _ in 0..500 {
             m.observe(LabelledSample {
-                input: ModelInput {
-                    pwm_l_prev: 0,
-                    pwm_r_prev: 0,
-                    v_prev: 0.0,
-                    omega_prev: 0.0,
-                    battery_v,
-                    v_target: v,
-                    omega_target: omega,
-                },
-                pwm_l_obs: pwm,
-                pwm_r_obs: pwm,
-                v_label_present: true,
-                dt_s: 0.2,
+                input: input(pwm_l, pwm_r, 7.8),
+                ds_obs_m: None,
+                dtheta_obs_rad: 0.0,
+                dt_s: WINDOW_S,
             });
         }
-        let lo = m.predict(neutral_state(0.4, 0.0, 7.2));
-        let hi = m.predict(neutral_state(0.4, 0.0, 8.4));
-        let delta = (lo.pwm_l - hi.pwm_l).abs();
+        let post = m.predict(input(pwm_l, pwm_r, 7.8));
         assert!(
-            delta as f32 > 0.02 * MAX_DUTY as f32,
-            "expected battery to shift PWM by >2% of MAX_DUTY, got Δ={delta}"
+            post.dtheta_rad.abs() < 0.005,
+            "dθ should have trained to ~0, got {}",
+            post.dtheta_rad
+        );
+        // Δs preserved within a tight tolerance.
+        let ds_drift = (post.ds_m - pre.ds_m).abs();
+        assert!(
+            ds_drift < 0.02,
+            "ds drifted by {ds_drift} despite missing-ds samples"
         );
     }
 
+    /// Mirror sample property: swapping L/R PWMs and negating ω/Δθ
+    /// produces a sample the model should predict identically up to
+    /// reflection. After symmetric training this is a structural
+    /// invariant — verify it directly on the bootstrap-only model.
     #[test]
-    fn out_of_envelope_clamps() {
+    fn mirror_predictions_are_symmetric_after_bootstrap() {
         let m = MotorModel::default_bootstrap(7.8);
-        // 5 m/s forward is impossible; the model should saturate the
-        // PWM at MAX_DUTY instead of going to NaN / huge values.
-        let cmd = m.predict(neutral_state(5.0, 0.0, 7.8));
-        assert!(cmd.pwm_l.abs() <= MAX_DUTY as i32);
-        assert!(cmd.pwm_r.abs() <= MAX_DUTY as i32);
-        // And it's biased forward (not stuck at zero).
-        assert!(cmd.pwm_l > 0 && cmd.pwm_r > 0);
-    }
-
-    #[test]
-    fn sparse_v_labels_still_train() {
-        // Mix labelled and unlabelled samples 1:4. The ω round-trip
-        // (which doesn't depend on v_label_present) should still
-        // tighten.
-        let mut m = MotorModel::default_bootstrap(7.8);
-        let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF);
-        for i in 0..4000 {
-            let mut s = synthetic_inverse_samples(&mut rng, 1).remove(0);
-            if i % 5 != 0 {
-                // Mark v as missing — the v_target field stays at the
-                // ground-truth motion (which is what would happen if the
-                // commanded v happened to match observed), but weight
-                // is reduced.
-                s.v_label_present = false;
-            }
-            m.observe(s);
-        }
-        for w_t in [-0.5_f32, -0.2, 0.2, 0.5] {
-            let (_, w_got) = round_trip_motion(&m, 0.0, w_t);
+        let cases = [(1500, 500), (-1200, 800), (1000, -1000), (500, 1500)];
+        for (l, r) in cases {
+            let p = m.predict(input(l, r, 7.8));
+            let p_mirror = m.predict(input(r, l, 7.8));
+            // Δs symmetric (L/R-flip preserves forward).
             assert!(
-                (w_got - w_t).abs() < 0.3,
-                "ω target {w_t} → got {w_got} after sparse-v training"
+                (p.ds_m - p_mirror.ds_m).abs() < 0.005,
+                "Δs not symmetric for ({l},{r}): {} vs {}",
+                p.ds_m,
+                p_mirror.ds_m
+            );
+            // Δθ flips sign.
+            assert!(
+                (p.dtheta_rad + p_mirror.dtheta_rad).abs() < 0.01,
+                "Δθ not anti-symmetric for ({l},{r}): {} vs {}",
+                p.dtheta_rad,
+                p_mirror.dtheta_rad
             );
         }
-    }
-
-    #[test]
-    fn training_remains_symmetric_under_asymmetric_data() {
-        // Reproduce the live failure mode that motivated the mirror
-        // augmentation: train only on LEFT-turn samples (omega > 0) for
-        // 1000 steps. Without augmentation, the model would forget how
-        // to predict RIGHT turns (right-wheel command falls below the
-        // deadband). With augmentation, every left sample is mirrored
-        // into a right sample, so the model stays symmetric.
-        let mut m = MotorModel::default_bootstrap(7.8);
-        let mut rng = SmallRng::seed_from_u64(0xA51C_1971);
-        for _ in 0..1000 {
-            // Only positive-omega synthetic samples — left turns only.
-            let pwm_diff = rng.random_range(400..1500);
-            let pwm_avg = rng.random_range(-300..300); // mostly small avg
-            let pwm_r = pwm_avg + pwm_diff / 2;
-            let pwm_l = pwm_avg - pwm_diff / 2;
-            let (v, omega) = synthetic_forward(pwm_l, pwm_r);
-            assert!(omega > 0.0, "training sample should be CCW");
-            m.observe(LabelledSample {
-                input: ModelInput {
-                    pwm_l_prev: 0,
-                    pwm_r_prev: 0,
-                    v_prev: 0.0,
-                    omega_prev: 0.0,
-                    battery_v: 7.8,
-                    v_target: v,
-                    omega_target: omega,
-                },
-                pwm_l_obs: pwm_l,
-                pwm_r_obs: pwm_r,
-                v_label_present: true,
-                dt_s: 0.2,
-            });
-        }
-        // Symmetry assertion: predict for +ω and -ω; the right-turn
-        // prediction should mirror the left-turn prediction within
-        // reasonable tolerance.
-        let cmd_left = m.predict(neutral_state(0.0, 0.5, 7.8));
-        let cmd_right = m.predict(neutral_state(0.0, -0.5, 7.8));
-        // Mirror property: cmd_right ≈ (cmd_left.pwm_r, cmd_left.pwm_l).
-        let mirror_l = cmd_left.pwm_r;
-        let mirror_r = cmd_left.pwm_l;
-        let dl = (cmd_right.pwm_l - mirror_l).abs();
-        let dr = (cmd_right.pwm_r - mirror_r).abs();
-        assert!(
-            dl < 200 && dr < 200,
-            "symmetry broken: predict(+ω)={cmd_left:?}, predict(-ω)={cmd_right:?} \
-             (expected mirror within ±200 PWM each)"
-        );
-        // And concretely: right-turn prediction must keep at least one
-        // wheel above the deadband (~200), so the chassis can actually
-        // pivot. This is the live failure mode the fix targets.
-        assert!(
-            cmd_right.pwm_l.abs() > 200 || cmd_right.pwm_r.abs() > 200,
-            "right-turn prediction has BOTH wheels below the deadband: {cmd_right:?}"
-        );
     }
 }

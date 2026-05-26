@@ -173,11 +173,12 @@ async fn main() {
     }
 
     // Stage 4: exploration controller. Always spawned (cheap when off);
-    // the WebUI flips `on` via `/api/motion/explore?on=1`.
+    // the WebUI flips `on` via `/api/motion/explore?on=1`. Drive
+    // commands go through the pure-math `arcade_drive` mapping (no
+    // model on the drive path).
     let explore_handle = Arc::new(ExploreHandle::new());
     explore::spawn(
         sensors.clone(),
-        motor_model.clone(),
         motion_target.clone(),
         pose_state.clone(),
         cmd_tx.clone(),

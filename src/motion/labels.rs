@@ -1,43 +1,43 @@
-//! Stage 2 of `PLAN.md`: assemble labelled 200 ms training windows for
-//! [`MotorModel`] from the live PWM command, IMU fusion, and
-//! ultrasonic streams.
+//! Forward training-label assembly: pair what was commanded with what
+//! actually happened.
 //!
 //! ## Window construction
 //!
 //! Every 200 ms the worker takes a snapshot of:
 //!
-//! * the latest commanded PWM (`pwm_l_cmd`, `pwm_r_cmd`) — published by
-//!   the supervisor into [`SensorSnapshot`];
-//! * all BNO055 fusion samples in the window (`Imu::recent_since`),
-//!   each carrying an absolute orientation quaternion + a
-//!   linear-acceleration vector (gravity already removed by the chip);
-//! * the ultrasonic distance at the *start* and *end* of the window
-//!   (captured by the previous tick → carried forward).
+//! * the commanded PWMs (`pwm_l_cmd`, `pwm_r_cmd`) — published by the
+//!   supervisor into [`SensorSnapshot`];
+//! * all BNO055 fusion samples in the window — orientation + linear-accel
+//!   (gravity removed by the chip);
+//! * the ultrasonic distance at the *start* and *end* of the window.
 //!
-//! ## Labels and rejections
+//! ## Forward labels
 //!
-//! * `ω_meas` = `Δyaw / Δt` between the first and last orientation
-//!   snapshot in the window (rad/s). The chip's IMUPLUS fusion engine
-//!   has already done the gyro integration, bias-correction and
-//!   gravity-aware projection internally — we just subtract endpoints.
-//!   **Always present** unless the window has fewer than two samples
-//!   (chip warming up) or hits whole-window rejection.
-//! * `v_meas` = `−Δd/Δt` from ultrasonic, in m/s. **Sometimes present**;
-//!   rejected if the window is curving, distances are out of the
-//!   sensor's reliable 8–80 cm range, or the trend isn't sign-consistent
-//!   with the commanded direction.
-//! * **Whole-window rejection** drops both `ω` and `v` for the window
-//!   if any single-sample `|linear_accel| > 3 m/s²` (collision / pickup
-//!   / kick). With gravity already removed by the chip, anything above
-//!   that threshold is a real impulse on the chassis.
+//! For the forward model the label has the shape:
 //!
-//! ## `ModelInput.v_target` / `omega_target`
+//! * **`ModelInput`** — current PWMs + previous-window PWMs + prior
+//!   motion estimate + battery.
+//! * **`Δθ_obs_rad`** — from `q_end * q_start⁻¹` (BNO055 quaternion delta),
+//!   with [`YAW_SIGN`] to match chassis convention. Always present.
+//! * **`Δs_obs_m`** — from ultrasonic `−Δd/Δt × dt_s` when the window
+//!   passes the straight / monotonic / in-range gate; `None` otherwise.
 //!
-//! Per the PLAN's inverse-training trick: the *measured* motion goes in
-//! as the input target. `v_target = v_meas` when present, else the
-//! previous window's measured `v` (a placeholder — the v signal is
-//! weaker on those samples and the optimiser down-weights them via
-//! `v_label_present = false`). `omega_target = omega_meas` always.
+//! Most windows in an open room get only Δθ (no obstacle in front for
+//! the ultrasonic to measure). The forward model's loss zeroes the Δs
+//! channel when missing — train Δθ from those windows anyway.
+//!
+//! ## Rejections
+//!
+//! * **Idle gate** — both `pwm_l_cmd == 0` AND `pwm_r_cmd == 0` AND
+//!   `MotionTarget` is `(0, 0)`: nothing was commanded, nothing to train.
+//!   Skip silently; counters don't tick. Without this gate the labeller
+//!   emits ~5 zero-PWM-zero-motion samples per second of idle time and
+//!   the dataset drowns the motion samples.
+//! * **`accel_spike`** — any per-sample `|linear_accel| > 3 m/s²`. The
+//!   chip already removes gravity, so this is a real impulse (bump,
+//!   pickup, kick) and the whole window is dropped.
+//! * **v-only rejections** — straightness, range, sign-consistency
+//!   checks fail; Δs label is set to `None` (window still trains Δθ).
 
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -101,8 +101,12 @@ pub struct RejectionCounts {
 
 #[derive(Default, Clone, Copy, Debug, Serialize)]
 pub struct LabelStats {
+    /// Total windows that successfully became LabelledSamples (Δθ
+    /// label, optionally with Δs).
     pub samples_observed: u64,
-    pub samples_v_labelled: u64,
+    /// Subset of `samples_observed` where Δs (forward displacement) was
+    /// also valid from ultrasonic. Δθ is in every observed sample.
+    pub samples_ds_labelled: u64,
     pub rejections: RejectionCounts,
 }
 
@@ -217,16 +221,19 @@ impl LabelWorker {
             return false;
         }
 
-        // ω from the chip's drift-compensated yaw delta. No software
+        // Δθ from the chip's drift-compensated yaw delta. No software
         // integration, no bias to subtract — IMUPLUS did all that. The
         // shared `YAW_SIGN` keeps the convention identical to the pose
-        // integrator, so the motor model trains against the same ω
-        // values the integrator and WebUI joystick speak in.
+        // integrator and arcade-drive mapping.
         let (_, _, yaw_start) = imu_samples.first().unwrap().orientation.euler_angles();
         let (_, _, yaw_end) = imu_samples.last().unwrap().orientation.euler_angles();
-        let omega_meas = wrap_pi((yaw_end - yaw_start) * YAW_SIGN) / dt_s;
+        let dtheta_obs_rad = wrap_pi((yaw_end - yaw_start) * YAW_SIGN);
+        // ω (rad/s) is derived for the carry-forward `prev_omega`; the
+        // forward model itself trains on Δθ directly, not ω.
+        let omega_meas = dtheta_obs_rad / dt_s;
 
-        // v label gate.
+        // Δs from ultrasonic when the window passes the gate. When
+        // None, the model trains only Δθ for this window.
         let v_meas = self.try_v_label(
             snap.pwm_l_cmd,
             snap.pwm_r_cmd,
@@ -235,30 +242,22 @@ impl LabelWorker {
             dt_s,
             snap.pan,
         );
-        let v_label_present = v_meas.is_some();
+        let ds_obs_m = v_meas.map(|v| v * dt_s);
+        let ds_label_present = ds_obs_m.is_some();
 
-        // `target` was snapshotted up front (idle gate). Its `v_target`
-        // is the v fallback when ultrasonic Δd/Δt didn't yield a v_meas
-        // — the PLAN.md Stage 2 design, important when there's no
-        // obstacle in front of the ultrasonic in an open room.
-        let v_commanded = target.v_target;
-
-        // Build the labelled window. `v_target` uses the measured value
-        // when present, falls back to the operator's commanded v
-        // (loss-weighted 0.3× via `v_label_present=false` in the model).
+        // Forward label: (current PWMs + state) → (Δs, Δθ) observed.
         let sample = LabelledSample {
             input: ModelInput {
+                pwm_l: snap.pwm_l_cmd,
+                pwm_r: snap.pwm_r_cmd,
                 pwm_l_prev: self.prev_pwm_l,
                 pwm_r_prev: self.prev_pwm_r,
                 v_prev: self.prev_v,
                 omega_prev: self.prev_omega,
                 battery_v: snap.battery_v,
-                v_target: v_meas.unwrap_or(v_commanded),
-                omega_target: omega_meas,
             },
-            pwm_l_obs: snap.pwm_l_cmd,
-            pwm_r_obs: snap.pwm_r_cmd,
-            v_label_present,
+            ds_obs_m,
+            dtheta_obs_rad,
             dt_s,
         };
 
@@ -266,18 +265,19 @@ impl LabelWorker {
         {
             let mut stats = self.stats.write().unwrap();
             stats.samples_observed += 1;
-            if v_label_present {
-                stats.samples_v_labelled += 1;
+            if ds_label_present {
+                stats.samples_ds_labelled += 1;
             }
         }
 
-        // Carry forward (only on a successful observation). `prev_v` is
-        // the best-known v at this point: measured when valid, else the
-        // commanded fallback we just used as the training target.
+        // Carry forward (only on a successful observation). `prev_v`
+        // uses ultrasonic when valid, else the commanded v_target (so
+        // closed-loop estimate of "what we were trying to do" feeds the
+        // next window's state input).
         self.prev_pwm_l = snap.pwm_l_cmd;
         self.prev_pwm_r = snap.pwm_r_cmd;
         self.prev_omega = omega_meas;
-        self.prev_v = v_meas.unwrap_or(v_commanded);
+        self.prev_v = v_meas.unwrap_or(target.v_target);
         self.advance_window(window_end, us_end);
         true
     }
@@ -558,7 +558,7 @@ mod tests {
     fn stats_default_clean() {
         let s = LabelStats::default();
         assert_eq!(s.samples_observed, 0);
-        assert_eq!(s.samples_v_labelled, 0);
+        assert_eq!(s.samples_ds_labelled, 0);
         assert_eq!(s.rejections.accel_spike, 0);
     }
 }

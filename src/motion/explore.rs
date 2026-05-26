@@ -55,7 +55,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::api::{Command, SensorSnapshot};
-use crate::motion::{ModelInput, MotionTarget, MotorModel, PoseState};
+use crate::motion::{MotionTarget, PoseState, arcade_drive};
 
 // ── Sweep parameters ──────────────────────────────────────────────────────────
 
@@ -187,7 +187,6 @@ impl Default for ExploreHandle {
 
 struct ExploreWorker {
     sensors: Arc<RwLock<SensorSnapshot>>,
-    motor_model: Arc<RwLock<MotorModel>>,
     motion_target: Arc<RwLock<MotionTarget>>,
     pose: Arc<RwLock<PoseState>>,
     cmd_tx: mpsc::Sender<Command>,
@@ -409,36 +408,22 @@ impl ExploreWorker {
         *self.motion_target.write().unwrap() = MotionTarget::default();
     }
 
-    /// Translate desired motion through the motor model and issue the
-    /// resulting PWM via the supervisor's command channel. Mirrors
-    /// `motion_drive` in `src/server.rs` but takes the cmd channel
-    /// directly instead of routing through HTTP.
+    /// Translate desired motion to PWMs via the pure-math
+    /// `arcade_drive` mapping and issue via the supervisor's command
+    /// channel. Mirrors `motion_drive` in `src/server.rs` but takes the
+    /// cmd channel directly instead of routing through HTTP. The motor
+    /// model is **not** on this path — see [`crate::motion::arcade_drive`].
     fn send_motion(&self, v_target: f32, omega_target: f32) {
-        let (pwm_l_prev, pwm_r_prev, v_prev, omega_prev) = {
-            let p = self.pose.read().unwrap();
-            let t = self.motion_target.read().unwrap();
-            (t.pwm_l, t.pwm_r, p.v_us.unwrap_or(p.v_cmd), p.omega_gyro)
-        };
-        let battery_v = self.sensors.read().unwrap().battery_v;
-        let input = ModelInput {
-            pwm_l_prev,
-            pwm_r_prev,
-            v_prev,
-            omega_prev,
-            battery_v,
-            v_target,
-            omega_target,
-        };
-        let pwm = self.motor_model.read().unwrap().predict(input);
+        let (pwm_l, pwm_r) = arcade_drive(v_target, omega_target);
         *self.motion_target.write().unwrap() = MotionTarget {
             v_target,
             omega_target,
-            pwm_l: pwm.pwm_l,
-            pwm_r: pwm.pwm_r,
+            pwm_l,
+            pwm_r,
         };
         let _ = self.cmd_tx.blocking_send(Command::SetMotors {
-            left: pwm.pwm_l,
-            right: pwm.pwm_r,
+            left: pwm_l,
+            right: pwm_r,
         });
     }
 }
@@ -507,10 +492,8 @@ fn pick_best_heading(rays: &[ScanRay], recent_pans: &[f32]) -> (usize, f32) {
 
 // ── Spawning ────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     sensors: Arc<RwLock<SensorSnapshot>>,
-    motor_model: Arc<RwLock<MotorModel>>,
     motion_target: Arc<RwLock<MotionTarget>>,
     pose: Arc<RwLock<PoseState>>,
     cmd_tx: mpsc::Sender<Command>,
@@ -523,7 +506,6 @@ pub fn spawn(
         .spawn(move || {
             let mut worker = ExploreWorker {
                 sensors,
-                motor_model,
                 motion_target,
                 recent_pans: std::collections::VecDeque::with_capacity(RECENCY_HISTORY + 1),
                 pose,
