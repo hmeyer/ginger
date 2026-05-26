@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::hal::bno055::CalibStatus;
+
 // ── Battery model ─────────────────────────────────────────────────────────────
 
 // 2S LiPo: 8.4 V full, 6.0 V cutoff. Log data to refine these constants.
@@ -33,20 +35,28 @@ pub struct SensorSnapshot {
     pub gain: f32,
     pub brightness: f32,
     pub luma: u8,
-    /// IMU gyro vector in deg/s (IMU body frame). `None` when the BMI160
-    /// wasn't reachable at boot — same gate as `/api/imu/sample` 503.
-    pub imu_gyro_dps: Option<[f32; 3]>,
-    /// IMU accelerometer vector in m/s² (IMU body frame, gravity included).
-    pub imu_accel_mps2: Option<[f32; 3]>,
-    /// Achieved polling rate (EWMA). Should sit ~200 Hz; sagging means
-    /// the I²C bus is busy (PCA9685/ADS7830 contention).
+    /// IMU yaw (chip-frame, degrees, wrapped to `(-180, 180]`). `None`
+    /// when the BNO055 wasn't reachable at boot OR is still in its
+    /// fusion warm-up (`calib.gyr < 1`) — same gate as `/api/imu/sample`
+    /// 503. Pitch and roll are exposed on `/api/imu/sample` for the
+    /// debug card; only yaw lives on the SSE snapshot.
+    pub imu_yaw_deg: Option<f32>,
+    /// Linear acceleration (gravity removed by the chip) in m/s², chip
+    /// body frame. Stays near zero on a still chassis; spikes signal
+    /// physical impulse (bump, kick, pickup) and drive the label
+    /// worker's spike-rejection counter.
+    pub imu_linear_accel_mps2: Option<[f32; 3]>,
+    /// Achieved polling rate (EWMA). Should sit ~100 Hz (BNO055 fusion
+    /// rate); sagging means I²C contention.
     pub imu_rate_hz: Option<f32>,
+    /// Per-subsystem calibration status (`sys/gyr/acc/mag`, each in
+    /// `0..=3`). `mag` stays at zero in IMUPLUS by design. Drives the
+    /// WebUI's "fusion ready" badge.
+    pub imu_calib: Option<CalibStatus>,
     /// Signed ms gap between latest camera frame arrival and latest IMU
     /// sample, on the same monotonic clock: `frame_ago_ms − sample_ago_ms`.
-    /// Positive = frame is older (typical with a 200 Hz IMU and ~10 Hz
-    /// camera, so this should sit in roughly `[0, camera_period_ms]`).
-    /// A steady drift here would break Stage 4's gyro pre-integration —
-    /// this is the canary surfaced in the WebUI.
+    /// Positive = frame is older. A steady drift here would break the
+    /// SLAM rotation hint — canary surfaced in the WebUI.
     pub imu_frame_sync_ms: Option<f32>,
     /// Most recently applied motor PWM (PCA9685 duty in
     /// `[-MAX_DUTY, MAX_DUTY]`). Surfaced so the Stage-2 label worker
@@ -77,9 +87,10 @@ impl SensorSnapshot {
             gain: 8.0,
             brightness: 0.0,
             luma: 0,
-            imu_gyro_dps: None,
-            imu_accel_mps2: None,
+            imu_yaw_deg: None,
+            imu_linear_accel_mps2: None,
             imu_rate_hz: None,
+            imu_calib: None,
             imu_frame_sync_ms: None,
             pwm_l_cmd: 0,
             pwm_r_cmd: 0,
@@ -142,33 +153,43 @@ pub struct AngleBody {
 
 // ── IMU sample (debug endpoint) ──────────────────────────────────────────────
 
-/// Wire format for `GET /api/imu/sample`: the latest BMI160 reading
-/// alongside the *current* host clock and the latest camera frame's
-/// capture time, so a caller can directly read off how far in the past
-/// each event was without doing any clock-domain conversion themselves.
+/// Wire format for `GET /api/imu/sample`: the latest BNO055 fusion
+/// snapshot alongside the *current* host clock and the latest camera
+/// frame's capture time, so a caller can directly read off how far in
+/// the past each event was without doing any clock-domain conversion
+/// themselves.
 ///
-/// `t_*_ago_ms` are all positive; they are `now - t_event` in
-/// milliseconds. The interesting one for sync verification is
-/// `frame_to_sample_ms = t_frame_capture_ago_ms - t_sample_ago_ms`,
-/// which is the host-monotonic gap between the latest camera frame and
-/// the latest IMU sample. With a 200 Hz IMU and a 10–30 Hz camera, this
-/// should be roughly uniform in `[0, 5 ms]`.
+/// The orientation is the chip's IMUPLUS-fused absolute orientation in
+/// the chip body frame; it's drift-compensated by the chip's fusion
+/// engine, so the same chassis pose produces the same quaternion
+/// across long-horizon observations (modulo the chip's auto-zero pass,
+/// which happens during the first stillness after boot).
 #[derive(Clone, Serialize)]
 pub struct ImuSampleView {
-    pub gyro_dps: [f32; 3],
-    pub accel_mps2: [f32; 3],
-    /// Chip-internal 24-bit counter ticks (39.0625 µs each); a stalled
-    /// sample stream shows up as this not advancing across requests.
-    pub sensortime: u32,
-    /// Achieved sample rate EWMA in Hz.
+    /// Unit quaternion as `[w, x, y, z]`. The canonical orientation
+    /// representation; yaw/pitch/roll below are derived from it for
+    /// human-readable WebUI display.
+    pub orientation_quat: [f32; 4],
+    pub yaw_deg: f32,
+    pub pitch_deg: f32,
+    pub roll_deg: f32,
+    /// Gravity-removed linear acceleration, chip body frame, m/s².
+    pub linear_accel_mps2: [f32; 3],
+    /// Per-subsystem calibration status (each `0..=3`).
+    pub calib: CalibStatus,
+    /// Achieved fusion polling rate EWMA in Hz.
     pub rate_hz: f32,
+    /// Monotonic per-sample counter — replaces the BMI160's chip-internal
+    /// sensortime. A stalled sample stream shows as this not advancing
+    /// across requests.
+    pub sample_index: u32,
     /// Milliseconds between the IMU sample and "now" at request time.
     pub t_sample_ago_ms: f32,
     /// Milliseconds between the latest camera frame arrival and "now".
     /// `None` if no camera frame has been captured yet.
     pub t_frame_capture_ago_ms: Option<f32>,
     /// Signed gap between the two: positive means the frame is older
-    /// than the IMU sample (typical, since the IMU is 200 Hz vs the
-    /// camera's ~10 Hz). Same as `t_frame_capture_ago_ms - t_sample_ago_ms`.
+    /// than the IMU sample. With a 100 Hz IMU and ~10 Hz camera this
+    /// should sit in roughly `[0, 10 ms]`.
     pub frame_to_sample_ms: Option<f32>,
 }

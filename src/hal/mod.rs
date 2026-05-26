@@ -4,7 +4,7 @@
 //! `rppal` and know nothing about the robot above them.
 
 pub mod adc;
-pub mod bmi160;
+pub mod bno055;
 pub mod buzzer;
 pub mod infrared;
 pub mod led;

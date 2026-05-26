@@ -4,10 +4,12 @@
 //! `/api/motion/drive` and integrates it into chassis pose `(x, y, θ)`.
 //! Two corrections are applied on every tick:
 //!
-//! 1. **ω override.** Gyro `gyro_z` is more accurate than any motor
-//!    model could ever be — the integrator always trusts it for the
-//!    rotational component. The model-derived `ω_target` is kept only
-//!    for the WebUI residual display ("model said X, gyro says Y").
+//! 1. **θ from BNO055 fusion.** The chip's IMUPLUS fusion engine
+//!    produces a drift-compensated absolute orientation; we read its
+//!    quaternion every tick and subtract the yaw captured at the last
+//!    pose reset. No software-side gyro integration, no bias tracking.
+//!    `omega_meas` (the "ω the IMU saw" residual the WebUI shows next
+//!    to `ω_target`) is derived as `Δyaw / Δt` from the same source.
 //! 2. **v override when ultrasonic is valid.** Same gate as Stage 2's
 //!    label worker (straight + monotonic + in 8–80 cm range); when the
 //!    window passes, `−Δd/Δt` substitutes for the commanded `v_target`
@@ -17,10 +19,18 @@
 //!    last commanded.
 //!
 //! Pose is **robot-frame** — `(0, 0, 0)` at the integrator's last
-//! reset, no global consistency, drifts over time. That's fine for the
-//! exploration use cases in Stages 4–6; if absolute localisation
-//! matters later, a fiducial / RGB-D anchor is the right addition,
-//! not a tweak to this integrator.
+//! reset, no global consistency. The yaw component now barely drifts
+//! (the BNO055 absorbs it); the x/y components still drift through the
+//! v-channel because mono ultrasonic only gives v when the window
+//! passes the straight-and-in-range gate.
+//!
+//! ## Chip → chassis yaw sign
+//!
+//! [`YAW_SIGN`] flips the chip's yaw to match the chassis convention
+//! "CCW about chassis-Z is positive." Default `+1.0` assumes the BNO055
+//! is mounted upright with chip-Z ≈ chassis-Z. Validate on the live
+//! robot by rotating the chassis ~90° CCW and confirming `pose.theta`
+//! moves toward `+π/2`; flip to `-1.0` if it moves the other way.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
@@ -32,6 +42,7 @@ use serde::Serialize;
 
 use crate::api::SensorSnapshot;
 use crate::imu::Imu;
+use crate::motion::{YAW_SIGN, wrap_pi};
 
 // ── Cadence & trail ───────────────────────────────────────────────────────────
 
@@ -87,17 +98,22 @@ pub struct TrailPoint {
 
 /// Surfaced at `GET /api/motion/pose`. Includes both the latest
 /// commanded and measured motion so the WebUI can show residuals
-/// (model vs gyro / ultrasonic) without a separate endpoint.
+/// (model vs fusion / ultrasonic) without a separate endpoint.
 #[derive(Clone, Debug, Serialize)]
 pub struct PoseState {
     pub x: f32,
     pub y: f32,
     /// Heading in radians. `0` = chassis forward along +X. CCW positive
-    /// (right-hand rule about chassis-Z, matches gyro convention).
+    /// (right-hand rule about chassis-Z).
     pub theta: f32,
     /// Last commanded `v_target` (m/s).
     pub v_cmd: f32,
-    /// Last gyro-measured ω (rad/s). Source of truth used in integration.
+    /// Last IMU-measured ω (rad/s). Derived as `Δθ / Δt` from the BNO055
+    /// fusion engine's quaternion delta across the tick — i.e. the same
+    /// θ source the integrator uses, just differentiated. Field name
+    /// kept (`omega_gyro`) for wire compatibility with the WebUI's
+    /// existing Pose-card parser; the semantics are now fusion, not raw
+    /// gyro.
     pub omega_gyro: f32,
     /// Last commanded ω_target — kept for residual visualisation.
     pub omega_cmd: f32,
@@ -107,6 +123,11 @@ pub struct PoseState {
     /// Drift indicator: Euclidean distance from origin to current pose.
     pub drift_m: f32,
     pub trail: VecDeque<TrailPoint>,
+    /// Bumped each time [`Self::reset`] runs. The pose worker watches
+    /// for changes and re-captures the BNO055's current yaw as the new
+    /// origin on the next tick — that's how "reset" actually zeros θ
+    /// even though θ is read absolutely from the chip's fusion engine.
+    pub reset_seq: u32,
 }
 
 impl Default for PoseState {
@@ -121,13 +142,16 @@ impl Default for PoseState {
             v_us: None,
             drift_m: 0.0,
             trail: VecDeque::with_capacity(TRAIL_CAP),
+            reset_seq: 0,
         }
     }
 }
 
 impl PoseState {
     pub fn reset(&mut self) {
+        let seq = self.reset_seq.wrapping_add(1);
         *self = Self::default();
+        self.reset_seq = seq;
     }
 }
 
@@ -144,6 +168,18 @@ struct PoseWorker {
     /// 50 ms window has a `(start, end)` pair for the Δd/Δt v-override.
     initial_us_cm: Option<f32>,
     trail_counter: u32,
+
+    /// Chassis-frame yaw at the moment the pose was last reset
+    /// (chip yaw at that instant, times [`YAW_SIGN`]). `None` until the
+    /// first usable fusion sample; re-set to `None` when `PoseState`'s
+    /// `reset_seq` advances.
+    yaw_origin: Option<f32>,
+    /// Last θ value computed — used to derive `omega_meas` as
+    /// `Δθ / Δt` and as the previous endpoint for the midpoint heading.
+    last_theta: Option<f32>,
+    /// Tracks `PoseState::reset_seq` so the worker notices the operator
+    /// pressed "Reset pose" and re-captures `yaw_origin`.
+    last_seen_reset_seq: u32,
 }
 
 impl PoseWorker {
@@ -154,6 +190,7 @@ impl PoseWorker {
         pose: Arc<RwLock<PoseState>>,
     ) -> Self {
         let initial_us_cm = sensors.read().unwrap().us_cm;
+        let last_seen_reset_seq = pose.read().unwrap().reset_seq;
         Self {
             sensors,
             imu,
@@ -162,6 +199,9 @@ impl PoseWorker {
             last_tick: Instant::now(),
             initial_us_cm,
             trail_counter: 0,
+            yaw_origin: None,
+            last_theta: None,
+            last_seen_reset_seq,
         }
     }
 
@@ -172,18 +212,38 @@ impl PoseWorker {
             return;
         }
 
-        // ── ω: gyro-integrated mean over the window ──────────────────
-        let samples = self.imu.recent_since(self.last_tick);
-        let bias_dps = self.imu.gyro_bias_dps();
-        let omega_gyro = if samples.is_empty() {
-            0.0
-        } else {
-            let sum: f32 = samples
-                .iter()
-                .map(|s| (s.raw.gyro_dps()[2] - bias_dps[2]).to_radians())
-                .sum();
-            sum / samples.len() as f32
+        // Watch for an operator-triggered pose reset. Re-capture
+        // `yaw_origin` on the next valid sample so θ goes back to 0
+        // relative to the chassis's current heading.
+        {
+            let current = self.pose.read().unwrap().reset_seq;
+            if current != self.last_seen_reset_seq {
+                self.yaw_origin = None;
+                self.last_theta = None;
+                self.last_seen_reset_seq = current;
+            }
+        }
+
+        // No fusion sample yet (chip warming up, or warm-up gate
+        // closed). Don't integrate — advance the tick and bail.
+        let Some(sample) = self.imu.latest() else {
+            self.last_tick = now;
+            self.initial_us_cm = self.sensors.read().unwrap().us_cm;
+            return;
         };
+
+        // BNO055 yaw → chassis-frame θ, relative to the pose's origin.
+        let (_, _, yaw_chip) = sample.orientation.euler_angles();
+        let yaw_chassis = yaw_chip * YAW_SIGN;
+        let yaw_origin = *self.yaw_origin.get_or_insert(yaw_chassis);
+        let theta = wrap_pi(yaw_chassis - yaw_origin);
+
+        // `Δθ / Δt` on the same wrapped manifold = the chip's reported ω.
+        let (omega_meas, theta_prev) = match self.last_theta {
+            Some(prev) => (wrap_pi(theta - prev) / dt_s, prev),
+            None => (0.0, theta),
+        };
+        self.last_theta = Some(theta);
 
         let target = *self.target.read().unwrap();
         let snap = self.sensors.read().unwrap().clone();
@@ -200,16 +260,19 @@ impl PoseWorker {
         );
         let v_used = v_us.unwrap_or(target.v_target);
 
-        // ── integrate ────────────────────────────────────────────────
+        // Midpoint heading for second-order accuracy on x/y. Wrap-aware
+        // so a θ that crossed ±π between ticks doesn't put the midpoint
+        // on the wrong side of the unit circle.
+        let dtheta = wrap_pi(theta - theta_prev);
+        let theta_mid = wrap_pi(theta_prev + 0.5 * dtheta);
+
         let mut pose = self.pose.write().unwrap();
-        // Use midpoint heading for second-order accuracy at modest dt.
-        let theta_mid = pose.theta + 0.5 * omega_gyro * dt_s;
         pose.x += v_used * theta_mid.cos() * dt_s;
         pose.y += v_used * theta_mid.sin() * dt_s;
-        pose.theta = wrap_pi(pose.theta + omega_gyro * dt_s);
+        pose.theta = theta;
         pose.v_cmd = target.v_target;
         pose.omega_cmd = target.omega_target;
-        pose.omega_gyro = omega_gyro;
+        pose.omega_gyro = omega_meas;
         pose.v_us = v_us;
         pose.drift_m = (pose.x * pose.x + pose.y * pose.y).sqrt();
 
@@ -230,20 +293,6 @@ impl PoseWorker {
         self.last_tick = now;
         self.initial_us_cm = us_end;
     }
-}
-
-/// Wrap an angle to `(-π, π]`. The integrator keeps θ in that range so
-/// JSON consumers don't see ever-growing values after many laps.
-fn wrap_pi(a: f32) -> f32 {
-    let two_pi = std::f32::consts::TAU;
-    let pi = std::f32::consts::PI;
-    let mut x = a % two_pi;
-    if x > pi {
-        x -= two_pi;
-    } else if x <= -pi {
-        x += two_pi;
-    }
-    x
 }
 
 /// Same v-label gate as `src/motion/labels.rs::try_v_label`, returning

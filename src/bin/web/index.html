@@ -227,10 +227,17 @@ footer{
       <div class="row"><span class="val" id="v-us">—</span><span style="color:var(--dim2)">cm</span></div>
       <div class="row"><span class="lbl" style="min-width:32px">TTC</span><span class="val" id="v-ttc">—</span><span style="color:var(--dim2);font-size:.8rem">s</span></div>
     </div>
-    <div class="card" id="imu-card" title="BMI160 IMU — gyro and accelerometer in the IMU body frame">
+    <div class="card" id="imu-card" title="BNO055 IMU — 6-DoF fusion (IMUPLUS): chip-fused absolute orientation + gravity-removed linear acceleration">
       <div class="card-title">IMU <span id="v-imu-rate" style="color:var(--dim2);font-size:.7rem;font-weight:normal;margin-left:4px">—</span></div>
-      <div class="row"><span class="lbl" style="min-width:32px">gyro</span><span class="val" id="v-imu-gyro">—</span><span style="color:var(--dim2);font-size:.75rem">°/s</span></div>
-      <div class="row"><span class="lbl" style="min-width:32px">accel</span><span class="val" id="v-imu-accel">—</span><span style="color:var(--dim2);font-size:.75rem">m/s²</span></div>
+      <div class="row" title="Chip-frame yaw (degrees). 0 = chassis forward. Drift-compensated by the fusion engine.">
+        <span class="lbl" style="min-width:32px">yaw</span><span class="val" id="v-imu-yaw">—</span><span style="color:var(--dim2);font-size:.75rem">°</span>
+      </div>
+      <div class="row" title="Gravity-removed linear acceleration magnitude. Near zero when stationary; spikes signal physical impulse (bump, kick, pickup).">
+        <span class="lbl" style="min-width:32px">|a|</span><span class="val" id="v-imu-accel">—</span><span style="color:var(--dim2);font-size:.75rem">m/s²</span>
+      </div>
+      <div class="row" title="Per-subsystem calibration status (sys/gyr/acc, each 0..=3). Yaw is meaningful once gyr ≥ 1. Mag stays 0 in IMUPLUS by design.">
+        <span class="lbl" style="min-width:32px">cal</span><span class="val" id="v-imu-cal">—</span>
+      </div>
       <div class="row" title="Frame-to-sample monotonic-clock gap. Should sit near zero (or up to one camera period) and stay stable; a steady drift means the camera and IMU clocks have diverged.">
         <span class="lbl" style="min-width:32px">sync</span><span class="val" id="v-imu-sync">—</span><span style="color:var(--dim2);font-size:.75rem">ms</span>
       </div>
@@ -261,7 +268,7 @@ footer{
       </div>
       <div style="margin-top:8px;font-size:.7rem;color:var(--dim2);text-align:center">labels (Stage 2)</div>
       <div class="row"><span class="lbl" style="min-width:48px">obs</span><span class="val" id="v-mm-obs">—</span><span class="lbl" style="margin-left:8px">v-lab</span><span class="val" id="v-mm-vlab">—</span></div>
-      <div class="row" title="Whole-window rejections: gyro spike (|ω|>5 rad/s) and accel spike (|a|−g>3 m/s²)">
+      <div class="row" title="Whole-window rejections: linear-accel impulse > 3 m/s² (BNO055 fusion subtracts gravity, so anything past 3 m/s² is a real chassis bump/kick)">
         <span class="lbl" style="min-width:48px">spike</span><span class="val" id="v-mm-rej-spike">—</span>
       </div>
       <div class="row" title="v-label-only rejections by reason">
@@ -343,7 +350,7 @@ footer{
     </div>
   </div>
   <div class="sv-sep"></div>
-  <div class="sv" title="BMI160 IMU — |gyro| in °/s and frame↔sample sync gap in ms">
+  <div class="sv" title="BNO055 IMU — fused yaw (°) and frame↔sample sync gap (ms)">
     <span class="lbl">IMU</span>
     <span class="val" id="v-imu-gyro-m">—</span>
     <span class="unit">°/s</span>
@@ -724,16 +731,32 @@ sse.onmessage = e => {
     ['ir-l-m','ir-c-m','ir-r-m'].forEach(id => document.getElementById(id).className = 'dot');
   }
 
-  // IMU. All four fields are null when the BMI160 isn't on the bus — in
-  // that case the card stays at "—" rather than mixing fresh and stale.
-  const v3 = (a, n) => a ? a.map(x => x.toFixed(n)).join(' ') : '—';
-  document.getElementById('v-imu-gyro').textContent  = v3(d.imu_gyro_dps, 1);
-  document.getElementById('v-imu-accel').textContent = v3(d.imu_accel_mps2, 2);
+  // IMU. yaw / |linear_accel| are null until the BNO055's fusion warm-up
+  // completes (calib.gyr ≥ 1, first ~5 s after boot); calib + rate are
+  // populated as soon as the chip is on the bus.
+  document.getElementById('v-imu-yaw').textContent =
+    d.imu_yaw_deg != null ? d.imu_yaw_deg.toFixed(1) : '—';
+  {
+    const a = d.imu_linear_accel_mps2;
+    const mag = a ? Math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]) : null;
+    document.getElementById('v-imu-accel').textContent = mag != null ? mag.toFixed(2) : '—';
+  }
   document.getElementById('v-imu-rate').textContent  = d.imu_rate_hz != null ? d.imu_rate_hz.toFixed(0) + ' Hz' : '—';
+  // Calibration badge: sys/gyr/acc. Colour green when all three ≥ 1
+  // (fusion trustworthy), amber while gyr still warming up.
+  {
+    const c = d.imu_calib;
+    const el = document.getElementById('v-imu-cal');
+    if (!c) {
+      el.textContent = '—';
+      el.style.color = '';
+    } else {
+      el.textContent = `${c.sys}/${c.gyr}/${c.acc}`;
+      el.style.color = c.gyr >= 1 ? 'var(--ok)' : 'var(--warn)';
+    }
+  }
   // Sync canary: colour green if the gap stays inside one camera period
   // (~100 ms at 10 fps), amber if it slips past, red if growing fast.
-  // Sign is preserved in the readout so a negative gap (IMU sample older
-  // than the latest frame, which shouldn't happen) is visible.
   {
     const g = d.imu_frame_sync_ms;
     const txt = g != null ? (g >= 0 ? '+' : '') + g.toFixed(0) : '—';
@@ -743,15 +766,11 @@ sse.onmessage = e => {
     el.textContent = txt;
     el.style.color = col;
   }
-  // Mobile strip summary: |gyro| magnitude (one number, easier on the eye
-  // than three) and the sync-gap.
-  {
-    const a = d.imu_gyro_dps;
-    const mag = a ? Math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]) : null;
-    document.getElementById('v-imu-gyro-m').textContent = mag != null ? mag.toFixed(0) : '—';
-    const g = d.imu_frame_sync_ms;
-    document.getElementById('v-imu-sync-m').textContent = g != null ? g.toFixed(0) : '—';
-  }
+  // Mobile strip summary: fused yaw and the sync-gap.
+  document.getElementById('v-imu-gyro-m').textContent =
+    d.imu_yaw_deg != null ? d.imu_yaw_deg.toFixed(0) : '—';
+  document.getElementById('v-imu-sync-m').textContent =
+    d.imu_frame_sync_ms != null ? d.imu_frame_sync_ms.toFixed(0) : '—';
 };
 
 // ── Motor model card (Stage 1) ────────────────────────────────────────────────
@@ -849,11 +868,12 @@ sse.onmessage = e => {
       const vRate = obs > 0 ? Math.round(100 * vlab / obs) : 0;
       document.getElementById('v-mm-obs').textContent  = obs.toLocaleString();
       document.getElementById('v-mm-vlab').textContent = `${vlab.toLocaleString()} (${vRate}%)`;
-      // Whole-window rejections: spike rows.
+      // Whole-window rejections: spike row (linear-accel impulse only;
+      // gravity is removed by the BNO055 so |linear_accel| > 3 m/s² is
+      // a bump/kick on the chassis).
       const r = l.rejections || {};
-      const spike = (r.gyro_spike || 0) + (r.accel_spike || 0);
       document.getElementById('v-mm-rej-spike').textContent =
-        `${spike} (gyro ${r.gyro_spike || 0} · accel ${r.accel_spike || 0})`;
+        `${r.accel_spike || 0} (impulse)`;
       // v-only rejection breakdown.
       const vonly = (r.v_out_of_range || 0) + (r.v_not_straight || 0) + (r.v_non_monotonic || 0);
       document.getElementById('v-mm-rej-vonly').textContent =
@@ -976,11 +996,11 @@ sse.onmessage = e => {
       const vMeas = p.v_us == null ? '—' : p.v_us.toFixed(2);
       document.getElementById('v-pose-v').textContent =
         `cmd ${p.v_cmd.toFixed(2)} · us ${vMeas}`;
-      // ω: commanded vs gyro
+      // ω: commanded vs fusion-derived (Δyaw/Δt from the BNO055)
       const wCmd = (p.omega_cmd * 180 / Math.PI).toFixed(0);
-      const wGyro = (p.omega_gyro * 180 / Math.PI).toFixed(0);
+      const wMeas = (p.omega_gyro * 180 / Math.PI).toFixed(0);
       document.getElementById('v-pose-omega').textContent =
-        `cmd ${wCmd} · gyro ${wGyro}`;
+        `cmd ${wCmd} · fused ${wMeas}`;
       renderTrail(p);
     } catch (_) {}
   }

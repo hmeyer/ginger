@@ -45,7 +45,7 @@ pub struct AppState {
     pub camera: Arc<Camera>,
     pub slam: Arc<RwLock<SlamSnapshot>>,
     pub map: Arc<RwLock<MapSnapshot>>,
-    /// `None` when the BMI160 wasn't reachable at boot (no hardware,
+    /// `None` when the BNO055 wasn't reachable at boot (no hardware,
     /// flaky bus, headless dev / test). Endpoints that depend on it
     /// answer 503 in that case rather than panicking.
     pub imu: Option<Arc<Imu>>,
@@ -85,7 +85,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/slam/map", get(slam_map))
         .route("/api/camera/frame", get(camera_frame))
         .route("/api/imu/sample", get(imu_sample))
-        .route("/api/imu/calibrate", post(imu_calibrate))
+        .route("/api/imu/calib", get(imu_calib))
         .route("/api/motion/model", get(motion_model_info))
         .route("/api/motion/model/predict", get(motion_model_predict))
         .route("/api/motion/model/reset", post(motion_model_reset))
@@ -138,14 +138,16 @@ async fn sensor_stream(
             // IMU read-out + sync canary. Compute camera_age and
             // sample_age from the *same* `now` snapshot so the WebUI's
             // sync-gap number can't pick up jitter from two separate
-            // Instant::now() calls.
+            // Instant::now() calls. `latest()` already gates on the
+            // chip's fusion warm-up — None during the first few seconds
+            // after boot is the chip auto-zeroing its gyro.
             if let Some(imu) = st.imu.as_ref() {
                 snap.imu_rate_hz = Some(imu.rate_hz());
+                snap.imu_calib = Some(imu.calib_status());
                 if let Some(s) = imu.latest() {
-                    let b = imu.gyro_bias_dps();
-                    let g = s.raw.gyro_dps();
-                    snap.imu_gyro_dps = Some([g[0] - b[0], g[1] - b[1], g[2] - b[2]]);
-                    snap.imu_accel_mps2 = Some(s.raw.accel_mps2());
+                    let (_, _, yaw) = s.orientation.euler_angles();
+                    snap.imu_yaw_deg = Some(yaw.to_degrees());
+                    snap.imu_linear_accel_mps2 = Some(s.linear_accel);
                     let now = std::time::Instant::now();
                     let sample_age = now.duration_since(s.t_read).as_secs_f32() * 1000.0;
                     if let Some(f) = st.camera.try_frame() {
@@ -260,11 +262,12 @@ async fn camera_frame(State(st): State<AppState>, Query(p): Query<CameraFramePar
 
 // ── IMU sample (debug / sync-verification) ────────────────────────────────────
 
-/// Latest BMI160 sample + the latest camera frame's capture time, both
-/// reported as "ago in ms" so the caller can read the host-monotonic
-/// gap directly. Returns 503 if the IMU wasn't initialized at boot
-/// (no chip on the bus) or if the polling thread hasn't produced a
-/// sample yet (first ~5–10 ms after start).
+/// Latest BNO055 fusion snapshot + the latest camera frame's capture
+/// time, both reported as "ago in ms" so the caller can read the
+/// host-monotonic gap directly. Returns 503 if the IMU wasn't
+/// initialized at boot (no chip on the bus) or if the chip's fusion
+/// warm-up hasn't completed (`calib.gyr == 0` — `Imu::latest` returns
+/// `None` until then; first few seconds after power-up).
 async fn imu_sample(State(st): State<AppState>) -> Response {
     let Some(imu) = st.imu.as_ref() else {
         return (
@@ -278,7 +281,7 @@ async fn imu_sample(State(st): State<AppState>) -> Response {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::RETRY_AFTER, "1")],
-            "imu sample not ready",
+            "imu fusion warming up",
         )
             .into_response();
     };
@@ -288,14 +291,19 @@ async fn imu_sample(State(st): State<AppState>) -> Response {
     let frame_t = st.camera.try_frame().map(|f| f.t_capture);
     let t_frame_capture_ago_ms = frame_t.map(|t| now.duration_since(t).as_secs_f32() * 1000.0);
     let frame_to_sample_ms = t_frame_capture_ago_ms.map(|f| f - t_sample_ago_ms);
-    let bias = imu.gyro_bias_dps();
-    let g = s.raw.gyro_dps();
+
+    let q = s.orientation.into_inner();
+    let (roll, pitch, yaw) = s.orientation.euler_angles();
 
     Json(ImuSampleView {
-        gyro_dps: [g[0] - bias[0], g[1] - bias[1], g[2] - bias[2]],
-        accel_mps2: s.raw.accel_mps2(),
-        sensortime: s.sensortime,
+        orientation_quat: [q.w, q.i, q.j, q.k],
+        yaw_deg: yaw.to_degrees(),
+        pitch_deg: pitch.to_degrees(),
+        roll_deg: roll.to_degrees(),
+        linear_accel_mps2: s.linear_accel,
+        calib: imu.calib_status(),
         rate_hz: imu.rate_hz(),
+        sample_index: s.sample_index,
         t_sample_ago_ms,
         t_frame_capture_ago_ms,
         frame_to_sample_ms,
@@ -303,12 +311,11 @@ async fn imu_sample(State(st): State<AppState>) -> Response {
     .into_response()
 }
 
-/// Restart the IMU's auto-bias collection window. Use after placing the
-/// chassis still if the auto-on-boot attempt aborted (e.g. the robot was
-/// being moved during the first second). Returns 200 always when the IMU
-/// is present, 503 when it isn't — the WebUI may bind this to a button
-/// without needing a body.
-async fn imu_calibrate(State(st): State<AppState>) -> Response {
+/// Per-subsystem fusion calibration status — drives the WebUI's
+/// "fusion ready" badge. Always responds 200 when the IMU is present
+/// (even during warm-up, since the calib byte itself is the warm-up
+/// indicator); 503 only when the chip wasn't initialized at boot.
+async fn imu_calib(State(st): State<AppState>) -> Response {
     let Some(imu) = st.imu.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -317,8 +324,7 @@ async fn imu_calibrate(State(st): State<AppState>) -> Response {
         )
             .into_response();
     };
-    imu.recalibrate_bias();
-    StatusCode::OK.into_response()
+    Json(imu.calib_status()).into_response()
 }
 
 // ── Motor-model endpoints (Stage 1 of PLAN.md) ────────────────────────────────

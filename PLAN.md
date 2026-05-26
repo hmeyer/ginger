@@ -17,8 +17,10 @@ replacement stack:
   `(pwm_l, pwm_r) → (v, ω)`, persisted to disk and refit continuously
   while driving. Exploits the fact that the apartment is uniform
   hardwood (one floor coefficient is enough).
-* **Gyro** — BMI160 already integrated; gives `ω` as a continuous,
-  zero-cost label and overrides the model's `ω` at runtime.
+* **IMU fusion** — BNO055 in IMUPLUS mode gives a drift-compensated
+  absolute orientation; we read its quaternion directly and overrides
+  the model's `ω`/`θ` at runtime. The chip handles bias correction and
+  angular-rate integration internally — no software-side SO(3) math.
 * **Swept ultrasonic** — the HC-SR04 sits on the pan servo, so it can
   build a ~150° local scan at a stationary waypoint. Cheap, no ML.
 * **Monocular depth predictor** — on-device neural net at ~1 Hz, gives

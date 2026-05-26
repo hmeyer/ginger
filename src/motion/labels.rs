@@ -1,6 +1,6 @@
 //! Stage 2 of `PLAN.md`: assemble labelled 200 ms training windows for
-//! [`MotorModel`] from the live PWM command, gyro, ultrasonic, and
-//! accelerometer streams.
+//! [`MotorModel`] from the live PWM command, IMU fusion, and
+//! ultrasonic streams.
 //!
 //! ## Window construction
 //!
@@ -8,21 +8,28 @@
 //!
 //! * the latest commanded PWM (`pwm_l_cmd`, `pwm_r_cmd`) — published by
 //!   the supervisor into [`SensorSnapshot`];
-//! * all gyro/accel samples in the window (`Imu::recent_since`);
+//! * all BNO055 fusion samples in the window (`Imu::recent_since`),
+//!   each carrying an absolute orientation quaternion + a
+//!   linear-acceleration vector (gravity already removed by the chip);
 //! * the ultrasonic distance at the *start* and *end* of the window
 //!   (captured by the previous tick → carried forward).
 //!
 //! ## Labels and rejections
 //!
-//! * `ω_meas` = bias-subtracted mean of `gyro_z` over the window
-//!   (rad/s). **Always present** unless rejected.
+//! * `ω_meas` = `Δyaw / Δt` between the first and last orientation
+//!   snapshot in the window (rad/s). The chip's IMUPLUS fusion engine
+//!   has already done the gyro integration, bias-correction and
+//!   gravity-aware projection internally — we just subtract endpoints.
+//!   **Always present** unless the window has fewer than two samples
+//!   (chip warming up) or hits whole-window rejection.
 //! * `v_meas` = `−Δd/Δt` from ultrasonic, in m/s. **Sometimes present**;
 //!   rejected if the window is curving, distances are out of the
 //!   sensor's reliable 8–80 cm range, or the trend isn't sign-consistent
 //!   with the commanded direction.
-//! * **Whole-window rejection** drops both `ω` and `v` for the window:
-//!     - any single-sample `|ω| > 5 rad/s` (chassis bump / kick), or
-//!     - any single-sample `||accel| − g| > 3 m/s²` (collision / pickup).
+//! * **Whole-window rejection** drops both `ω` and `v` for the window
+//!   if any single-sample `|linear_accel| > 3 m/s²` (collision / pickup
+//!   / kick). With gravity already removed by the chip, anything above
+//!   that threshold is a real impulse on the chassis.
 //!
 //! ## `ModelInput.v_target` / `omega_target`
 //!
@@ -41,7 +48,7 @@ use serde::Serialize;
 
 use crate::api::SensorSnapshot;
 use crate::imu::Imu;
-use crate::motion::{LabelledSample, ModelInput, MotorModel};
+use crate::motion::{LabelledSample, ModelInput, MotorModel, YAW_SIGN, wrap_pi};
 
 // ── Window cadence ────────────────────────────────────────────────────────────
 
@@ -49,12 +56,12 @@ const WINDOW: Duration = Duration::from_millis(200);
 
 // ── Whole-window rejection thresholds ─────────────────────────────────────────
 
-/// Any per-sample `|ω|` above this rejects the window (chassis bump etc).
-const GYRO_SPIKE_RAD_S: f32 = 5.0;
-/// Any per-sample `||accel| − g|` above this rejects the window
-/// (collision / pickup / kick).
-const ACCEL_DEV_FROM_G_MPS2: f32 = 3.0;
-const G_MPS2: f32 = 9.80665;
+/// Any per-sample `|linear_accel|` above this rejects the window
+/// (collision / pickup / kick). The BNO055 already subtracts gravity,
+/// so the magnitude of `linear_accel` *is* the chassis's own
+/// acceleration — anything past this is a real impulse, not gravity
+/// pointing through a tilted chip.
+const LIN_ACCEL_SPIKE_MPS2: f32 = 3.0;
 
 // ── v-label gate ──────────────────────────────────────────────────────────────
 
@@ -83,7 +90,9 @@ const PAN_FORWARD_DEG: f32 = 90.0;
 
 #[derive(Default, Clone, Copy, Debug, Serialize)]
 pub struct RejectionCounts {
-    pub gyro_spike: u64,
+    /// Whole-window rejection: a single fusion sample's linear-accel
+    /// magnitude exceeded [`LIN_ACCEL_SPIKE_MPS2`]. Real impulse on the
+    /// chassis (bump, kick, pickup) — both ω and v labels dropped.
     pub accel_spike: u64,
     pub v_out_of_range: u64,
     pub v_not_straight: u64,
@@ -151,26 +160,16 @@ impl LabelWorker {
     fn tick(&mut self) -> bool {
         let window_end = Instant::now();
         let dt_s = (window_end - self.window_start).as_secs_f32();
-        // Pull IMU samples in `[window_start, window_end]` (the ring is
-        // open at the high end since `recent_since` returns
-        // `t_read > since`).
+        // Pull BNO055 fusion samples in `[window_start, window_end]`.
         let imu_samples = self.imu.recent_since(self.window_start);
-        let bias_dps = self.imu.gyro_bias_dps();
 
-        // Pre-pass: scan for whole-window rejection.
-        let mut gyro_spike = false;
+        // Pre-pass: scan for whole-window rejection on the chip's
+        // gravity-removed linear acceleration.
         let mut accel_spike = false;
-        let mut omega_z_sum_rad_s = 0.0_f32;
         for s in &imu_samples {
-            let gyro = s.raw.gyro_dps();
-            let omega_z = (gyro[2] - bias_dps[2]).to_radians();
-            omega_z_sum_rad_s += omega_z;
-            if omega_z.abs() > GYRO_SPIKE_RAD_S {
-                gyro_spike = true;
-            }
-            let a = s.raw.accel_mps2();
+            let a = s.linear_accel;
             let amag = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
-            if (amag - G_MPS2).abs() > ACCEL_DEV_FROM_G_MPS2 {
+            if amag > LIN_ACCEL_SPIKE_MPS2 {
                 accel_spike = true;
             }
         }
@@ -179,27 +178,27 @@ impl LabelWorker {
         let snap = self.sensors.read().unwrap().clone();
         let us_end = snap.us_cm;
 
-        if gyro_spike || accel_spike {
-            {
-                let mut stats = self.stats.write().unwrap();
-                if gyro_spike {
-                    stats.rejections.gyro_spike += 1;
-                }
-                if accel_spike {
-                    stats.rejections.accel_spike += 1;
-                }
-            }
+        if accel_spike {
+            self.stats.write().unwrap().rejections.accel_spike += 1;
             self.advance_window(window_end, us_end);
             return false;
         }
 
-        // No usable gyro yet (IMU absent, or window too tight for samples).
-        if imu_samples.is_empty() || dt_s < 0.05 {
+        // Need at least two fusion snapshots to compute Δyaw across the
+        // window; bail otherwise (chip warming up or window too tight).
+        if imu_samples.len() < 2 || dt_s < 0.05 {
             self.advance_window(window_end, us_end);
             return false;
         }
 
-        let omega_meas = omega_z_sum_rad_s / imu_samples.len() as f32;
+        // ω from the chip's drift-compensated yaw delta. No software
+        // integration, no bias to subtract — IMUPLUS did all that. The
+        // shared `YAW_SIGN` keeps the convention identical to the pose
+        // integrator, so the motor model trains against the same ω
+        // values the integrator and WebUI joystick speak in.
+        let (_, _, yaw_start) = imu_samples.first().unwrap().orientation.euler_angles();
+        let (_, _, yaw_end) = imu_samples.last().unwrap().orientation.euler_angles();
+        let omega_meas = wrap_pi((yaw_end - yaw_start) * YAW_SIGN) / dt_s;
 
         // v label gate.
         let v_meas = self.try_v_label(
@@ -490,70 +489,36 @@ mod tests {
     }
 
     /// Per-sample rejection scanner mirrored from `LabelWorker::tick`.
-    fn scan_imu_samples(samples: &[(f32, f32, f32, f32, f32, f32)]) -> (bool, bool, f32) {
-        // Samples are (gyro_x, gyro_y, gyro_z, ax, ay, az) in physical
-        // units (deg/s and m/s²) — same shape as `RawSample::*_dps()`
-        // returns.
-        let mut gyro_spike = false;
-        let mut accel_spike = false;
-        let mut omega_z_sum_rad_s = 0.0;
-        for s in samples {
-            let omega_z = s.2.to_radians();
-            omega_z_sum_rad_s += omega_z;
-            if omega_z.abs() > GYRO_SPIKE_RAD_S {
-                gyro_spike = true;
-            }
-            let amag = (s.3 * s.3 + s.4 * s.4 + s.5 * s.5).sqrt();
-            if (amag - G_MPS2).abs() > ACCEL_DEV_FROM_G_MPS2 {
-                accel_spike = true;
-            }
-        }
-        let mean = if samples.is_empty() {
-            0.0
-        } else {
-            omega_z_sum_rad_s / samples.len() as f32
-        };
-        (gyro_spike, accel_spike, mean)
+    /// Each input is a linear-accel triple (m/s², gravity already
+    /// removed by the chip) — same shape as `ImuSample::linear_accel`.
+    fn scan_lin_accel(samples: &[(f32, f32, f32)]) -> bool {
+        samples
+            .iter()
+            .any(|a| (a.0 * a.0 + a.1 * a.1 + a.2 * a.2).sqrt() > LIN_ACCEL_SPIKE_MPS2)
     }
 
     #[test]
     fn scan_clean_window_passes() {
-        // ω ≈ 0.5 rad/s on z (29 deg/s), gravity-only accel.
-        let s = vec![(0.0, 0.0, 29.0, 0.0, 0.0, G_MPS2); 30];
-        let (gs, as_, omega) = scan_imu_samples(&s);
-        assert!(!gs && !as_);
-        assert!((omega - 29.0_f32.to_radians()).abs() < 1e-3);
-    }
-
-    #[test]
-    fn scan_gyro_spike_window_rejects() {
-        // One sample with |ω| = 6 rad/s = 343 deg/s — above 5 rad/s.
-        let mut s = vec![(0.0, 0.0, 0.0, 0.0, 0.0, G_MPS2); 30];
-        s[15].2 = 360.0;
-        let (gs, as_, _) = scan_imu_samples(&s);
-        assert!(gs, "should detect gyro spike");
-        assert!(!as_);
+        // Quiet chassis: linear-accel near zero on every sample.
+        let s = vec![(0.05, -0.02, 0.01); 30];
+        assert!(!scan_lin_accel(&s));
     }
 
     #[test]
     fn scan_accel_spike_window_rejects() {
-        // One sample with |accel| = 15 m/s² (5 m/s² above g — past the
-        // 3 m/s² gate).
-        let mut s = vec![(0.0, 0.0, 0.0, 0.0, 0.0, G_MPS2); 30];
-        s[10].5 = 15.0;
-        let (gs, as_, _) = scan_imu_samples(&s);
-        assert!(as_, "should detect accel spike");
-        assert!(!gs);
+        // One sample with |linear_accel| = 5 m/s² — past the 3 m/s² gate.
+        let mut s = vec![(0.0, 0.0, 0.0); 30];
+        s[10].0 = 5.0;
+        assert!(scan_lin_accel(&s));
     }
 
     #[test]
-    fn scan_combined_spike_rejects() {
-        // Both gyro and accel spike on the same sample — both flags set.
-        let mut s = vec![(0.0, 0.0, 0.0, 0.0, 0.0, G_MPS2); 30];
-        s[5].2 = 400.0;
-        s[5].5 = 14.0;
-        let (gs, as_, _) = scan_imu_samples(&s);
-        assert!(gs && as_);
+    fn scan_threshold_just_above_passes_just_below_rejects() {
+        // 2.9 m/s² should not trip; 3.1 m/s² should.
+        let just_below = vec![(2.9, 0.0, 0.0); 5];
+        assert!(!scan_lin_accel(&just_below));
+        let just_above = vec![(0.0, 0.0, 3.1)];
+        assert!(scan_lin_accel(&just_above));
     }
 
     #[test]
@@ -561,7 +526,6 @@ mod tests {
         let s = LabelStats::default();
         assert_eq!(s.samples_observed, 0);
         assert_eq!(s.samples_v_labelled, 0);
-        assert_eq!(s.rejections.gyro_spike, 0);
         assert_eq!(s.rejections.accel_spike, 0);
     }
 }

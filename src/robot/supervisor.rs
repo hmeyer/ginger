@@ -224,15 +224,16 @@ pub fn run(mut cmd_rx: mpsc::Receiver<Command>, sensors: Arc<RwLock<SensorSnapsh
             ttc_s,
             pan: cur_pan,
             tilt: cur_tilt,
-            camera_fps: 0.0,         // filled by SSE handler
-            exposure_us: 0,          // filled by SSE handler
-            gain: 0.0,               // filled by SSE handler
-            brightness: 0.0,         // filled by SSE handler
-            luma: 0,                 // filled by SSE handler
-            imu_gyro_dps: None,      // filled by SSE handler
-            imu_accel_mps2: None,    // filled by SSE handler
-            imu_rate_hz: None,       // filled by SSE handler
-            imu_frame_sync_ms: None, // filled by SSE handler
+            camera_fps: 0.0,             // filled by SSE handler
+            exposure_us: 0,              // filled by SSE handler
+            gain: 0.0,                   // filled by SSE handler
+            brightness: 0.0,             // filled by SSE handler
+            luma: 0,                     // filled by SSE handler
+            imu_yaw_deg: None,           // filled by SSE handler
+            imu_linear_accel_mps2: None, // filled by SSE handler
+            imu_rate_hz: None,           // filled by SSE handler
+            imu_calib: None,             // filled by SSE handler
+            imu_frame_sync_ms: None,     // filled by SSE handler
             pwm_l_cmd: motor_left,
             pwm_r_cmd: motor_right,
         };
