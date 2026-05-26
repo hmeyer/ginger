@@ -55,6 +55,31 @@ pub fn arcade_drive(v_target: f32, omega_target: f32) -> (i32, i32) {
     (l, r)
 }
 
+// ── Shared helpers used by both `pose` and `labels` ──────────────────────────
+
+/// Wrap an angle to `(-π, π]`. Shared by the pose integrator and the
+/// label worker so a yaw delta that crosses ±π is handled identically
+/// in both consumers (any divergence would let the motor model train
+/// against a yaw signal the integrator never uses).
+pub(crate) fn wrap_pi(a: f32) -> f32 {
+    let two_pi = std::f32::consts::TAU;
+    let pi = std::f32::consts::PI;
+    let mut x = a % two_pi;
+    if x > pi {
+        x -= two_pi;
+    } else if x <= -pi {
+        x += two_pi;
+    }
+    x
+}
+
+/// Chip-frame → chassis-frame yaw sign. `+1.0` if the BNO055's reported
+/// CCW yaw matches the chassis's right-hand-rule "CCW about chassis-Z
+/// is positive" convention; `-1.0` otherwise. Default `+1.0`; validate
+/// on the live robot by rotating the chassis ~90° CCW and confirming
+/// `pose.theta` moves toward `+π/2`.
+pub(crate) const YAW_SIGN: f32 = 1.0;
+
 #[cfg(test)]
 mod arcade_tests {
     use super::*;
@@ -108,26 +133,3 @@ mod arcade_tests {
         assert_eq!(arcade_drive(0.0, 0.0), (0, 0));
     }
 }
-
-/// Wrap an angle to `(-π, π]`. Shared by the pose integrator and the
-/// label worker so a yaw delta that crosses ±π is handled identically
-/// in both consumers (any divergence would let the motor model train
-/// against a yaw signal the integrator never uses).
-pub(crate) fn wrap_pi(a: f32) -> f32 {
-    let two_pi = std::f32::consts::TAU;
-    let pi = std::f32::consts::PI;
-    let mut x = a % two_pi;
-    if x > pi {
-        x -= two_pi;
-    } else if x <= -pi {
-        x += two_pi;
-    }
-    x
-}
-
-/// Chip-frame → chassis-frame yaw sign. `+1.0` if the BNO055's reported
-/// CCW yaw matches the chassis's right-hand-rule "CCW about chassis-Z
-/// is positive" convention; `-1.0` otherwise. Default `+1.0`; validate
-/// on the live robot by rotating the chassis ~90° CCW and confirming
-/// `pose.theta` moves toward `+π/2`.
-pub(crate) const YAW_SIGN: f32 = 1.0;
