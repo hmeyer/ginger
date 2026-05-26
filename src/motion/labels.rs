@@ -170,6 +170,29 @@ impl LabelWorker {
         // Pull BNO055 fusion samples in `[window_start, window_end]`.
         let imu_samples = self.imu.recent_since(self.window_start);
 
+        // Snapshot the sensor/PWM state once, atomically.
+        let snap = self.sensors.read().unwrap().clone();
+        let us_end = snap.us_cm;
+        let target = *self.target.read().unwrap();
+
+        // Idle gate. When no command has been issued — both the raw PWM
+        // channel and the operator's MotionTarget intent are quiescent —
+        // there's nothing meaningful to train. Without this gate the
+        // labeller emits ~5 zero-PWM-zero-motion samples per second
+        // forever; even a few minutes of idle drown out the motion
+        // samples, pulling the inverse model toward "output zero for
+        // every target" — the sub-deadband trap. Skip silently: stats
+        // counters don't tick, the model isn't touched, the chassis
+        // simply isn't training right now.
+        if snap.pwm_l_cmd == 0
+            && snap.pwm_r_cmd == 0
+            && target.v_target == 0.0
+            && target.omega_target == 0.0
+        {
+            self.advance_window(window_end, us_end);
+            return false;
+        }
+
         // Pre-pass: scan for whole-window rejection on the chip's
         // gravity-removed linear acceleration.
         let mut accel_spike = false;
@@ -180,10 +203,6 @@ impl LabelWorker {
                 accel_spike = true;
             }
         }
-
-        // Snapshot the sensor/PWM state once, atomically.
-        let snap = self.sensors.read().unwrap().clone();
-        let us_end = snap.us_cm;
 
         if accel_spike {
             self.stats.write().unwrap().rejections.accel_spike += 1;
@@ -218,14 +237,11 @@ impl LabelWorker {
         );
         let v_label_present = v_meas.is_some();
 
-        // Operator's currently-commanded v_target. Used as the v
-        // fallback when ultrasonic Δd/Δt didn't yield a v_meas — this
-        // is the PLAN.md Stage 2 design, and it matters most when
-        // there's no obstacle in front of the ultrasonic (open room):
-        // without it the model trains "pwm_avg=1200 → v=0" because the
-        // previous still-window's v was zero, which is structurally
-        // wrong and was breaking the v→pwm mapping until this fix.
-        let v_commanded = self.target.read().unwrap().v_target;
+        // `target` was snapshotted up front (idle gate). Its `v_target`
+        // is the v fallback when ultrasonic Δd/Δt didn't yield a v_meas
+        // — the PLAN.md Stage 2 design, important when there's no
+        // obstacle in front of the ultrasonic in an open room.
+        let v_commanded = target.v_target;
 
         // Build the labelled window. `v_target` uses the measured value
         // when present, falls back to the operator's commanded v
