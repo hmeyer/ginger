@@ -136,15 +136,21 @@ async fn main() {
             .expect("spawn motor-model saver");
     }
 
+    // MotionTarget is shared between the label worker, the pose
+    // integrator, and the drive endpoint. Constructed early so all
+    // three readers see the same instance.
+    let motion_target: Arc<RwLock<MotionTarget>> = Arc::new(RwLock::new(MotionTarget::default()));
+
     // Stage 2: feed labelled windows to the motor model. Skip if the IMU
-    // isn't on the bus — the labeller needs gyro `ω` as its only
-    // always-available label source, and the model can stay at its
+    // isn't on the bus — the labeller needs the BNO055's fusion-yaw as
+    // its only always-available ω source, and the model can stay at its
     // bootstrap weights without it.
     let label_stats: Arc<RwLock<LabelStats>> = Arc::new(RwLock::new(LabelStats::default()));
     if let Some(imu_arc) = imu.as_ref() {
         labels::spawn(
             sensors.clone(),
             imu_arc.clone(),
+            motion_target.clone(),
             motor_model.clone(),
             label_stats.clone(),
         );
@@ -154,7 +160,6 @@ async fn main() {
 
     // Stage 3: pose integrator. Same IMU dependency as the label
     // worker — without gyro we'd integrate trash.
-    let motion_target: Arc<RwLock<MotionTarget>> = Arc::new(RwLock::new(MotionTarget::default()));
     let pose_state: Arc<RwLock<PoseState>> = Arc::new(RwLock::new(PoseState::default()));
     if let Some(imu_arc) = imu.as_ref() {
         pose::spawn(

@@ -48,7 +48,7 @@ use serde::Serialize;
 
 use crate::api::SensorSnapshot;
 use crate::imu::Imu;
-use crate::motion::{LabelledSample, ModelInput, MotorModel, YAW_SIGN, wrap_pi};
+use crate::motion::{LabelledSample, ModelInput, MotionTarget, MotorModel, YAW_SIGN, wrap_pi};
 
 // ── Window cadence ────────────────────────────────────────────────────────────
 
@@ -114,6 +114,11 @@ pub struct LabelStats {
 struct LabelWorker {
     sensors: Arc<RwLock<SensorSnapshot>>,
     imu: Arc<Imu>,
+    /// Latest desired motion set by `POST /api/motion/drive` (the
+    /// operator's commanded `v_target` / `ω_target`). Used as the
+    /// `v_target` fallback when ultrasonic Δd/Δt doesn't yield a real
+    /// v_meas — see [`Self::tick`] for the why.
+    target: Arc<RwLock<MotionTarget>>,
     model: Arc<RwLock<MotorModel>>,
     stats: Arc<RwLock<LabelStats>>,
 
@@ -123,9 +128,9 @@ struct LabelWorker {
     /// computed without it.
     initial_us_cm: Option<f32>,
 
-    // Carries for `ModelInput.*_prev` on the next tick — see module
-    // docs for why `v_prev` falls back to the previous window's measured
-    // value rather than the commanded one.
+    // Carries for `ModelInput.*_prev` on the next tick. `prev_v` is the
+    // last *known* v — either ultrasonic-measured when valid, or the
+    // commanded v as a placeholder when not.
     prev_pwm_l: i32,
     prev_pwm_r: i32,
     prev_v: f32,
@@ -138,6 +143,7 @@ impl LabelWorker {
     fn new(
         sensors: Arc<RwLock<SensorSnapshot>>,
         imu: Arc<Imu>,
+        target: Arc<RwLock<MotionTarget>>,
         model: Arc<RwLock<MotorModel>>,
         stats: Arc<RwLock<LabelStats>>,
     ) -> Self {
@@ -145,6 +151,7 @@ impl LabelWorker {
         Self {
             sensors,
             imu,
+            target,
             model,
             stats,
             window_start: Instant::now(),
@@ -211,9 +218,18 @@ impl LabelWorker {
         );
         let v_label_present = v_meas.is_some();
 
+        // Operator's currently-commanded v_target. Used as the v
+        // fallback when ultrasonic Δd/Δt didn't yield a v_meas — this
+        // is the PLAN.md Stage 2 design, and it matters most when
+        // there's no obstacle in front of the ultrasonic (open room):
+        // without it the model trains "pwm_avg=1200 → v=0" because the
+        // previous still-window's v was zero, which is structurally
+        // wrong and was breaking the v→pwm mapping until this fix.
+        let v_commanded = self.target.read().unwrap().v_target;
+
         // Build the labelled window. `v_target` uses the measured value
-        // when present, falls back to the carried-forward previous
-        // measurement otherwise (see module docs).
+        // when present, falls back to the operator's commanded v
+        // (loss-weighted 0.3× via `v_label_present=false` in the model).
         let sample = LabelledSample {
             input: ModelInput {
                 pwm_l_prev: self.prev_pwm_l,
@@ -221,7 +237,7 @@ impl LabelWorker {
                 v_prev: self.prev_v,
                 omega_prev: self.prev_omega,
                 battery_v: snap.battery_v,
-                v_target: v_meas.unwrap_or(self.prev_v),
+                v_target: v_meas.unwrap_or(v_commanded),
                 omega_target: omega_meas,
             },
             pwm_l_obs: snap.pwm_l_cmd,
@@ -239,13 +255,13 @@ impl LabelWorker {
             }
         }
 
-        // Carry forward (only on a successful observation).
+        // Carry forward (only on a successful observation). `prev_v` is
+        // the best-known v at this point: measured when valid, else the
+        // commanded fallback we just used as the training target.
         self.prev_pwm_l = snap.pwm_l_cmd;
         self.prev_pwm_r = snap.pwm_r_cmd;
         self.prev_omega = omega_meas;
-        if let Some(v) = v_meas {
-            self.prev_v = v;
-        } // else keep the previous v_prev; gyro held the ω signal.
+        self.prev_v = v_meas.unwrap_or(v_commanded);
         self.advance_window(window_end, us_end);
         true
     }
@@ -319,13 +335,14 @@ impl LabelWorker {
 pub fn spawn(
     sensors: Arc<RwLock<SensorSnapshot>>,
     imu: Arc<Imu>,
+    target: Arc<RwLock<MotionTarget>>,
     model: Arc<RwLock<MotorModel>>,
     stats: Arc<RwLock<LabelStats>>,
 ) {
     thread::Builder::new()
         .name("motion-labels".into())
         .spawn(move || {
-            let mut worker = LabelWorker::new(sensors, imu, model, stats);
+            let mut worker = LabelWorker::new(sensors, imu, target, model, stats);
             loop {
                 thread::sleep(WINDOW);
                 let _ = worker.tick();
